@@ -21,7 +21,14 @@
 extern "C" {
 #endif
 
-/* v12: ReimsVgpuHostOps.track_guest_writes / untrack_guest_writes /
+/* v13: ReimsVgpuHostOps.guest_written_pages — which pages of a tracked set
+ *      moved, not merely whether any did, so a resident spanning many pages
+ *      re-reads only the damage. Both shims already installed it; its absence
+ *      here was a struct-layout disagreement between the two sides.
+ *      reims_vgpu_qemu_log_path — resolve the shim's own always-on artifacts
+ *      through the crate's log directory rather than naming one. `/tmp` is not
+ *      a path on Windows, so a shim that spelled it there wrote nowhere.
+ * v12: ReimsVgpuHostOps.track_guest_writes / untrack_guest_writes /
  *      guest_write_gen — the hypervisor dirty bitmap, the only witness for a
  *      write to a surface's guest pages that no device operation made. Every
  *      host-side copy of those pages is stale the instant the guest CPU stores
@@ -43,7 +50,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 12u
+#define REIMS_VGPU_QEMU_ABI_VERSION 13u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1

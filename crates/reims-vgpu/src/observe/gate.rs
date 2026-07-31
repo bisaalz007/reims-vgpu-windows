@@ -305,6 +305,162 @@ fn the_result_string_scanner_reads_wrapped_types_and_only_the_error_slot() {
     assert_eq!(hits.len(), 2, "wrapped/direct string errors: {hits:?}");
 }
 
+/// The C ABI header this crate ships and the Rust side of that ABI are two
+/// halves of one contract, and nothing in either half can see the other.
+fn abi_header() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("include")
+        .join("reims_vgpu_qemu_abi.h");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The header's ABI version must equal the crate's.
+///
+/// They are compared at device realize, and a mismatch refuses the device — so
+/// a stale header is caught, but only on a host that can build the shim and the
+/// staticlib together and then actually start a VM. That is late, and it was
+/// unreachable for the whole life of the Windows arm; the first realize on that
+/// host duly failed with "header 12, staticlib 13" because a bump had landed on
+/// one side only.
+#[test]
+fn the_abi_header_version_matches_the_crate() {
+    let header = abi_header();
+    let declared = header
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("#define REIMS_VGPU_QEMU_ABI_VERSION ")
+                .and_then(|rest| rest.trim().trim_end_matches('u').parse::<u32>().ok())
+        })
+        .expect("header must define REIMS_VGPU_QEMU_ABI_VERSION as a plain integer");
+    assert_eq!(
+        declared,
+        crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
+        "include/reims_vgpu_qemu_abi.h and qemu::abi disagree on the ABI \
+         version; bump both or the C shim refuses the device at realize"
+    );
+}
+
+/// `ReimsVgpuHostOps` must have the same members in the same order on both
+/// sides of the ABI.
+///
+/// It is `#[repr(C)]` and the C shim initialises it by designated initialiser,
+/// so a member present in one declaration and not the other is a layout
+/// disagreement, not a missing convenience. This is not hypothetical: the shims
+/// installed `guest_written_pages` while the Rust struct had never grown the
+/// field, and that survived until something compiled both halves together.
+///
+/// Names and order are compared, not types — a C function-pointer signature and
+/// a Rust `Option<unsafe extern "C" fn(..)>` cannot be matched textually, and
+/// every member of this struct is pointer-sized regardless. What this catches is
+/// the failure that actually happens: one side gaining or losing a member.
+#[test]
+fn the_host_ops_struct_has_the_same_members_on_both_sides() {
+    let header = abi_header();
+    let body = header
+        .split_once("} ReimsVgpuHostOps;")
+        .map(|(before, _)| before)
+        .and_then(|before| before.rsplit_once('{'))
+        .map(|(_, body)| body)
+        .expect("header must declare a ReimsVgpuHostOps struct body");
+
+    let mut c_members = Vec::new();
+    for line in mask_c_comments(body).lines() {
+        let line = line.trim();
+        // Function-pointer member: `ret (*name)(args);`
+        if let Some((_, rest)) = line.split_once("(*") {
+            if let Some((name, _)) = rest.split_once(')') {
+                c_members.push(name.to_string());
+                continue;
+            }
+        }
+        // Plain member: `type name;` — the last identifier before the `;`.
+        if let Some((decl, _)) = line.split_once(';') {
+            if let Some(name) = decl
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next_back()
+            {
+                if !name.is_empty() && !decl.contains('(') {
+                    c_members.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    let rust_src = std::fs::read_to_string(crate_src().join("qemu").join("host_ops.rs"))
+        .expect("read host_ops.rs");
+    let rust_body = rust_src
+        .split_once("pub struct ReimsVgpuHostOps {")
+        .map(|(_, after)| after)
+        .and_then(|after| after.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("host_ops.rs must declare pub struct ReimsVgpuHostOps");
+
+    let mut rust_members = Vec::new();
+    let mut depth = 0i32;
+    for line in mask_rust_line_comments(rust_body).lines() {
+        let trimmed = line.trim();
+        // Only a line at nesting depth 0 starts a member; a wrapped
+        // `Option<unsafe extern "C" fn(` spans several lines of arguments.
+        if depth == 0 {
+            if let Some(rest) = trimmed.strip_prefix("pub ") {
+                if let Some((name, _)) = rest.split_once(':') {
+                    rust_members.push(name.trim().to_string());
+                }
+            }
+        }
+        depth += trimmed.matches(['(', '<']).count() as i32;
+        depth -= trimmed.matches([')', '>']).count() as i32;
+        depth = depth.max(0);
+    }
+
+    // The Rust struct carries the two handshake words the C side declares too;
+    // compare the whole sequence so a reorder is caught as well as a gain.
+    assert_eq!(
+        rust_members, c_members,
+        "ReimsVgpuHostOps disagrees between qemu/host_ops.rs and \
+         include/reims_vgpu_qemu_abi.h. The struct is #[repr(C)] and the shim \
+         fills it by designated initialiser, so this is a layout mismatch: the \
+         C side writes at offsets the Rust side does not read.\n  \
+         rust: {rust_members:?}\n  c:    {c_members:?}"
+    );
+}
+
+/// Strip `/* */` and `//` comments so a member named inside prose is not read
+/// as a declaration.
+fn mask_c_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/*") {
+            match src[i..].find("*/") {
+                Some(end) => {
+                    out.extend(src[i..i + end + 2].chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+                    i += end + 2;
+                }
+                None => break,
+            }
+        } else if bytes[i..].starts_with(b"//") {
+            let end = src[i..].find('\n').map_or(src.len(), |n| i + n);
+            out.extend(std::iter::repeat_n(' ', end - i));
+            i = end;
+        } else {
+            let ch = src[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Drop `///` and `//` lines so doc prose naming a field is not read as one.
+fn mask_rust_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| if line.trim_start().starts_with("//") { "" } else { line })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Windows is gated as `target_os = "windows"`, never as the `windows` family
 /// predicate.
 ///
