@@ -393,6 +393,26 @@ if [ "$HOST_KIND" != windows ]; then
   ln -sfn "qmp-$STAMP.sock" "$RUN_DIR/qmp.sock"
 fi
 
+# A human monitor over TCP, on Windows only. Two reasons, both measured:
+#
+#   - The AF_UNIX QMP socket above does not work there. What lands in $RUN_DIR is
+#     a zero-byte regular file that accepts no connection, so every QMP-driven
+#     tool has no channel at all and no error saying why.
+#   - The guest can reach a state only the host can leave. macOS restarts through
+#     the AppleSMC watchdog, and QEMU's isa-applesmc does not implement that key:
+#     the guest unmounts its volumes, logs `MACH Reboot`, then retries
+#     `SMCWDT::setWatchdogTimer ERROR: smcWriteKey failed (kSMCBadCommand)` and
+#     stops. Nothing is wrong with it -- it is waiting for a reset that has to
+#     come from outside. Without a monitor the only way to send one is a mouse
+#     click in the GTK menu, which an unattended install cannot do.
+#
+# `system_reset` on this port is that reset. Bound to loopback.
+QEMU_MONITOR_PORT="${QEMU_MONITOR_PORT:-4444}"
+QEMU_MONITOR_ADDR=""
+if [ "$HOST_KIND" = windows ]; then
+  QEMU_MONITOR_ADDR="127.0.0.1:$QEMU_MONITOR_PORT"
+fi
+
 # --- Control-plane trace rail ---------------------------------------------------
 TRACE="${TRACE:-0}"
 TRACE_LOG=""
@@ -539,6 +559,10 @@ QEMU_ARGS=(
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
 
+if [ -n "$QEMU_MONITOR_ADDR" ]; then
+  QEMU_ARGS+=(-monitor "tcp:$QEMU_MONITOR_ADDR,server=on,wait=off")
+fi
+
 # sata.3, between OpenCore and the target disk. Attached as a disk rather than
 # CD media because these images are raw disks, not ISO9660, whatever the file is
 # named.
@@ -630,6 +654,8 @@ fi
 
 echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS accel=$ACCEL cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
 echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
+[ -n "$QEMU_MONITOR_ADDR" ] && \
+  echo "boot-x86.sh: monitor → tcp:$QEMU_MONITOR_ADDR (the AF_UNIX qmp above does not work on this host)"
 [ -n "$TRACE_SPEC" ] && echo "boot-x86.sh: trace → $QEMU_LOG ($TRACE_SPEC)"
 [ -n "$QEMU_LOG" ] && echo "boot-x86.sh: qemu log → $QEMU_LOG"
 
@@ -705,16 +731,25 @@ else
 fi
 
 if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
-  if [ -n "$INSTALLER_DRIVE" ]; then
-    # An install runs for the better part of an hour with nobody at the console,
-    # so `mon:stdio` is the wrong shape for it twice over: the monitor is on
-    # stdin, which makes the VM die with the shell that launched it, and the
-    # guest's console goes to a terminal instead of to a file that survives.
-    # Both bit here -- a launch whose parent was torn down took the install with
-    # it, and the only record of how far it got was scrollback.
+  if [ -n "$INSTALLER_DRIVE" ] || [ ! -t 0 ]; then
+    # `mon:stdio` puts the guest console *and* the QEMU monitor on this shell's
+    # stdin. That is only right with a human at a terminal, and it fails two
+    # ways otherwise:
+    #
+    #   - No terminal means stdin is at EOF immediately, and QEMU quits when its
+    #     monitor reads EOF. A detached launch therefore dies seconds after it
+    #     starts, with no message and nothing on disk to explain it.
+    #   - Even when it survives, the guest's console exists only as scrollback in
+    #     a window nobody is watching, so a boot that fails an hour in leaves no
+    #     record of how far it got.
+    #
+    # So: a file whenever there is no terminal to be interactive with, and
+    # always for an install, which is an hour of unattended work by definition.
+    # `[ ! -t 0 ]` is the honest test -- it asks whether the monitor would have
+    # anyone to talk to, rather than guessing from the boot class.
     QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial "file:$SERIAL_LOG")
-    echo "boot-x86.sh: install boot — serial → $SERIAL_LOG (no monitor on stdio;" >&2
-    echo "boot-x86.sh:   the VM does not die with this shell, and the log outlives it)" >&2
+    echo "boot-x86.sh: serial → $SERIAL_LOG (no monitor on stdio: it would quit" >&2
+    echo "boot-x86.sh:   on EOF without a terminal, and the log would not outlive the window)" >&2
   else
     # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
     QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
