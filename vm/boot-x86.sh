@@ -759,8 +759,7 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
     #   - Even when it survives, the guest's console exists only as scrollback in
     #     a window nobody is watching, so a boot that fails an hour in leaves no
     #     record of how far it got.
-    #
-    # So: a file whenever there is no terminal to be interactive with, and
+    #    # So: a file whenever there is no terminal to be interactive with, and
     # always for an install, which is an hour of unattended work by definition.
     # `[ ! -t 0 ]` is the honest test -- it asks whether the monitor would have
     # anyone to talk to, rather than guessing from the boot class.
@@ -768,8 +767,19 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
     echo "boot-x86.sh: serial → $SERIAL_LOG (no monitor on stdio: it would quit" >&2
     echo "boot-x86.sh:   on EOF without a terminal, and the log would not outlive the window)" >&2
   else
-    # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
-    QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
+    # A terminal exists, so the monitor has someone to talk to -- but the guest
+    # console must still reach a file. A `chardev` fanned out to both is the only
+    # way to have both: `-serial mon:stdio` alone leaves the guest's own account
+    # of a failure as scrollback in one window, which is how an "Apple GPU
+    # watchdog: GPU hang" report reached a human eye and no log on disk, with
+    # nothing left to grep for the ring pointers it named.
+    QEMU_ARGS+=(
+      -chardev "stdio,id=serial0,mux=on,logfile=$SERIAL_LOG,signal=off"
+      -display "$REIMS_VGPU_DISPLAY"
+      -serial chardev:serial0
+      -mon "chardev=serial0,mode=readline"
+    )
+    echo "boot-x86.sh: serial → console AND $SERIAL_LOG" >&2
   fi
   rc=0
   "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
