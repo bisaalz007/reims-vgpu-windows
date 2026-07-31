@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Compile every supported reims-vgpu arm, tests included.
 #
-# The project supports three arms, one per host GPU API actually available:
-# Metal on Apple, Vulkan through MoltenVK on Apple, and Vulkan on a native
-# Linux ICD. QEMU's meson picks one per build and day-to-day work compiles one,
+# The project supports four arms, one per host GPU API actually available:
+# Metal on Apple, Vulkan through MoltenVK on Apple, and Vulkan on a native ICD
+# on Linux and on Windows. QEMU's meson picks one per build and day-to-day work compiles one,
 # so a rename or a cfg change could break another arm silently for days. This
 # script is the gate.
 #
@@ -16,6 +16,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE_DIR="${REPO}"
 CROSS_TARGET="${CROSS_TARGET:-x86_64-unknown-linux-gnu}"
+# The Windows arm is cross-checked when its target is installed and merely
+# reported when it is not. Unlike CROSS_TARGET this is not a hard error: most
+# contributors have no reason to install it, and turning the whole matrix red
+# for them would train people to ignore the gate.
+WINDOWS_TARGET="${WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
 CARGO_CMD="check"
 COUNT_TESTS=1
 
@@ -34,7 +39,7 @@ a green run. Counting links the test binaries, which is slower than checking;
 pass --no-counts to skip it. The cross-compiled arm cannot be counted because
 its binaries do not run on this host.
 
-The three supported arms, one per host GPU API actually available:
+The four supported arms, one per host GPU API actually available:
 
   Metal              --features backend-metal                     Apple only
   Vulkan / MoltenVK  --no-default-features
@@ -52,6 +57,11 @@ Warnings do not fail an arm; the count is printed so drift stays visible.
 
 env:
   CROSS_TARGET   Linux target to cross-check (default x86_64-unknown-linux-gnu)
+  WINDOWS_TARGET Windows target to cross-check (default x86_64-pc-windows-gnu)
+
+Both cross targets are reported as skipped rather than failing the run when the
+toolchain does not have them: that is a fact about the machine, not a broken arm,
+and failing outright meant a host missing one target could verify nothing.
 EOF
 }
 
@@ -92,11 +102,16 @@ if ! rustc --print target-list | grep -qx "$CROSS_TARGET"; then
   echo "feature-matrix: ERROR: unknown target '$CROSS_TARGET'" >&2
   exit 1
 fi
+# Whether the Linux cross-check can run at all. Treated exactly like the Windows
+# one below: a target the toolchain does not have is a fact about the machine,
+# not a broken arm, so it is reported and the other arms still run. Failing the
+# whole matrix instead meant a host missing one target could verify *nothing* —
+# and on a Windows host that is the normal state, because the toolchain there
+# may be a distribution rustc with no rustup to add targets with.
+CROSS_TARGET_AVAILABLE=1
 if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ] &&
   ! rustup target list --installed 2>/dev/null | grep -qx "$CROSS_TARGET"; then
-  echo "feature-matrix: ERROR: target '$CROSS_TARGET' not installed" >&2
-  echo "feature-matrix:        run: rustup target add $CROSS_TARGET" >&2
-  exit 1
+  CROSS_TARGET_AVAILABLE=0
 fi
 
 # Feature sets, verbatim from vendor/qemu/hw/display/meson.build.
@@ -186,12 +201,30 @@ esac
 # feature set; the host is what differs.
 run_cell "vulkan,host-window / $HOST_TRIPLE" "" "$FEATURES_VULKAN"
 count_cell "vulkan,host-window / $HOST_TRIPLE" "$FEATURES_VULKAN"
-if [ "$CROSS_TARGET" != "$HOST_TRIPLE" ]; then
+if [ "$CROSS_TARGET" = "$HOST_TRIPLE" ]; then
+  : # already covered by the host cell above
+elif [ "$CROSS_TARGET_AVAILABLE" -eq 1 ]; then
   run_cell "vulkan,host-window / $CROSS_TARGET" "$CROSS_TARGET" "$FEATURES_VULKAN"
   if [ "$COUNT_TESTS" -eq 1 ]; then
     COUNTS+=("$(printf '%-46s %s' "vulkan,host-window / $CROSS_TARGET" \
       "(cross-compiled — cannot run here)")")
   fi
+else
+  RESULTS+=("$(printf '%-4s %-46s %s' "n/a" "vulkan,host-window / $CROSS_TARGET" "(target not installed: rustup target add $CROSS_TARGET)")")
+fi
+
+# Arm 4 - Vulkan on a native Windows ICD. Same feature set again; only the host
+# differs. Skipped-and-named when the target is not installed, because a missing
+# rustup target is a machine fact, not a broken arm.
+if [ "$WINDOWS_TARGET" = "$HOST_TRIPLE" ]; then
+  : # already covered by the host cell above
+elif rustup target list --installed 2>/dev/null | grep -qx "$WINDOWS_TARGET"; then
+  run_cell "vulkan,host-window / $WINDOWS_TARGET" "$WINDOWS_TARGET" "$FEATURES_VULKAN"
+  if [ "$COUNT_TESTS" -eq 1 ]; then
+    COUNTS+=("$(printf '%-46s %s' "vulkan,host-window / $WINDOWS_TARGET" "(cross-compiled; cannot run here)")")
+  fi
+else
+  RESULTS+=("$(printf '%-4s %-46s %s' "n/a" "vulkan,host-window / $WINDOWS_TARGET" "(target not installed: rustup target add $WINDOWS_TARGET)")")
 fi
 
 echo

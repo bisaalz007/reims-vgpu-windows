@@ -86,6 +86,25 @@ pub struct ReimsVgpuHostOps {
     /// was written; 0 for an unknown or not-yet-armed token. Safe from any
     /// thread.
     pub guest_write_gen: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
+    /// Which pages of the token's set were written since `since_gen`, as GPAs
+    /// into `out` (capacity `max`). Returns the count written, or a negative
+    /// value when the answer cannot be given — an unknown token, or a
+    /// `since_gen` so old the shim no longer holds the per-page record.
+    ///
+    /// [`Self::guest_write_gen`] answers *whether* the set moved; a resident
+    /// that spans many pages must then re-read all of them to find the few that
+    /// did. This answers *which*, so the re-read is proportional to the damage.
+    /// A count of 0 with a non-negative return means the set genuinely did not
+    /// move, which is distinct from the negative "cannot tell".
+    pub guest_written_pages: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            token: u64,
+            since_gen: u64,
+            out: *mut u64,
+            max: usize,
+        ) -> i64,
+    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -667,6 +686,7 @@ mod tests {
             track_guest_writes: None,
             untrack_guest_writes: None,
             guest_write_gen: None,
+            guest_written_pages: None,
             is_ram_gpa: None,
             notify_actions: None,
         }

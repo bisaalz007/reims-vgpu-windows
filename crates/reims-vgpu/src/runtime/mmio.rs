@@ -98,7 +98,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/reims-vgpu-gop-console.log")
+                .open(crate::observe::log_path("reims-vgpu-gop-console.log"))
                 .and_then(|mut f| {
                     use std::io::Write;
                     writeln!(
@@ -194,7 +194,7 @@ pub fn gfx_write<H: HostMemory + HostOps>(
                 let _ = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("/tmp/reims-vgpu-gop-console.log")
+                    .open(crate::observe::log_path("reims-vgpu-gop-console.log"))
                     .and_then(|mut f| {
                         use std::io::Write;
                         writeln!(

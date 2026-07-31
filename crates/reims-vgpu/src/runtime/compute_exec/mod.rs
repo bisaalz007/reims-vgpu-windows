@@ -1100,7 +1100,7 @@ fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
 /// different type-11 slot).
 /// Local handoff dir for metal2vulkan failure artifacts. `$REIMS_VGPU_M2V_FAIL_DIR`
 /// overrides; else `$REIMS_VGPU_REPO_ROOT/m2v-handoff/artifacts` (gitignored); else
-/// `/tmp/reims-vgpu-m2v-compute-fails`.
+/// `reims-vgpu-m2v-compute-fails` under [`crate::observe::log_dir`].
 fn m2v_handoff_dir_from_env(
     fail_dir: Option<std::ffi::OsString>,
     repo_root: Option<std::ffi::OsString>,
@@ -1108,7 +1108,7 @@ fn m2v_handoff_dir_from_env(
     fail_dir
         .map(std::path::PathBuf::from)
         .or_else(|| repo_root.map(|r| std::path::PathBuf::from(r).join("m2v-handoff/artifacts")))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reims-vgpu-m2v-compute-fails"))
+        .unwrap_or_else(|| crate::observe::log_dir().join("reims-vgpu-m2v-compute-fails"))
 }
 
 pub(crate) fn m2v_handoff_dir() -> std::path::PathBuf {
@@ -3956,7 +3956,9 @@ fn spawn_compute_engine_stall_watchdog(
         crate::observe::fail(format!(
             "compute_engine_stall reason=backend_call_unreturned pipe={pipeline_ref} elapsed_ms={elapsed_ms} grid={grid:?} nbuf={buffers} nimg={images} image_geom={image_geometry:?}"
         ));
-        let base = format!("/tmp/reims-vgpu-compute-stall-pipe-{pipeline_ref}");
+        let base = crate::observe::log_path(&format!(
+            "reims-vgpu-compute-stall-pipe-{pipeline_ref}"
+        ));
         let mut bytes = Vec::with_capacity(spirv.len().saturating_mul(4));
         for word in spirv {
             bytes.extend_from_slice(&word.to_le_bytes());

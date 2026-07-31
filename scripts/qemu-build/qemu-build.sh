@@ -3,14 +3,15 @@
 # scripts/qemu-build/qemu-build.sh
 #
 # Configures and builds the vendored QEMU submodule (steelbrain/qemu-reims-vgpu,
-# branch host-reims-vgpu-vmapple) into vendor/qemu/build/qemu-system-<arch>.
+# branch bot-branch-host-reims-vgpu-vmapple) into vendor/qemu/build/qemu-system-<arch>.
 #
 # Targets:
 #   aarch64  — arm macOS guest rail for vm/boot-arm64.sh (macOS + HVF + Cocoa).
 #              Use --backend metal for host Metal or --backend vulkan for
 #              metal2vulkan through MoltenVK. Default target on Darwin.
 #   x86_64   — x86 macOS guest rail for vm/boot-x86.sh. Use --backend vulkan
-#              for metal2vulkan on the Linux host. Default target on Linux.
+#              for metal2vulkan on the Linux or Windows host. Default target on
+#              both. Accelerator follows the host: KVM on Linux, WHPX on Windows.
 #
 # The vmapple enablement (RFC v7 patches 1-6; patch 7 excluded -- it needs SIP
 # disabled) is committed IN the submodule, so this script does not clone or
@@ -25,16 +26,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 QEMU_SRC="$REPO_ROOT/vendor/qemu"
+
+# Host classification. `uname -s` under MSYS2 reports the *environment*, not just
+# the OS — MINGW64_NT-10.0-26200, MSYS_NT-10.0-26200, CYGWIN_NT-10.0 are all the
+# same Windows host seen through different shells — so match a prefix rather than
+# an exact string. Everything downstream that differs by host (accelerator,
+# binary suffix, cargo location, link libraries) keys on this one value.
+case "$(uname -s)" in
+  Darwin)                     HOST_KIND=darwin ;;
+  Linux)                      HOST_KIND=linux ;;
+  MINGW*|MSYS*|CYGWIN*)       HOST_KIND=windows ;;
+  *)
+    echo "[qemu-build] ERROR: unsupported host OS '$(uname -s)'" >&2
+    exit 1
+    ;;
+esac
+
+# QEMU's own binaries carry .exe on Windows; ninja target names carry it too, so
+# the suffix has to reach both the build request and every later path.
+EXE_SUFFIX=""
+[ "$HOST_KIND" = windows ] && EXE_SUFFIX=".exe"
+
 # Vulkan paths: public metal2vulkan crate + in-crate ash engine. On macOS this
-# uses MoltenVK through the Vulkan loader; on Linux it uses the native ICD.
-# Metal is for Darwin (or intentional host stubs on Linux). Default follows host OS.
+# uses MoltenVK through the Vulkan loader; on Linux and Windows it uses the
+# native ICD. Metal is Darwin-only. Default follows host OS.
 if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
-  case "$(uname -s)" in
-    Darwin) REIMS_VGPU_BACKEND=metal ;;
+  case "$HOST_KIND" in
+    darwin) REIMS_VGPU_BACKEND=metal ;;
     *)      REIMS_VGPU_BACKEND=vulkan ;;
   esac
 fi
-# Empty → auto: aarch64 on Darwin, x86_64 on Linux.
+# Empty → auto: aarch64 on Darwin, x86_64 on Linux and Windows.
 QEMU_TARGET="${QEMU_TARGET:-}"
 
 echo "[qemu-build] qemu submodule: $QEMU_SRC"
@@ -56,7 +78,7 @@ usage: scripts/qemu-build/qemu-build.sh [options]
 Build vendor/qemu (reims-vgpu-mmio + reims-vgpu for the selected target/backend).
 
   --target aarch64|x86_64  softmmu target (default: aarch64 on Darwin, x86_64
-                           on Linux). Env: QEMU_TARGET.
+                           on Linux and Windows). Env: QEMU_TARGET.
   --backend metal|vulkan   host GPU backend linked into reims-vgpu-mmio.
                            Defaults by host OS. Baked at build time. Env: REIMS_VGPU_BACKEND.
                            On non-Apple hosts, metal = Rust host stubs (linkable;
@@ -105,13 +127,9 @@ done
 
 # --- Resolve target -------------------------------------------------------------
 if [ -z "$QEMU_TARGET" ]; then
-  case "$(uname -s)" in
-    Darwin) QEMU_TARGET=aarch64 ;;
-    Linux)  QEMU_TARGET=x86_64 ;;
-    *)
-      echo "[qemu-build] ERROR: unknown host OS '$(uname -s)'; pass --target aarch64|x86_64" >&2
-      exit 1
-      ;;
+  case "$HOST_KIND" in
+    darwin)          QEMU_TARGET=aarch64 ;;
+    linux|windows)   QEMU_TARGET=x86_64 ;;
   esac
 fi
 
@@ -131,11 +149,11 @@ case "$REIMS_VGPU_BACKEND" in
     ;;
 esac
 
-# Three supported arms: Metal on Apple, Vulkan/MoltenVK on Apple, Vulkan/native
-# on Linux. backend-metal off Apple has no Metal to call and is a compile_error!
+# Four supported arms: Metal on Apple, Vulkan/MoltenVK on Apple, Vulkan/native on
+# Linux and on Windows. backend-metal off Apple has no Metal to call and is a compile_error!
 # in crates/reims-vgpu/src/lib.rs; catch it here so the message is about the build
 # choice rather than a rustc error inside meson.
-if [ "$REIMS_VGPU_BACKEND" = metal ] && [ "$(uname -s)" != Darwin ]; then
+if [ "$REIMS_VGPU_BACKEND" = metal ] && [ "$HOST_KIND" != darwin ]; then
   echo "[qemu-build] ERROR: --backend metal requires macOS (no host-stub Metal arm)" >&2
   echo "[qemu-build]        use --backend vulkan on this host" >&2
   exit 1
@@ -146,21 +164,60 @@ echo "[qemu-build] target=$QEMU_TARGET"
 echo "[qemu-build] REIMS_VGPU_BACKEND=$REIMS_VGPU_BACKEND (reims-vgpu-mmio → reims-vgpu)"
 
 # Product aarch64 path needs macOS (HVF + Cocoa). Fail early with a clear message.
-if [ "$QEMU_TARGET" = aarch64 ] && [ "$(uname -s)" != Darwin ]; then
+if [ "$QEMU_TARGET" = aarch64 ] && [ "$HOST_KIND" != darwin ]; then
   echo "[qemu-build] ERROR: aarch64 product build (vmapple + HVF + Cocoa) requires macOS" >&2
-  echo "[qemu-build]        On Linux use: scripts/qemu-build/qemu-build.sh --target x86_64" >&2
+  echo "[qemu-build]        On Linux/Windows use: scripts/qemu-build/qemu-build.sh --target x86_64" >&2
   exit 1
 fi
 
 # Prefer a known cargo if PATH is minimal (agent shells). Always needed: both
 # targets link libreims_vgpu.a (metal host stubs on non-Apple).
 if ! command -v cargo >/dev/null 2>&1; then
-  if [ -x "$HOME/.cargo/bin/cargo" ]; then
+  # MSYS2 installs the toolchain into the MINGW64 prefix; a rustup install lives
+  # under $HOME. Try both before failing.
+  if [ "$HOST_KIND" = windows ] && [ -x /mingw64/bin/cargo.exe ]; then
+    export PATH="/mingw64/bin:$PATH"
+  elif [ -x "$HOME/.cargo/bin/cargo" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
   else
     echo "[qemu-build] ERROR: cargo not found (needed to build reims-vgpu)" >&2
     exit 1
   fi
+fi
+
+# The staticlib is archived as libreims_vgpu.a and linked by the MinGW gcc that
+# builds QEMU, so the Rust host triple has to be the GNU one. An -msvc toolchain
+# emits reims_vgpu.lib and a CRT that does not match: hw/display/meson.build
+# would not find its input, and if it did the link would mix CRTs. QEMU's own
+# configure says the same ("MSVC not supported").
+if [ "$HOST_KIND" = windows ]; then
+  rust_host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+  case "$rust_host" in
+    *-pc-windows-gnu|*-pc-windows-gnullvm) ;;
+    "")
+      echo "[qemu-build] ERROR: rustc not found (needed to build reims-vgpu)" >&2
+      exit 1
+      ;;
+    *)
+      echo "[qemu-build] ERROR: rustc host is '$rust_host'; the MinGW link needs a" >&2
+      echo "[qemu-build]        *-pc-windows-gnu toolchain (pacman -S mingw-w64-x86_64-rust)" >&2
+      exit 1
+      ;;
+  esac
+
+  # QEMU's own build scripts read source files with a bare `open()`, which on
+  # Windows picks the encoding from the *system* locale rather than UTF-8. On a
+  # Japanese Windows that is cp932, and the first non-ASCII byte in any input
+  # aborts the build: `tracetool.py` reading hw/display/trace-events died on an
+  # em dash in a comment, 229 targets in, with a UnicodeDecodeError naming the
+  # codec and not the file.
+  #
+  # UTF-8 mode makes the interpreter locale-independent, which is the property
+  # the build actually wants — the alternative is keeping every file QEMU reads
+  # inside ASCII, which is not enforceable across a vendored upstream. Exported
+  # rather than passed per-invocation because meson re-enters Python through its
+  # own venv for each generator.
+  export PYTHONUTF8=1
 fi
 
 if [ "$QEMU_TARGET" = aarch64 ]; then
@@ -206,15 +263,36 @@ if [ ! -f "build/build.ninja" ]; then
         --disable-tools
       ;;
     x86_64)
-      echo "[qemu-build] configuring (x86_64-softmmu, no hvf/cocoa) ..."
-      ./configure \
-        --target-list=x86_64-softmmu \
-        --disable-hvf \
-        --disable-cocoa \
-        --disable-docs \
-        --disable-bsd-user \
-        --disable-linux-user \
-        --disable-tools
+      # The accelerator differs by host: KVM is picked up automatically on Linux,
+      # WHPX has to be asked for. Requesting it explicitly (rather than letting
+      # configure auto-detect) makes a missing winhvplatform.h a configure error
+      # naming WHPX, instead of a TCG-only binary discovered a boot later.
+      #
+      # Spelled as two whole invocations rather than one with an array of extra
+      # arguments: macOS still ships bash 3.2, where expanding an empty array
+      # under `set -u` is itself an error.
+      if [ "$HOST_KIND" = windows ]; then
+        echo "[qemu-build] configuring (x86_64-softmmu, whpx) ..."
+        ./configure \
+          --target-list=x86_64-softmmu \
+          --enable-whpx \
+          --disable-hvf \
+          --disable-cocoa \
+          --disable-docs \
+          --disable-bsd-user \
+          --disable-linux-user \
+          --disable-tools
+      else
+        echo "[qemu-build] configuring (x86_64-softmmu, no hvf/cocoa) ..."
+        ./configure \
+          --target-list=x86_64-softmmu \
+          --disable-hvf \
+          --disable-cocoa \
+          --disable-docs \
+          --disable-bsd-user \
+          --disable-linux-user \
+          --disable-tools
+      fi
       ;;
   esac
 else
@@ -225,9 +303,9 @@ printf '%s\n' "$STAMP_WANTED" > build/qemu-build.stamp
 printf '%s\n' "$REIMS_VGPU_BACKEND" > build/reims-vgpu-backend.stamp
 
 # --- Build ----------------------------------------------------------------------
-QEMU_BIN="$QEMU_SRC/build/qemu-system-${QEMU_TARGET}"
-echo "[qemu-build] building qemu-system-${QEMU_TARGET} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
-ninja -C build "qemu-system-${QEMU_TARGET}"
+QEMU_BIN="$QEMU_SRC/build/qemu-system-${QEMU_TARGET}${EXE_SUFFIX}"
+echo "[qemu-build] building qemu-system-${QEMU_TARGET}${EXE_SUFFIX} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
+ninja -C build "qemu-system-${QEMU_TARGET}${EXE_SUFFIX}"
 
 # --- Verify (target-specific) ---------------------------------------------------
 case "$QEMU_TARGET" in
@@ -265,7 +343,20 @@ case "$QEMU_TARGET" in
     else
       echo "[qemu-build] WARNING: reims-vgpu-pci type not registered" >&2
     fi
-    if "$QEMU_BIN" -accel help 2>/dev/null | grep -qi kvm; then
+    # Name the accelerator this host is expected to use, so "built fine, boots
+    # under TCG at 1/50th speed" is caught at build time rather than mistaken for
+    # a slow guest.
+    if [ "$HOST_KIND" = windows ]; then
+      if "$QEMU_BIN" -accel help 2>/dev/null | grep -qi whpx; then
+        echo "[qemu-build] whpx accel: available"
+      else
+        echo "[qemu-build] ERROR: whpx accel not listed — configure found no" >&2
+        echo "[qemu-build]        Windows Hypervisor Platform headers, or the build is TCG-only." >&2
+        echo "[qemu-build]        Enable the feature (admin, needs a reboot):" >&2
+        echo "[qemu-build]          DISM /online /Enable-Feature /FeatureName:HypervisorPlatform /All" >&2
+        exit 1
+      fi
+    elif "$QEMU_BIN" -accel help 2>/dev/null | grep -qi kvm; then
       echo "[qemu-build] kvm accel: available"
     else
       echo "[qemu-build] kvm accel: not listed (TCG-only; install/enable KVM if you need it)"

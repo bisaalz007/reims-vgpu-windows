@@ -90,9 +90,11 @@ fn m2v_handoff_dir_prefers_explicit_dir_then_repo_local_private_dir() {
         m2v_handoff_dir_from_env(None, Some("/repo".into())),
         std::path::PathBuf::from("/repo/m2v-handoff/artifacts")
     );
+    // The last resort follows the sink directory rather than a literal, so the
+    // artifacts land next to the fail log that names them on every host.
     assert_eq!(
         m2v_handoff_dir_from_env(None, None),
-        std::path::PathBuf::from("/tmp/reims-vgpu-m2v-compute-fails")
+        crate::observe::log_dir().join("reims-vgpu-m2v-compute-fails")
     );
 }
 
@@ -1536,7 +1538,7 @@ fn incomplete_compute_engine_call_fires_stall_proxy() {
         line.contains("compute_engine_stall reason=backend_call_unreturned")
             && line.contains(&format!("pipe={pipe}"))
     }));
-    let base = format!("/tmp/reims-vgpu-compute-stall-pipe-{pipe}");
+    let base = crate::observe::log_path(&format!("reims-vgpu-compute-stall-pipe-{pipe}"));
     let _ = std::fs::remove_file(format!("{base}.spv"));
     let _ = std::fs::remove_file(format!("{base}.txt"));
 }

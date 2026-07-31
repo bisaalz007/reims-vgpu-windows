@@ -30,6 +30,15 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v13 adds `guest_written_pages` on [`ReimsVgpuHostOps`], which answers *which*
+/// pages of a tracked set moved rather than only whether any did, and
+/// `reims_vgpu_qemu_log_path`, which resolves the shim's own always-on artifacts
+/// through [`crate::observe::sink::log_dir`] instead of letting it name a
+/// directory. Both were first exercised by the Windows bring-up: the field's
+/// absence here was a `#[repr(C)]` layout disagreement with shims that already
+/// supplied it, and the shim spelled `/tmp` directly, which is not a path on
+/// Windows at all, so its GOP console proxy fell silent on the one host that
+/// cannot show a QEMU console either.
 /// v12 adds the guest-write tracking triple on [`ReimsVgpuHostOps`]:
 /// `track_guest_writes`, `untrack_guest_writes`, `guest_write_gen`. A surface's
 /// pages are plain guest RAM and the guest CPU stores into them with no device
@@ -46,7 +55,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 12;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 13;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -298,6 +307,57 @@ pub unsafe extern "C" fn reims_vgpu_qemu_backend_name(buf: *mut c_char, buf_len:
             unsafe {
                 std::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
                 *buf.add(n) = 0;
+            }
+            REIMS_VGPU_QEMU_OK
+        },
+        REIMS_VGPU_QEMU_ERR_PANIC,
+    )
+}
+
+/// Resolve `name` against the directory the crate drops host-side artifacts in,
+/// writing the absolute path into the caller buffer (NUL-terminated).
+///
+/// The shim has artifacts of its own — the GOP console proxy is one — and they
+/// have to land beside the crate's sinks on every host. Spelling `/tmp` on the C
+/// side made that true on the Unix rails by coincidence and false on Windows,
+/// where the path is drive-relative and `fopen` fails silently, so the proxy
+/// went quiet exactly where nothing else can see. Asking the crate keeps
+/// `observe::sink::log_dir` the single place a new host is taught, including
+/// `REIMS_VGPU_LOG_DIR`.
+///
+/// Truncation is refused rather than performed: a short buffer would yield a
+/// path that is well-formed, wrong, and silently written to.
+///
+/// SAFETY: `name` must be a NUL-terminated C string; `buf` must have `buf_len`
+/// bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn reims_vgpu_qemu_log_path(
+    name: *const c_char,
+    buf: *mut c_char,
+    buf_len: usize,
+) -> c_int {
+    unwind_safe(
+        || {
+            if name.is_null() || buf.is_null() || buf_len == 0 {
+                return REIMS_VGPU_QEMU_ERR_ARGS;
+            }
+            // SAFETY: caller guarantees `name` is NUL-terminated.
+            let name = unsafe { std::ffi::CStr::from_ptr(name) };
+            let Ok(name) = name.to_str() else {
+                return REIMS_VGPU_QEMU_ERR_ARGS;
+            };
+            if name.is_empty() {
+                return REIMS_VGPU_QEMU_ERR_ARGS;
+            }
+            let path = crate::observe::sink::log_path(name);
+            let bytes = path.as_bytes();
+            if bytes.len() + 1 > buf_len {
+                return REIMS_VGPU_QEMU_ERR_ARGS;
+            }
+            // SAFETY: buf valid for buf_len, and the length was just checked.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+                *buf.add(bytes.len()) = 0;
             }
             REIMS_VGPU_QEMU_OK
         },
@@ -747,6 +807,77 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(s == "metal" || s == "vulkan", "got {s}");
+    }
+
+    /// The shim's artifacts have to land in the same directory as the crate's
+    /// sinks, on whichever host is running. This asserts the composition rather
+    /// than a spelling, so it stays true on the Windows arm where `/tmp` is not
+    /// a directory at all.
+    #[test]
+    fn log_path_resolves_under_the_crate_log_dir() {
+        let name = c"reims-vgpu-gop-console.log";
+        let mut buf = [0 as c_char; 512];
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(name.as_ptr(), buf.as_mut_ptr(), buf.len()) },
+            REIMS_VGPU_QEMU_OK
+        );
+        let got = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_str()
+            .expect("path is utf-8");
+        assert_eq!(
+            got,
+            crate::observe::sink::log_path("reims-vgpu-gop-console.log"),
+            "the shim must resolve to exactly what the crate's own sinks use"
+        );
+        assert!(
+            std::path::Path::new(got).is_absolute(),
+            "shim artifacts must not be cwd-relative: {got}"
+        );
+    }
+
+    /// A buffer one byte short of the terminator must be refused, not filled: a
+    /// truncated path is well-formed, so the shim would open the wrong file and
+    /// report success.
+    #[test]
+    fn log_path_refuses_truncation_and_bad_args() {
+        let name = c"reims-vgpu-gop-console.log";
+        let exact = crate::observe::sink::log_path("reims-vgpu-gop-console.log").len();
+
+        let mut buf = vec![0 as c_char; exact];
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(name.as_ptr(), buf.as_mut_ptr(), buf.len()) },
+            REIMS_VGPU_QEMU_ERR_ARGS,
+            "a buffer with no room for the NUL must be refused"
+        );
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "a refused call must not have written a partial path"
+        );
+
+        let mut buf = vec![0 as c_char; exact + 1];
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(name.as_ptr(), buf.as_mut_ptr(), buf.len()) },
+            REIMS_VGPU_QEMU_OK,
+            "exactly enough room for the path and its NUL must succeed"
+        );
+
+        let mut buf = [0 as c_char; 512];
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(std::ptr::null(), buf.as_mut_ptr(), buf.len()) },
+            REIMS_VGPU_QEMU_ERR_ARGS
+        );
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(c"".as_ptr(), buf.as_mut_ptr(), buf.len()) },
+            REIMS_VGPU_QEMU_ERR_ARGS
+        );
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(name.as_ptr(), std::ptr::null_mut(), 512) },
+            REIMS_VGPU_QEMU_ERR_ARGS
+        );
+        assert_eq!(
+            unsafe { reims_vgpu_qemu_log_path(name.as_ptr(), buf.as_mut_ptr(), 0) },
+            REIMS_VGPU_QEMU_ERR_ARGS
+        );
     }
 
     #[test]

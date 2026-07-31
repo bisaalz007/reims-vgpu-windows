@@ -163,7 +163,7 @@ typedef struct ReimsVgpuHostOps {
      * CPU stores into them with no device operation, so no counter the Rust
      * device keeps can witness such a store, and any host-side copy of those
      * pages is silently stale from that instant. The hypervisor's dirty
-     * bitmap is the only witness, and these three calls are the door to it.
+     * bitmap is the only witness, and these four calls are the door to it.
      *
      * track_guest_writes registers `count` page-aligned GPAs (each of
      * `page_size` bytes) as one tracked set and returns a non-zero opaque
@@ -175,11 +175,22 @@ typedef struct ReimsVgpuHostOps {
      * written, or 0 for an unknown token; it is safe from any thread, while
      * track/untrack are not (they mutate QEMU MemoryRegion logging state and
      * must run with the BQL held).
+     *
+     * guest_written_pages answers *which* pages of the set moved since
+     * `since_gen`, writing their GPAs into `out` (capacity `max`) and returning
+     * the count. guest_write_gen only says *whether* the set moved, which forces
+     * a resident spanning many pages to re-read all of them to find the few that
+     * did; this makes the re-read proportional to the damage instead. A negative
+     * return is "cannot tell" — an unknown token, or a `since_gen` older than
+     * the per-page record still held — and is distinct from a 0 count, which
+     * means the set genuinely did not move.
      */
     uint64_t (*track_guest_writes)(void *ctx, const uint64_t *gpas, size_t count,
                                    size_t page_size);
     void (*untrack_guest_writes)(void *ctx, uint64_t token);
     uint64_t (*guest_write_gen)(void *ctx, uint64_t token);
+    int64_t (*guest_written_pages)(void *ctx, uint64_t token, uint64_t since_gen,
+                                   uint64_t *out, size_t max);
 } ReimsVgpuHostOps;
 
 /* Default guest page size for arm64e / vmapple (create may override). */
@@ -258,6 +269,23 @@ int reims_vgpu_qemu_window_set_early_fb(uint64_t handle, const uint8_t *ptr,
                                  uint32_t stride, uint32_t width,
                                  uint32_t height);
 int reims_vgpu_qemu_backend_name(char *buf, size_t buf_len);
+
+/*
+ * Resolve `name` (a bare filename) against the directory the crate drops its
+ * always-on artifacts in, writing the absolute path NUL-terminated into buf.
+ *
+ * The shim must not spell that directory itself. `/tmp` is a real path only on
+ * the Unix rails; on Windows it is drive-relative, so fopen fails and an
+ * always-on log goes silent with nothing to say so. REIMS_VGPU_LOG_DIR is
+ * honoured here too, so a run redirects the shim's artifacts and the crate's
+ * sinks together.
+ *
+ * REIMS_VGPU_QEMU_OK on success. REIMS_VGPU_QEMU_ERR_ARGS on a null/empty name,
+ * a null buf, or a buf too small to hold the path and its terminator — the path
+ * is never truncated, because a truncated one is well-formed and wrong.
+ */
+int reims_vgpu_qemu_log_path(const char *name, char *buf, size_t buf_len);
+
 uint32_t reims_vgpu_qemu_abi_version(void);
 
 int reims_vgpu_qemu_gfx_read(uint64_t handle, uint64_t offset, uint32_t size,

@@ -19,6 +19,125 @@ execute it through Metal or Vulkan. We ship no guest driver.
 Pathway-specific facts must be verified on the pathway being changed. Do not generalize from arm64
 to x86, from Metal to Vulkan, or from one host GPU class to another.
 
+### A fourth pathway exists in the tree and is NOT proven
+
+| Pathway | Host | Guest | Attach | Page shift | Backend | Boot |
+|---|---|---|---|---|---|---|
+| x86 macOS / Windows Vulkan | Windows x86_64 (**WHPX**) | x86_64 macOS Metal guest | PCI (`reims-vgpu-pci`) | 12 | Vulkan | `vm/boot-x86.sh` (`ACCEL=whpx`) |
+
+Treat this as bring-up, not a supported rail. What is true today, stated narrowly:
+
+- The crate, `hw/display/meson.build`, `scripts/qemu-build/qemu-build.sh`, `vm/boot-x86.sh` and the
+  feature matrix all have a Windows arm. **None of it has been compiled or run.** Every claim about
+  it is derived from source, not measured.
+- **No public report exists of any x86_64 macOS booting under QEMU+WHPX, at any macOS version.**
+  Second-hand claims about macOS Ventura on Windows QEMU predate the February 2026 rewrite that
+  moved WHPX MMIO decoding off Microsoft's `WinHvEmulation.dll` and onto QEMU's in-tree
+  `target/i386/emulate`, so they say nothing about this tree.
+- Verified by reading the vendored source, so you need not re-derive it:
+  `-accel whpx,ignore-unknown-msr=` defaults **on** (`accel/whpx/whpx-common.c:557`,
+  `target/i386/whpx/whpx-all.c:2922`), so the Linux rail's `options kvm ignore_msrs=1` requirement
+  has **no Windows equivalent to configure** — it is already the default.
+- Verified and load-bearing: WHPX intercepts a **fixed 25-leaf CPUID list**
+  (`target/i386/whpx/whpx-all.c:3029`) and Hyper-V answers everything else from the host CPU.
+  **Leaves `0x2`, `0x4`, `0x5` are not in that list**, and XNU reads all three —
+  `osfmk/i386/cpuid.c` takes cores-per-package straight out of leaf 4 for the Penryn family, with no
+  reference to QEMU's `-smp`. If SMP topology looks wrong in a WHPX guest, look there first. The fix
+  is appending to that list, not a new mechanism; do not add it speculatively.
+- Untested and dangerous to assume: whether `snapshots/current` behaves as a junction under MSYS2,
+  whether QEMU's AF_UNIX QMP socket works on Windows, and whether AppleParavirtGPU issues any
+  vector instruction to BAR0 MMIO (which QEMU's in-tree emulator cannot decode — it would
+  `abort()` on an unknown opcode, or silently skip a decoded-but-unhandled one).
+
+The intended guest for this pathway is macOS 26 Tahoe, and the guest-driver question is **settled
+in the affirmative**. Measured on an Intel Tahoe install (2026-07-31), so do not re-derive it:
+
+| Fact | Value |
+|---|---|
+| `AppleParavirtGPU.kext/Contents/Info.plist` → `IOPCIMatch` | `0xEEEE106B` — i.e. vendor `0x106B`, device `0xEEEE` |
+| `IOProviderClass` | `IOPCIDevice` |
+| Kernel code | present in `/System/Library/KernelCollections/SystemKernelExtensions.kc` as an `LC_FILESET_ENTRY` for `com.apple.driver.AppleParavirtGPU`; `__TEXT,__text` 77626 bytes, `LC_SOURCE_VERSION` 63.4.3, UUID `1A14B80D-E04B-3199-8F6C-55D735ADD7E3` |
+| `AppleParavirtGPUMetal.bundle` | universal, **x86_64** + arm64e |
+| `AppleParavirtGPUMetalIOGPUFamily.bundle` | universal, **x86_64** + arm64e |
+
+So `hw/display/reims-vgpu-pci.c`'s `0x106B:0xEEEE` is still the right pairing on Tahoe, the x86_64
+user-space Metal stack was not dropped, and the kext is not a codeless stub. Four hypotheses are
+dead and must not be re-raised without new evidence: that Tahoe changed the PCI ID, that it removed
+the paravirt GPU from Intel builds, that the Metal driver went arm64e-only, and that the kext is
+metadata alone.
+
+#### Tahoe ships *two* paravirt GPU stacks, and only one can bind over PCI
+
+Read off the shipped `IOKitPersonalities` on macOS 26.3.1 build 25D771280a (x86_64):
+
+| Kext | Personality | Provider | Match | Metal plugin |
+|---|---|---|---|---|
+| `AppleParavirtGPU` 15.0.0 | `AppleParavirtGPUControl` | `IOPCIDevice` | `IOPCIMatch 0xEEEE106B`, `IOProbeScore 1000000` | `AppleParavirtGPUMetal` / `AppleParavirtDevice` |
+| `AppleParavirtGPUIOGPUFamily` 15.0.0 | `AppleParavirtGPUARM` | `AppleARMIODevice` | `IONameMatch paravirtualizedgraphics,gpu` | `AppleParavirtGPUMetalIOGPUFamily` / `AppleParavirtDevice` |
+| `AppleParavirtIOSurface` 15.0.0 | `ParavirtMapperDevice` | `AppleARMIODevice` | `IONameMatch paravirtualizedgraphics,iosurface` | — |
+
+The two stacks **do not compete**: the IOGPUFamily one matches a device-tree name on an
+`AppleARMIODevice`, which does not exist on a PCI x86 machine. So an x86 guest attached to
+`reims-vgpu-pci` binds the legacy IOAccelerator-family stack, and only that one — the same stack the
+crate's decode was built against. There is no probe contest to lose, and `IOProbeScore 1000000`
+puts it far above any generic display driver matching the same ID.
+
+This is also the line the repo's two attach shims fall along: `reims-vgpu-pci` (x86, page shift 12)
+faces `AppleParavirtGPUControl`; `reims-vgpu-mmio` (arm64 `vmapple`, page shift 14) faces the
+`AppleARMIODevice` side. Do not reason from one to the other.
+
+Corroborating: only `com.apple.driver.AppleParavirtGPU` has an `LC_FILESET_ENTRY` in the x86
+`SystemKernelExtensions.kc`; the other two have none. All 1118 `AppleParavirt*` symbols in that
+collection belong to the PCI stack — the class `AppleParavirtGPU` (the IOGPUFamily `IOClass`) has
+zero symbols there.
+
+#### The PCI stack's interface surface, as shipped in Tahoe
+
+Class map (method counts from the kernel collection's symbol table), useful for orienting decode
+work against real driver structure rather than guesses:
+
+`AppleParavirtResource` 107 · `AppleParavirtPageTable` 106 · `AppleParavirtDisplayPipe` 101 ·
+`AppleParavirtFramebuffer` 78 · `AppleParavirtAccelerator` 76 · `AppleParavirtShared` 50 ·
+`AppleParavirtVirtualChannel` 41 · `AppleParavirtResourceHeap` 39 · `AppleParavirtCommandQueue` 37 ·
+`AppleParavirtSharedUserClient` 34 · `AppleParavirtResourceHeapNamespace` 33 · `AppleParavirtTask` 32 ·
+`AppleParavirtSegmentResourceList` 30 · `AppleParavirtDisplayMachine` 30 · `AppleParavirtEventMachine` 28 ·
+`AppleParavirtGPUControl` 27 · `AppleParavirt2DContext` 26 · `AppleParavirtRootChannel` 24 ·
+`AppleParavirtMemoryMap` 24 · `AppleParavirtKernelTask` 23 · `AppleParavirtVidMemory` 22 ·
+`AppleParavirtDisplayPipeFence` 21 · `AppleParavirtResourceHeapHandle` 20 · `AppleParavirtSysMemory` 19 ·
+`AppleParavirtChannel` 19 · `AppleParavirtCommandAllocator` 12
+
+Names that matter for bring-up:
+
+- `AppleParavirtGPUControl::start` → `::setupMMIO` is the PCI attach entry point. **The first BAR0
+  access from the guest OS comes from `setupMMIO`.** Anything touching BAR0 before that is firmware
+  (OVMF/the option ROM), so an attach witness that cannot tell them apart proves nothing.
+- `AppleParavirtAccelerator::configureDevice(IOPCIDevice*)`, `::setupChannels`, `::setupVersion`,
+  `::newCommandQueue`, `::newDisplayPipe`, `::getStampMemory` — the bring-up sequence, in the order
+  the log should show it.
+- `AppleParavirtRootChannel::submitBuffer` and `AppleParavirtVirtualChannel::submitBuffer` — the two
+  submission paths behind the root/child opcode split the crate decodes.
+- `AppleParavirtCommandQueue::parseSegmentList`, `::processSegmentKernelCommand`,
+  `::processExecIndirect`, `::writeInvalidates` — the command-stream shape, including the indirect
+  path the crate handles in `runtime/icb/`.
+- `AppleParavirtChannel::getChannelLabel` — channels are labelled in the driver, so channel identity
+  is a driver-side concept, not a number this project invented.
+- `AppleParavirtRootChannel::resetHardwareAndReplay` / `::hasFault` /
+  `::getHardwareDiagnosisReport` — the guest **can** decide the device faulted and replay. A boot
+  that silently loops may be the guest resetting us, not us hanging.
+
+Versions to diff against a Ventura 13 install when asking "did the protocol drift": kext
+`CFBundleVersion` 15.0.0, `LC_SOURCE_VERSION` 63.4.3, Metal bundles `CFBundleVersion` 63.4.3.
+
+Two things this does **not** establish, because they cannot be seen from the file system: whether
+Tahoe's MMIO/command-stream protocol still matches what this crate decodes, and whether Tahoe-era
+`.mtlb`/AIR is within metal2vulkan's coverage. `LC_SOURCE_VERSION` 63.4.3 is the cheapest available
+proxy for protocol drift — compare it against the same field on a Ventura 13 install before
+assuming the decoder is current.
+
+`is_tahoe` (`runtime/drain/mod.rs`) is presently **dead state**: written on
+`ROOT_OP_DEVICE_INFO_TAHOE` (`0x3a`) and read only by a test. Every dated live-RE annotation on the
+x86 rail names Ventura 13.7.8. Do not read "Tahoe is decoded" into the presence of that opcode.
+
 ## Main Components
 
 - `vendor/qemu` - QEMU fork with the thin device shim: QOM, MMIO/BAR, IRQ/MSI, console/display
@@ -46,6 +165,14 @@ backend policy, and performance behavior belong in Rust.
 If a decoded guest command is rejected, dropped, degraded, unsupported, or mis-executed, make the
 reason visible. Use typed decline/refusal reasons and emit them through the always-on failure path
 so `/tmp/reims-vgpu-fail.log` explains what happened.
+
+That path is `/tmp` **literally** on the Unix rails — this doc names it, the boot scripts open it,
+and offline analysis greps it, so the sink does not follow `TMPDIR`. On Windows there is no `/tmp`
+(the spelling is drive-relative and would drop every line), so the sink falls back to the OS temp
+directory. `REIMS_VGPU_LOG_DIR` overrides on every host. One helper decides this for the sinks and
+for every other artifact the crate drops — the GOP console proxy, the compute-stall SPIR-V dump, the
+metal2vulkan handoff last resort — so a new host is one edit in `observe::sink`, not a literal
+repeated across `runtime/`. Do not reintroduce a bare `"/tmp/..."` path anywhere in the crate.
 
 Expected control flow should stay quiet. A resolver saying "not ready yet" or an intentionally
 unbound `ref == 0` is not a failure. A real loss of guest work is.
@@ -125,6 +252,13 @@ Pick the pathway your change affects.
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
+- x86 on Windows (unproven rail): from a **MINGW64** MSYS2 shell,
+  `vm/boot-x86.sh --device reims-vgpu-pci --testing` (picks `ACCEL=whpx` from `uname -s`). There is
+  **no screenshot script for this host yet**, so there is no way to close the loop on a visual
+  claim — say so rather than reporting a boot as verified. Evidence is `$RUN_DIR/serial-*.log`,
+  `$RUN_DIR/qemu-*.log` (QEMU's own `-D`, which carries the `-cpu ...,check` feature-strip warnings
+  — the ground truth for what WHPX actually exposes) and the fail sink under `%TEMP%` or
+  `REIMS_VGPU_LOG_DIR`.
 
 For Rust changes, run the relevant native tests serially from the repo root:
 
@@ -144,6 +278,13 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 
 ```sh
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
+```
+
+On Windows there is no `pkill`, and a live test binary holds a lock that makes the next `cargo
+build` fail with a confusing "Access is denied" on the executable rather than a test failure:
+
+```sh
+taskkill //F //IM 'reims_vgpu-*.exe' 2>/dev/null || true
 ```
 
 ### Vulkan validation layers without root
@@ -206,6 +347,11 @@ Use the appropriate subset for the host and change; the Metal command is Apple-o
 cargo clippy -p reims-vgpu --all-targets --features backend-metal -- -D warnings
 cargo clippy -p reims-vgpu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 cargo clippy -p reims-vgpu --target x86_64-unknown-linux-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
+cargo clippy -p reims-vgpu --target x86_64-pc-windows-gnu --all-targets --no-default-features --features backend-vulkan,host-window -- -D warnings
 ```
+
+The Windows arm needs `rustup target add x86_64-pc-windows-gnu` and is skipped-and-named by the
+feature matrix when absent. Run it whenever you touch a `target_os` gate, `observe::sink`, the
+`host_window` surface/event-loop code, or `hw/display/meson.build`.
 
 Do not hide warnings, skip an affected arm, or commit a dropped test count without calling it out.

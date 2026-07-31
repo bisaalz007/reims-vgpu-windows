@@ -305,6 +305,58 @@ fn the_result_string_scanner_reads_wrapped_types_and_only_the_error_slot() {
     assert_eq!(hits.len(), 2, "wrapped/direct string errors: {hits:?}");
 }
 
+/// Windows is gated as `target_os = "windows"`, never as the `windows` family
+/// predicate.
+///
+/// `crate::lib` states the rule the whole crate leans on: **gate the host on
+/// `target_os` and nothing else**, so that one grep for `target_os` finds every
+/// host gate. `cfg(windows)` defeats exactly that — and it buys nothing, because
+/// Windows is the only OS in its target family, so the two predicates are
+/// identical in meaning and differ only in whether a reader can find them.
+///
+/// `unix` is deliberately *not* covered by this gate. It spans many operating
+/// systems, so it is a genuinely different predicate rather than a shorter
+/// spelling of one `target_os`, and the crate uses it that way — the host-window
+/// event loop asks "X11 or Wayland" as `all(unix, not(target_os = "macos"))`,
+/// which is a statement about window systems and not a fourth host arm.
+///
+/// Comments and string literals are masked, so this paragraph is not a hit.
+/// Whitespace is folded so a rustfmt wrap inside the `cfg` cannot hide one.
+#[test]
+fn windows_is_gated_by_target_os_and_not_by_the_family_predicate() {
+    let root = crate_src();
+    let mut hits = Vec::new();
+    for path in rust_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = mask_comments_and_literals(&src);
+        let folded: String = masked
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        // `cfg(windows` and `cfg(not(windows` catch the bare family predicate.
+        // `target_os="windows"` never matches either, because the character
+        // after `cfg(` is `t`, and `not(windows` requires `windows` to be the
+        // whole predicate rather than a value.
+        for needle in ["cfg(windows)", "cfg(not(windows))", "cfg(any(windows", "cfg(all(windows"] {
+            if folded.contains(needle) {
+                hits.push(format!(
+                    "{} names {needle}",
+                    path.strip_prefix(&root).unwrap_or(&path).to_string_lossy()
+                ));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "spell the Windows host gate as target_os = \"windows\"; the `windows` \
+         family predicate means the same thing but is invisible to the grep \
+         every host gate is supposed to answer to:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
 /// `VK_EXT_external_memory_host` must never be asked for.
 ///
 /// Importing a host pointer over guest RAM gives the host GPU write access to

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# vm/boot-x86.sh — boot an x86_64 macOS guest under QEMU+KVM on Linux.
+# vm/boot-x86.sh — boot an x86_64 macOS guest under QEMU on Linux (KVM) or
+# Windows (WHPX). The accelerator follows the host; override with ACCEL.
 #
 # Display is selected by --device (primary VGA):
 #   vmware-svga      default console (OSX-KVM mainstream)
@@ -8,8 +9,9 @@
 #
 # SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): snapshots form an IMMUTABLE
 # HISTORY under `vm/disks/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}`
-# (each read-only, never overwritten). `vm/disks/snapshots/current` is a symlink
-# naming the active one. EVERY boot starts from a byte-identical COW clone of
+# (each read-only, never overwritten). `vm/disks/snapshots/current` points at the
+# active one — a symlink on Unix, a directory junction on Windows. EVERY boot
+# starts from a byte-identical COW clone of
 # `current` (btrfs reflink when available) and discards that clone on exit, so a
 # harsh kill or a wedge costs nothing and poisons nothing. A snapshot is never
 # booted directly.
@@ -31,6 +33,35 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Host classification. Under MSYS2 `uname -s` names the environment rather than
+# the OS (MINGW64_NT-…, MSYS_NT-…, CYGWIN_NT-…), so match a prefix. The host
+# decides the accelerator, the binary suffix, and how "is acceleration usable"
+# is even asked — there is no /dev/kvm to stat on Windows.
+case "$(uname -s)" in
+  Linux)                HOST_KIND=linux ;;
+  Darwin)               HOST_KIND=darwin ;;
+  MINGW*|MSYS*|CYGWIN*) HOST_KIND=windows ;;
+  *)                    HOST_KIND=unknown ;;
+esac
+EXE_SUFFIX=""
+[ "$HOST_KIND" = windows ] && EXE_SUFFIX=".exe"
+
+# Accelerator. KVM on Linux, WHPX on Windows; overridable so a TCG bisect of a
+# guest-side bug does not need an edit. This is the one setting that decides
+# whether the boot is a hardware-virtualisation run at all, so it is echoed in
+# the banner rather than left implicit.
+if [ -z "${ACCEL:-}" ]; then
+  case "$HOST_KIND" in
+    linux)   ACCEL=kvm ;;
+    windows) ACCEL=whpx ;;
+    *)       ACCEL=tcg ;;
+  esac
+fi
+case "$ACCEL" in
+  kvm|whpx|tcg) ;;
+  *) echo "boot-x86.sh: unknown ACCEL '$ACCEL' (kvm | whpx | tcg)" >&2; exit 2 ;;
+esac
 
 # --- Configuration (override via env or flags) ----------------------------------
 DISKS_DIR="${DISKS_DIR:-$SCRIPT_DIR/disks}"
@@ -55,7 +86,7 @@ RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 #   survives the sweep, keeps hostfwd 2222, and the next boot fails to bind and
 #   exits — after which the scoring script talks to the *pinned* guest and
 #   reports a clean run of the wrong binary.
-QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
+QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64${EXE_SUFFIX}"
 QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
 OVMF_CODE="${OVMF_CODE:-$OVMF_DIR/OVMF_CODE_4M.fd}"
@@ -105,7 +136,8 @@ Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
 Env: DISKS_DIR OVMF_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
      OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
-     CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
+     CPU_OPTIONS ACCEL CPU_PARAVIRT SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC
+     REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
      NET=user (SLIRP, default) | NET=none (no NIC)
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
@@ -115,6 +147,10 @@ Env: DISKS_DIR OVMF_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTE
      TRACE=1 — QEMU trace events → \$RUN_DIR/trace-<stamp>.log
      TRACE_PATTERN=glob — override the default trace glob
      TRACE_EVENTS_FILE=path — QEMU trace event list file; overrides TRACE_PATTERN
+On Windows QEMU's own warnings (notably the \`-cpu ...,check\` feature strip, which
+is the ground truth for what WHPX exposes) go to \$RUN_DIR/qemu-<stamp>.log, since
+a GUI-subsystem binary has no console. \`-D\` names one file for the whole process,
+so under TRACE=1 those warnings share the trace log instead.
 EOF
 }
 
@@ -169,9 +205,54 @@ clone_file() {
   cp -f "$src" "$dst"
 }
 
+# `snapshots/current` names the active snapshot AND is traversed as a path
+# (`$CURRENT/macos.img`), so it has to be a real directory indirection rather
+# than a file holding a label. On Unix that is a symlink.
+#
+# On Windows it is a directory junction. Not a symlink: MSYS2's `ln -s` defaults
+# to *copying* rather than linking, which would silently fork the immutable
+# history into a second full-size copy, and a native symlink needs Developer
+# Mode or admin. A junction needs neither.
+#
+# The removal below is the dangerous part and is written to be junction-safe:
+# `cmd /c rmdir` on a junction unlinks the junction and never follows it, where
+# `rm -rf` might recurse into the target and delete the golden snapshot this
+# whole scheme exists to protect. Anything at $CURRENT that is not a link is
+# left alone and reported, never deleted.
+snapshot_pointer_set() {
+  local label="$1"
+  if [ "$HOST_KIND" != windows ]; then
+    ln -sfn "$label" "$CURRENT"
+    return
+  fi
+  if [ -e "$CURRENT" ] || [ -L "$CURRENT" ]; then
+    [ -L "$CURRENT" ] || die "refusing to replace $CURRENT: not a link (move it aside by hand)"
+    cmd //c rmdir "$(cygpath -w "$CURRENT")" >/dev/null 2>&1 \
+      || die "failed to unlink the existing $CURRENT junction"
+  fi
+  cmd //c mklink //J "$(cygpath -w "$CURRENT")" "$(cygpath -w "$SNAPSHOTS_DIR/$label")" >/dev/null \
+    || die "failed to point $CURRENT at $label (mklink /J)"
+  # A junction records only its target path, and reading it back through
+  # `readlink` is not reliable under MSYS2, so the label is also written plainly.
+  printf '%s\n' "$label" > "$SNAPSHOTS_DIR/current.label"
+}
+
+snapshot_pointer_label() {
+  if [ "$HOST_KIND" = windows ] && [ -f "$SNAPSHOTS_DIR/current.label" ]; then
+    cat "$SNAPSHOTS_DIR/current.label"
+    return
+  fi
+  readlink "$CURRENT" 2>/dev/null || echo current
+}
+
 ensure_rust_tools() {
-  if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
-    export PATH="$HOME/.cargo/bin:$PATH"
+  if ! command -v cargo >/dev/null 2>&1; then
+    # MSYS2 puts the toolchain in the MINGW64 prefix; rustup puts it under $HOME.
+    if [ "$HOST_KIND" = windows ] && [ -x /mingw64/bin/cargo.exe ]; then
+      export PATH="/mingw64/bin:$PATH"
+    elif [ -x "$HOME/.cargo/bin/cargo" ]; then
+      export PATH="$HOME/.cargo/bin:$PATH"
+    fi
   fi
   command -v cargo >/dev/null 2>&1 || die "cargo not found (needed to build reims-vgpu)"
 }
@@ -209,7 +290,23 @@ else
 fi
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
 [ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
-[ -r /dev/kvm ] || die "KVM not available (/dev/kvm); is kvm loaded and are you in the kvm group?"
+# "Is the accelerator actually there" is asked differently per host, and asking
+# it wrongly is worse than not asking: a TCG fallback boots, looks alive, and
+# runs ~50x slower, which reads as a guest hang rather than a host misconfig.
+case "$ACCEL" in
+  kvm)
+    [ -r /dev/kvm ] || die "KVM not available (/dev/kvm); is kvm loaded and are you in the kvm group?"
+    ;;
+  whpx)
+    # There is no device node to stat. The binary's own accelerator list is the
+    # authority: it reflects both what QEMU was configured with and what the
+    # Windows Hypervisor Platform headers were available at build time.
+    "$QEMU_BIN" -accel help 2>/dev/null | grep -qi whpx || die \
+      "WHPX not available in $QEMU_BIN. Build with scripts/qemu-build/qemu-build.sh
+   and enable the platform feature (admin, needs a reboot):
+     DISM /online /Enable-Feature /FeatureName:HypervisorPlatform /All"
+    ;;
+esac
 
 CURRENT="$SNAPSHOTS_DIR/current"
 HAVE_SNAPSHOT=0
@@ -235,7 +332,12 @@ mkdir -p "$RUN_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SERIAL_LOG="$RUN_DIR/serial-$STAMP.log"
 QMP_SOCK="$RUN_DIR/qmp-$STAMP.sock"
-ln -sfn "qmp-$STAMP.sock" "$RUN_DIR/qmp.sock"
+# Convenience pointer for tools that do not know this run's stamp. Skipped on
+# Windows: MSYS2's `ln -s` would copy rather than link, and a copied socket is a
+# plain file that silently accepts no connection.
+if [ "$HOST_KIND" != windows ]; then
+  ln -sfn "qmp-$STAMP.sock" "$RUN_DIR/qmp.sock"
+fi
 
 # --- Control-plane trace rail ---------------------------------------------------
 TRACE="${TRACE:-0}"
@@ -257,6 +359,30 @@ if [ "$TRACE" = "1" ]; then
   fi
 fi
 
+# --- QEMU's own log destination -------------------------------------------------
+# `-D` names ONE file for the whole process: QEMU holds a single logfile handle,
+# so a second `-D` silently replaces the first rather than teeing. Trace output
+# and QEMU's warnings therefore cannot be split into two files. Passing both
+# would leave whichever came last as the only real destination, while the banner
+# still advertised the other — a file that exists, is empty, and reads as
+# "nothing went wrong" instead of "nothing was written here".
+#
+# So resolve the destination once and emit `-D` exactly once. Tracing wins when
+# it is on, because a run with TRACE=1 was asked for the trace specifically; the
+# warnings land in the same file rather than being dropped.
+#
+# On Windows the warnings are why this exists at all: when a UI backend is found
+# the build also produces a GUI-subsystem binary with no attached console, so
+# anything QEMU writes to stderr goes nowhere. The `-cpu ...,check` feature-strip
+# warnings are the ground truth for what WHPX actually exposes to the guest, and
+# losing them makes a failed boot undiagnosable from $RUN_DIR alone.
+QEMU_LOG=""
+if [ -n "$TRACE_LOG" ]; then
+  QEMU_LOG="$TRACE_LOG"
+elif [ "$HOST_KIND" = windows ]; then
+  QEMU_LOG="$RUN_DIR/qemu-$STAMP.log"
+fi
+
 if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   DISK="$DISK_MASTER"
   OPENCORE="$OPENCORE_MASTER"
@@ -268,7 +394,7 @@ else
   OPENCORE="$RUN_DIR/OpenCore-$STAMP.qcow2"
   OVMF_VARS="$RUN_DIR/OVMF_VARS-$STAMP.fd"
   IS_CLONE=1
-  echo "boot-x86.sh: reverting to snapshot '$(readlink "$CURRENT" 2>/dev/null || echo current)' ..."
+  echo "boot-x86.sh: reverting to snapshot '$(snapshot_pointer_label)' ..."
   clone_file "$CURRENT/macos.img" "$DISK"
   clone_file "$CURRENT/OpenCore.qcow2" "$OPENCORE"
   clone_file "$CURRENT/OVMF_VARS.fd" "$OVMF_VARS"
@@ -296,10 +422,23 @@ fi
 
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
+# Which paravirt interface the CPU model claims. On KVM the guest really is on
+# KVM and the leaf is QEMU's to fill in. On WHPX it is not: QEMU's WHPX CPUID
+# handler rewrites the hypervisor leaves (0x40000000/1/10) from partition state
+# regardless of this property, so asking for KVM's would be a claim the
+# accelerator then contradicts. Overridable, because "what the guest is told it
+# is running on" is exactly the knob a macOS bring-up needs to sweep.
+if [ -z "${CPU_PARAVIRT:-}" ]; then
+  case "$ACCEL" in
+    whpx) CPU_PARAVIRT="kvm=off" ;;
+    *)    CPU_PARAVIRT="kvm=on" ;;
+  esac
+fi
+
 QEMU_ARGS=(
-  -enable-kvm
+  -accel "$ACCEL"
   -m "$RAM"
-  -cpu "${CPU_MODEL},-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
+  -cpu "${CPU_MODEL},-hle,-rtm,${CPU_PARAVIRT},vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
   -machine q35
   -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
   -device qemu-xhci,id=xhci
@@ -377,8 +516,11 @@ case "$GFX_DEVICE" in
     ;;
 esac
 
-if [ -n "$TRACE_LOG" ]; then
-  QEMU_ARGS+=(-trace "$TRACE_SPEC" -D "$TRACE_LOG")
+if [ -n "$TRACE_SPEC" ]; then
+  QEMU_ARGS+=(-trace "$TRACE_SPEC")
+fi
+if [ -n "$QEMU_LOG" ]; then
+  QEMU_ARGS+=(-D "$QEMU_LOG")
 fi
 if [ -n "$NETDEV" ]; then
   QEMU_ARGS+=(-netdev "$NETDEV" -device "virtio-net-pci,netdev=net0,id=net0,mac=$GUEST_MAC")
@@ -386,9 +528,10 @@ else
   QEMU_ARGS+=(-nic none)
 fi
 
-echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
+echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS accel=$ACCEL cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
 echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
-[ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
+[ -n "$TRACE_SPEC" ] && echo "boot-x86.sh: trace → $QEMU_LOG ($TRACE_SPEC)"
+[ -n "$QEMU_LOG" ] && echo "boot-x86.sh: qemu log → $QEMU_LOG"
 
 discard_clone() {
   if [ "${IS_CLONE:-1}" -eq 1 ]; then
@@ -401,7 +544,7 @@ discard_clone() {
   # next immediately otherwise has the dying instance delete the live
   # instance's symlink, and the driver then fails with a bare ENOENT partway
   # through a run — which reads as a guest defect, not as a missing socket.
-  if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
+  if [ "$HOST_KIND" != windows ] && [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
     rm -f "$RUN_DIR/qmp.sock"
   fi
 }
@@ -420,7 +563,7 @@ promote_to_snapshot() {
   clone_file "$OPENCORE" "$new_dir/OpenCore.qcow2"
   clone_file "$OVMF_VARS" "$new_dir/OVMF_VARS.fd"
   chmod 444 "$new_dir/macos.img" "$new_dir/OpenCore.qcow2" "$new_dir/OVMF_VARS.fd"
-  ln -sfn "$label" "$CURRENT"
+  snapshot_pointer_set "$label"
   discard_clone
   echo "boot-x86.sh: snapshot '$label' captured; current -> $label"
 }

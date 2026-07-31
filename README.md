@@ -40,8 +40,13 @@ their unit of work is on.
 | **arm64 macOS / macOS Metal** | Apple Silicon macOS (HVF) | arm64 macOS Metal guest (`vmapple`) | sysbus MMIO `reims-vgpu-mmio` | host **Metal** | `vm/boot-arm64.sh` |
 | **arm64 macOS / macOS Vulkan** | Apple Silicon macOS (HVF) | arm64 macOS Metal guest (`vmapple`) | sysbus MMIO `reims-vgpu-mmio` | host **Vulkan** via `metal2vulkan` through MoltenVK | `vm/boot-arm64.sh` |
 
+A fourth combination — **Windows x86_64 host under WHPX**, same `reims-vgpu-pci` device and native
+Vulkan — exists in the tree but is **bring-up, not a supported pathway**: it has not been compiled
+or booted, and no public report exists of any x86_64 macOS booting under QEMU+WHPX at any version.
+See the "fourth pathway" section of [`AGENTS.md`](AGENTS.md) for what is and is not known.
+
 - QEMU device shims: `vendor/qemu` tracks
-  [`steelbrain/qemu-reims-vgpu@host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/host-reims-vgpu-vmapple)
+  [`steelbrain/qemu-reims-vgpu@bot-branch-host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/bot-branch-host-reims-vgpu-vmapple)
   (thin C — QOM/MMIO/IRQ/console/HostOps only)
 - Product logic: `crates/reims-vgpu` (decode + device model + Metal/Vulkan backends)
 - Vulkan translator dependency: public `steelbrain/metal2vulkan` Git crate. On macOS, the Vulkan
