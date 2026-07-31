@@ -551,6 +551,16 @@ fi
 
 # Guest KP often reboots (even with OpenCore DB_HALT). Default exit so the GTK
 # window disappears and serial stays under vm/disks/run/serial-*.log.
+#
+# An install is the exception, and needs the opposite default: a macOS installer
+# reboots itself several times on purpose, between copying files and continuing.
+# Treating that as a fault ended the install at its first legitimate reboot --
+# measured, with 19.4 GiB already written to the target disk, no crash and no
+# hang recorded by the host, and QEMU simply gone. `reset` lets the guest come
+# back up and carry on.
+if [ -n "$INSTALLER_DRIVE" ]; then
+  QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-reset}"
+fi
 QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-exit}"
 case "$QEMU_REBOOT_ACTION" in
   exit)
@@ -695,8 +705,20 @@ else
 fi
 
 if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
-  # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
-  QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
+  if [ -n "$INSTALLER_DRIVE" ]; then
+    # An install runs for the better part of an hour with nobody at the console,
+    # so `mon:stdio` is the wrong shape for it twice over: the monitor is on
+    # stdin, which makes the VM die with the shell that launched it, and the
+    # guest's console goes to a terminal instead of to a file that survives.
+    # Both bit here -- a launch whose parent was torn down took the install with
+    # it, and the only record of how far it got was scrollback.
+    QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial "file:$SERIAL_LOG")
+    echo "boot-x86.sh: install boot — serial → $SERIAL_LOG (no monitor on stdio;" >&2
+    echo "boot-x86.sh:   the VM does not die with this shell, and the log outlives it)" >&2
+  else
+    # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
+    QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
+  fi
   rc=0
   "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
   if [ "$BOOT_CLASS" = "snapshot" ] && [ "$rc" -eq 0 ]; then
