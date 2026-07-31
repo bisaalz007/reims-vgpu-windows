@@ -483,6 +483,20 @@ elif [ "$HOST_KIND" = windows ]; then
   QEMU_LOG="$RUN_DIR/qemu-$STAMP.log"
 fi
 
+# `-D` only chooses where the log goes; `-d` decides whether anything is written
+# to it. Without a category the file is created, stays empty, and reads as "the
+# run was clean" — which is how a VM that WHPX stopped on an unexpected exit was
+# read for an entire bring-up, because the accompanying error_report went to a
+# stderr this GUI-subsystem binary does not have.
+#
+# guest_errors carries that stop reason. unimp carries requests a device
+# understood and did not act on, which is where the AppleSMC writes macOS makes
+# to restart the machine show up. Both are rare enough to leave on.
+QEMU_LOG_ITEMS=""
+if [ "$HOST_KIND" = windows ] && [ -z "$TRACE_SPEC" ]; then
+  QEMU_LOG_ITEMS="${QEMU_LOG_ITEMS:-guest_errors,unimp}"
+fi
+
 if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   DISK="$DISK_MASTER"
   OPENCORE="$OPENCORE_MASTER"
@@ -645,6 +659,9 @@ if [ -n "$TRACE_SPEC" ]; then
 fi
 if [ -n "$QEMU_LOG" ]; then
   QEMU_ARGS+=(-D "$QEMU_LOG")
+fi
+if [ -n "$QEMU_LOG_ITEMS" ]; then
+  QEMU_ARGS+=(-d "$QEMU_LOG_ITEMS")
 fi
 if [ -n "$NETDEV" ]; then
   QEMU_ARGS+=(-netdev "$NETDEV" -device "virtio-net-pci,netdev=net0,id=net0,mac=$GUEST_MAC")
