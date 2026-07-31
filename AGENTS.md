@@ -19,35 +19,77 @@ execute it through Metal or Vulkan. We ship no guest driver.
 Pathway-specific facts must be verified on the pathway being changed. Do not generalize from arm64
 to x86, from Metal to Vulkan, or from one host GPU class to another.
 
-### A fourth pathway exists in the tree and is NOT proven
+### A fourth pathway: the host boots macOS, the device is not proven on it
 
 | Pathway | Host | Guest | Attach | Page shift | Backend | Boot |
 |---|---|---|---|---|---|---|
 | x86 macOS / Windows Vulkan | Windows x86_64 (**WHPX**) | x86_64 macOS Metal guest | PCI (`reims-vgpu-pci`) | 12 | Vulkan | `vm/boot-x86.sh` (`ACCEL=whpx`) |
 
-Treat this as bring-up, not a supported rail. What is true today, stated narrowly:
+Treat this as bring-up, not a supported rail. Measured on 2026-07-31 on a Windows 11 host
+(RTX 4070 SUPER + Intel UHD 770, MSYS2 MINGW64), so do not re-derive it:
 
-- The crate, `hw/display/meson.build`, `scripts/qemu-build/qemu-build.sh`, `vm/boot-x86.sh` and the
-  feature matrix all have a Windows arm. **None of it has been compiled or run.** Every claim about
-  it is derived from source, not measured.
-- **No public report exists of any x86_64 macOS booting under QEMU+WHPX, at any macOS version.**
-  Second-hand claims about macOS Ventura on Windows QEMU predate the February 2026 rewrite that
-  moved WHPX MMIO decoding off Microsoft's `WinHvEmulation.dll` and onto QEMU's in-tree
-  `target/i386/emulate`, so they say nothing about this tree.
-- Verified by reading the vendored source, so you need not re-derive it:
-  `-accel whpx,ignore-unknown-msr=` defaults **on** (`accel/whpx/whpx-common.c:557`,
+- **The whole toolchain builds and the crate passes on Windows.** 1122 tests, clippy
+  `--target x86_64-pc-windows-gnu --all-targets -D warnings` clean, feature matrix green,
+  `qemu-system-x86_64.exe` links with `reims-vgpu-pci` present and `whpx` available. The
+  GPU-touching `vk_engine_batch` tests pass, so the Vulkan engine executes against a real ICD here.
+- **x86_64 macOS Tahoe 26.4 boots under QEMU+WHPX to its installer UI** (Darwin 25.4.0,
+  `xnu-12377.101.15`), with all 8 vCPUs enumerated. This is the claim that previously had no public
+  report; it now has one here, on this tree. It was reached with `vmware-svga`, **not** with
+  `reims-vgpu-pci` — see the open questions below.
+- `-accel whpx,ignore-unknown-msr=` defaults **on** (`accel/whpx/whpx-common.c:557`,
   `target/i386/whpx/whpx-all.c:2922`), so the Linux rail's `options kvm ignore_msrs=1` requirement
-  has **no Windows equivalent to configure** — it is already the default.
-- Verified and load-bearing: WHPX intercepts a **fixed 25-leaf CPUID list**
-  (`target/i386/whpx/whpx-all.c:3029`) and Hyper-V answers everything else from the host CPU.
-  **Leaves `0x2`, `0x4`, `0x5` are not in that list**, and XNU reads all three —
-  `osfmk/i386/cpuid.c` takes cores-per-package straight out of leaf 4 for the Penryn family, with no
-  reference to QEMU's `-smp`. If SMP topology looks wrong in a WHPX guest, look there first. The fix
-  is appending to that list, not a new mechanism; do not add it speculatively.
-- Untested and dangerous to assume: whether `snapshots/current` behaves as a junction under MSYS2,
-  whether QEMU's AF_UNIX QMP socket works on Windows, and whether AppleParavirtGPU issues any
-  vector instruction to BAR0 MMIO (which QEMU's in-tree emulator cannot decode — it would
-  `abort()` on an unknown opcode, or silently skip a decoded-but-unhandled one).
+  has **no Windows equivalent to configure**.
+- **CPUID leaves `0x2`, `0x4`, `0x5` are now in the WHPX exit list** and must stay there. WHPX lets
+  the hypervisor answer any leaf it does not exit, and XNU takes cores-per-package straight from
+  leaf 4 without consulting `-smp`. On a hybrid P/E-core host that produced a topology the guest
+  could not use: `-smp 8` hung in early SMP bring-up with **no console output at all**, `-smp 1`
+  booted. Adding the leaves fixed it. A silent early hang with the Apple logo still on screen is
+  what this failure looks like — reach for CPUID before suspecting the device.
+
+Three host facts that cost a build each, and are not discoverable from the code:
+
+- **Windows Developer Mode must be on.** `meson setup` runs `symlink-install-tree.py`, whose
+  `os.symlink` fails with `WinError 1314` without it, and meson reports only "Postconf script
+  failed" with the real error swallowed.
+- **`PYTHONUTF8=1` is required** and `scripts/qemu-build/qemu-build.sh` now exports it. QEMU's build
+  scripts read sources with a bare `open()`, which takes its encoding from the system locale; on a
+  Japanese Windows that is cp932 and `tracetool.py` dies on the first non-ASCII byte in
+  `hw/display/trace-events`, 229 targets in.
+- **`llvm-dis` and `spirv-val` must be on `PATH` at run time**, not just for tests — metal2vulkan
+  shells out to the first for AIR translation, and `vm/boot-x86.sh` refuses to start without either.
+  `mingw-w64-x86_64-llvm` and `mingw-w64-x86_64-spirv-tools` provide them.
+- **`x86_64-unknown-uefi` cannot be added to a distribution rustc.** MSYS2's
+  `mingw-w64-x86_64-rust` has no rustup, so `crates/reims-vgpu-efi` does not build there.
+  `vm/boot-x86.sh` now skips the option ROM and says so rather than failing the boot — the ROM only
+  provides a GOP before the product present path latches, and `REIMS_VGPU_GOP_ROM=` already existed
+  to turn it off. Set `REIMS_VGPU_GOP_ROM` to any value to make that failure fatal again.
+
+Guest-media facts, if a macOS installer image is involved:
+
+- A "macOS ISO" is usually **not ISO9660**. The one measured here is a raw disk with an Apple
+  Partition Map and a single `Apple_HFS` partition, and it must be attached as a disk, not CD media.
+- **OVMF cannot read an Apple Partition Map.** EDK2's `PartitionDxe` handles MBR, GPT, El Torito and
+  UDF; real Mac firmware handles APM and OVMF does not. The partition never becomes a block device,
+  so OpenCore's picker shows only its own ESP.
+- **Stripping the map instead is a trap.** XNU roots by boot-uuid (`rooting via boot-uuid from
+  /chosen`) and `AppleFileSystemDriver` publishes that UUID from a *partition* `IOMedia`. A disk with
+  no partition map has nothing to match, and the kernel sits at `Still waiting for root device`
+  with every disk detected and powered up. **A GPT describing the same extent satisfies both ends**;
+  nothing needs to be copied, only the first and last sectors rewritten.
+- OpenCore classes installer volumes as **auxiliary** entries. With `HideAuxiliary=true` the picker
+  hides them until Space is pressed, which reads exactly like the volume not being found.
+- Set `boot-args` to include `-v serial=1` before diagnosing anything: the kernel log then lands in
+  the `-serial` file as text instead of only on a screen that another window can overlap.
+
+Still untested and dangerous to assume: whether `snapshots/current` behaves as a junction under
+MSYS2, and whether AppleParavirtGPU issues any vector instruction to BAR0 MMIO (which QEMU's
+in-tree emulator cannot decode — it would `abort()` on an unknown opcode, or silently skip a
+decoded-but-unhandled one). QEMU's **AF_UNIX QMP socket is still unverified here**; the monitor over
+`tcp:127.0.0.1:PORT` does work and is the safe choice on this host.
+
+Nothing above says the device works. `reims-vgpu-pci` realizes under WHPX, the Vulkan backend
+initialises, and the always-on sinks are written — but no guest has attached to it, so every
+question about MMIO protocol, opcode coverage and present remains open on this rail.
 
 The intended guest for this pathway is macOS 26 Tahoe, and the guest-driver question is **settled
 in the affirmative**. Measured on an Intel Tahoe install (2026-07-31), so do not re-derive it:
@@ -252,13 +294,20 @@ Pick the pathway your change affects.
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
-- x86 on Windows (unproven rail): from a **MINGW64** MSYS2 shell,
-  `vm/boot-x86.sh --device reims-vgpu-pci --testing` (picks `ACCEL=whpx` from `uname -s`). There is
-  **no screenshot script for this host yet**, so there is no way to close the loop on a visual
-  claim — say so rather than reporting a boot as verified. Evidence is `$RUN_DIR/serial-*.log`,
+- x86 on Windows (device unproven): from a **MINGW64** MSYS2 shell,
+  `vm/boot-x86.sh --device reims-vgpu-pci --testing` (picks `ACCEL=whpx` from `uname -s`), then
+  `scripts/screenshot-when-windows-host/screenshot-when-windows-host.sh -o /tmp/screen.png`.
+  That script captures with `PrintWindow`, not a screen copy, so a window overlapping the VM cannot
+  end up in the "screenshot" — which happened on the first capture taken on this rail and is
+  indistinguishable from guest output. Other evidence is `$RUN_DIR/serial-*.log`,
   `$RUN_DIR/qemu-*.log` (QEMU's own `-D`, which carries the `-cpu ...,check` feature-strip warnings
   — the ground truth for what WHPX actually exposes) and the fail sink under `%TEMP%` or
   `REIMS_VGPU_LOG_DIR`.
+
+  To create the guest in the first place: `vm/boot-x86.sh --installer <image>`. It creates the
+  target disk, wraps an Apple-Partition-Map installer in a GPT without copying or modifying it, and
+  boots it. Put `-v serial=1` in OpenCore's `boot-args` before diagnosing anything the guest does —
+  the kernel log then lands in `$RUN_DIR/serial-*.log` as text.
 
 For Rust changes, run the relevant native tests serially from the repo root:
 

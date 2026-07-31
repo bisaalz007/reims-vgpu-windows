@@ -129,6 +129,13 @@ usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interac
   --interactive          human/GUI boot, no time limit, reverts
   --snapshot             boot writable; a clean guest shutdown CAPTURES a new snapshot
                          (also bootstraps the first snapshot on a fresh guest)
+  --installer PATH       attach a macOS installer image and boot it, for creating
+                         the guest in the first place. Implies --snapshot, because
+                         an install that reverts on shutdown has installed nothing.
+                         An Apple-Partition-Map image is wrapped in a GPT first
+                         (scripts/macos-installer-media), without copying it or
+                         modifying PATH; OVMF cannot read APM and XNU cannot root
+                         without a partition map, and only a GPT satisfies both.
 
 Every boot reverts to the current snapshot:
   $SNAPSHOTS_DIR/current -> <label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}
@@ -179,10 +186,21 @@ while [ "$#" -gt 0 ]; do
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
     --snapshot) BOOT_CLASS="snapshot"; shift ;;
+    --installer) shift; INSTALLER_IMAGE="${1:-}"; shift ;;
+    --installer=*) INSTALLER_IMAGE="${1#--installer=}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "boot-x86.sh: unknown arg: $1" >&2; usage >&2; exit 64 ;;
   esac
 done
+
+# An install writes the guest that every later boot reverts to, so it must not
+# revert itself. This has to be settled here rather than where the installer
+# media is prepared: the snapshot check runs in between, and it refuses any
+# class but `snapshot` when no snapshot exists yet -- which is the state every
+# install starts from.
+if [ -n "${INSTALLER_IMAGE:-}" ]; then
+  BOOT_CLASS="snapshot"
+fi
 
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-x86.sh: $*" >&2; exit 1; }
@@ -259,8 +277,31 @@ ensure_rust_tools() {
 
 build_reims_vgpu_efi() {
   [ -x "$REIMS_VGPU_EFI_ROM_SCRIPT" ] || die "EFI ROM builder not executable: $REIMS_VGPU_EFI_ROM_SCRIPT"
+
+  # The ROM is an enhancement -- it gives the guest a GOP before the product
+  # present path latches -- and the device works without it: REIMS_VGPU_GOP_ROM=
+  # already exists to turn it off, and the ROM is attached only "if built". So a
+  # host that cannot build it should lose the ROM, not the boot.
+  #
+  # It targets x86_64-unknown-uefi, which a distribution rustc cannot grow
+  # without rustup (MSYS2's mingw-w64-x86_64-rust is one such). Failing the whole
+  # run there reported a missing cross target as "the VM will not start", which
+  # is both wrong and the last message anyone wants while bringing a rail up.
   echo "boot-x86.sh: building reims-vgpu-efi option ROM ..."
-  "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
+  if "$REIMS_VGPU_EFI_ROM_SCRIPT"; then
+    return 0
+  fi
+  if [ -n "${REIMS_VGPU_GOP_ROM+x}" ]; then
+    die "reims-vgpu-efi build failed"
+  fi
+  REIMS_VGPU_GOP_ROM=""
+  export REIMS_VGPU_GOP_ROM
+  echo "boot-x86.sh: WARNING — reims-vgpu-efi did not build; booting with NO option ROM." >&2
+  echo "boot-x86.sh:   The guest gets no GOP before the product present path latches, so early" >&2
+  echo "boot-x86.sh:   firmware output will not be visible through reims-vgpu-pci. Everything" >&2
+  echo "boot-x86.sh:   after the first present boundary is unaffected." >&2
+  echo "boot-x86.sh:   Needs the x86_64-unknown-uefi target: rustup target add x86_64-unknown-uefi" >&2
+  echo "boot-x86.sh:   Set REIMS_VGPU_GOP_ROM to any value to make this failure fatal again." >&2
 }
 
 require_shader_toolchain
@@ -322,6 +363,19 @@ if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
 (boots the provisioned disk/OpenCore/OVMF_VARS writable for Setup Assistant + config; a clean
 guest shutdown then captures the first immutable snapshot. --testing/--interactive need a
 snapshot to revert to.)"
+  # An install is the one case where the target disk is *supposed* to be absent:
+  # it is what the installer is about to create. Every other boot requires it,
+  # because a missing disk there means a lost guest and creating a blank one
+  # silently would hide that.
+  if [ ! -f "$DISK_MASTER" ] && [ -n "${INSTALLER_IMAGE:-}" ]; then
+    command -v qemu-img >/dev/null 2>&1 || die \
+      "qemu-img is needed to create the target disk and is not on PATH
+(MSYS2: pacman -S mingw-w64-x86_64-qemu   Debian/Ubuntu: apt install qemu-utils)"
+    mkdir -p "$(dirname "$DISK_MASTER")"
+    echo "boot-x86.sh: creating target disk $DISK_MASTER (${INSTALL_DISK_SIZE:-128G}, sparse) ..."
+    qemu-img create -f qcow2 "$DISK_MASTER" "${INSTALL_DISK_SIZE:-128G}" >/dev/null \
+      || die "could not create $DISK_MASTER"
+  fi
   [ -f "$DISK_MASTER" ] || die "no provisioned disk at $DISK_MASTER"
   [ -f "$OPENCORE_MASTER" ] || die "no OpenCore image at $OPENCORE_MASTER"
   [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS master at $OVMF_VARS_MASTER"
@@ -357,6 +411,32 @@ if [ "$TRACE" = "1" ]; then
     fi
     TRACE_SPEC="$TRACE_PATTERN"
   fi
+fi
+
+# --- Installer media -------------------------------------------------------------
+# An install writes the guest that every later boot reverts to, so it must not
+# revert itself: --installer implies --snapshot rather than quietly discarding
+# the work at shutdown.
+#
+# The image is presented through a GPT overlay because the two ends of the boot
+# disagree about Apple Partition Map. OVMF's PartitionDxe cannot read APM, so the
+# installer never appears in OpenCore's picker; hand the guest the bare partition
+# instead and XNU, which roots by boot-uuid off a *partition* IOMedia, sits at
+# "Still waiting for root device" with every disk healthy. A GPT is read by both.
+# Nothing is copied and the source image is never written.
+INSTALLER_DRIVE=""
+if [ -n "${INSTALLER_IMAGE:-}" ]; then
+  [ -f "$INSTALLER_IMAGE" ] || die "installer image not found: $INSTALLER_IMAGE"
+  INSTALLER_DRIVE="$RUN_DIR/installer-$STAMP.qcow2"
+  echo "boot-x86.sh: preparing installer media from $INSTALLER_IMAGE ..."
+  # Invoked through the interpreter rather than the shebang: on Windows the
+  # shebang is not honoured, and the failure there is an exec error rather than
+  # anything about the media.
+  PY_BIN="$(command -v python3 || command -v python || true)"
+  [ -n "$PY_BIN" ] || die "python3 is needed to prepare installer media and is not on PATH"
+  "$PY_BIN" "$REPO_ROOT/scripts/macos-installer-media/macos-installer-media.py" \
+    "$INSTALLER_IMAGE" "$INSTALLER_DRIVE" --force \
+    || die "could not prepare installer media"
 fi
 
 # --- QEMU's own log destination -------------------------------------------------
@@ -458,6 +538,16 @@ QEMU_ARGS=(
   -device ide-hd,bus=sata.4,drive=MacHDD
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
+
+# sata.3, between OpenCore and the target disk. Attached as a disk rather than
+# CD media because these images are raw disks, not ISO9660, whatever the file is
+# named.
+if [ -n "$INSTALLER_DRIVE" ]; then
+  QEMU_ARGS+=(
+    -drive "id=Installer,if=none,format=qcow2,file=$INSTALLER_DRIVE"
+    -device ide-hd,bus=sata.3,drive=Installer
+  )
+fi
 
 # Guest KP often reboots (even with OpenCore DB_HALT). Default exit so the GTK
 # window disappears and serial stays under vm/disks/run/serial-*.log.
