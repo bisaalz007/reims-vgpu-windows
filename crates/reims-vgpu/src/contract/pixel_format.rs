@@ -231,6 +231,18 @@ pub enum RenderTargetClass {
     /// widgets). The GPU pass is 8-bit UNORM like every other target; the R/G
     /// channels round-trip through the f16 LUT at guest writeback/seed.
     Rg16Float = 6,
+    /// Single-channel float16 colour RT (Metal colour-renderable). The
+    /// one-channel sibling of [`Self::Rg16Float`] and used the same way — a
+    /// mask/coverage slot for vibrancy UI tiles — at the smaller extents those
+    /// tiles are composed at.
+    ///
+    /// Its absence was not a decode gap but a whole-pass one: `bytes_per_pixel`
+    /// has accepted `0x19` for sampling all along while `render_target_class`
+    /// did not list it, and one unresolvable colour attachment drops the entire
+    /// render pass. Measured on a logged-in desktop: 64 of 105
+    /// `mrt color RT resolve fail` lines name this format, and the caller
+    /// abandons the rest of the serialized draw list on each one.
+    R16Float = 7,
 }
 
 #[repr(u8)]
@@ -687,6 +699,7 @@ pub fn render_target_class(format: u16) -> Option<(RenderTargetClass, u32)> {
         MTL_FORMAT_BGRA8_UNORM_SRGB => (RenderTargetClass::Bgra8UnormSrgb, BGRA8_BPP),
         MTL_FORMAT_RGBA16_FLOAT => (RenderTargetClass::Rgba16Float, RGBA16F_BPP),
         MTL_FORMAT_RG16_FLOAT => (RenderTargetClass::Rg16Float, RG16F_BPP),
+        MTL_FORMAT_R16_FLOAT => (RenderTargetClass::R16Float, R16F_BPP),
         _ => return None,
     })
 }
@@ -953,6 +966,14 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
             rgba[COMPONENT_G] = lut[ld16(&src[2..4]) as usize];
             rgba[COMPONENT_A] = UNORM8_MAX;
         }
+        MTL_FORMAT_R16_FLOAT => {
+            // One float16 channel → R; G and B have no source (0), A opaque.
+            // The single-channel sibling of the RG16Float arm above, and the
+            // same LUT.
+            let lut = f16_to_unorm8_lut();
+            rgba[COMPONENT_R] = lut[ld16(&src[0..2]) as usize];
+            rgba[COMPONENT_A] = UNORM8_MAX;
+        }
         _ => return None,
     }
     Some(rgba)
@@ -988,6 +1009,12 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             let lut = unorm8_to_f16_lut();
             st16(&mut dst[0..2], lut[rgba[COMPONENT_R] as usize]);
             st16(&mut dst[2..4], lut[rgba[COMPONENT_G] as usize]);
+        }
+        MTL_FORMAT_R16_FLOAT => {
+            // R → one float16 channel; G,B,A have no destination. Inverse of
+            // the texel_to_rgba8 R16Float path.
+            let lut = unorm8_to_f16_lut();
+            st16(&mut dst[0..2], lut[rgba[COMPONENT_R] as usize]);
         }
         _ => return false,
     }
@@ -1200,6 +1227,55 @@ mod tests {
             texel_to_rgba8(MTL_FORMAT_RGBA16_UNORM, &texel),
             Some([0xff, 0x80, 0x00, 0x40])
         );
+    }
+
+    /// A format the guest renders into must be render-targetable, and the two
+    /// admission tables must agree about it.
+    ///
+    /// `R16Float` was accepted by `bytes_per_pixel` — so it sampled fine — while
+    /// `render_target_class` did not list it. One unresolvable colour attachment
+    /// drops the whole render pass and the caller abandons the rest of the
+    /// serialized draw list, so the disagreement cost 64 of the 105
+    /// `mrt color RT resolve fail` lines in one logged-in session, at extents
+    /// from 32x32 to 416x224.
+    ///
+    /// The round trip is pinned too: a colour target is written back through
+    /// `rgba8_to_texel` and seeded through `texel_to_rgba8`, so a class with no
+    /// arm in either would produce wrong pixels rather than none — worse than
+    /// the refusal it replaces.
+    #[test]
+    fn a_single_channel_float16_target_is_renderable_and_round_trips() {
+        assert_eq!(
+            render_target_class(MTL_FORMAT_R16_FLOAT),
+            Some((RenderTargetClass::R16Float, 2))
+        );
+        // Both tables now agree, which is the property that was broken.
+        assert_eq!(
+            bytes_per_pixel(MTL_FORMAT_R16_FLOAT),
+            render_target_bpp(MTL_FORMAT_R16_FLOAT)
+        );
+
+        // R survives the round trip; the channels the format cannot hold read
+        // back as the Metal defaults (0,0) with an opaque alpha, exactly as the
+        // two-channel sibling does.
+        for value in [0u8, 1, 64, 128, 200, 255] {
+            let mut texel = [0u8; 2];
+            assert!(rgba8_to_texel(
+                MTL_FORMAT_R16_FLOAT,
+                [value, 77, 88, 99],
+                &mut texel
+            ));
+            let back = texel_to_rgba8(MTL_FORMAT_R16_FLOAT, &texel)
+                .expect("R16Float must decode");
+            assert_eq!(back[COMPONENT_R], value, "R must survive at {value}");
+            assert_eq!(back[COMPONENT_G], 0);
+            assert_eq!(back[COMPONENT_B], 0);
+            assert_eq!(back[COMPONENT_A], UNORM8_MAX);
+        }
+
+        // A format that genuinely is not colour-renderable stays refused, so the
+        // table is still a statement and not a rubber stamp.
+        assert_eq!(render_target_class(MTL_FORMAT_R8_UNORM), None);
     }
 
     #[test]
