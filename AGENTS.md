@@ -39,6 +39,24 @@ Treat this as bring-up, not a supported rail. Measured on 2026-07-31 on a Window
 - `-accel whpx,ignore-unknown-msr=` defaults **on** (`accel/whpx/whpx-common.c:557`,
   `target/i386/whpx/whpx-all.c:2922`), so the Linux rail's `options kvm ignore_msrs=1` requirement
   has **no Windows equivalent to configure**.
+- **Keep the guest at 8 vCPUs.** WHPX stops the VM outright when a vCPU returns exit reason 4
+  (`InvalidVpRegisterValue`): QEMU logs `whpx: cpu N stopped the VM: unexpected exit reason 4 at
+  cs:rip ...` and the monitor then reports `VM status: paused`. Measured at `-smp 12,cores=6` on a
+  logged-in desktop — four vCPUs hit it within minutes, at four different guest RIPs, with no guest
+  panic and no message on the serial console. `-smp 8,cores=4` runs the same session without it. It
+  presents as a total guest freeze while the host window still redraws and the drain worker still
+  turns (`drain_duty ... draws=0 computes=0`), so it is easy to mistake for a device hang — check
+  `info status` before suspecting the device. `-smp 16` was already known to fail this way during
+  reset; the failure is not confined to reset.
+- **macOS idles into suspend-to-RAM and does not come back.** The guest logs `IOCPUSleepKernel
+  enter`, powers its devices down, and no keyboard or pointer event revives it; the screen stays
+  black with the host process alive, which reads exactly like a render failure and is not one. Do
+  not reach for `-global ICH9-LPC.disable_s3=1` to prevent it: measured here, taking S3 away made
+  things worse rather than better — two sessions then stopped with `whpx: cpu N stopped the VM:
+  unexpected exit reason 4`, once at four different kernel RIPs and once with four vCPUs at the
+  identical low-memory address `0038:0000000000002012`, which is AP-startup/resume trampoline
+  territory. Neither happened on the same tree with S3 left in place. Turn the idle timer off inside
+  the guest instead (`sudo pmset -a sleep 0 displaysleep 0 disablesleep 1`).
 - **CPUID leaves `0x2`, `0x4`, `0x5` are now in the WHPX exit list** and must stay there. WHPX lets
   the hypervisor answer any leaf it does not exit, and XNU takes cores-per-package straight from
   leaf 4 without consulting `-smp`. On a hybrid P/E-core host that produced a topology the guest
