@@ -109,6 +109,28 @@ impl EngineState {
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
 
+/// Presents skipped because the drain worker held `ENGINE`.
+///
+/// A running total rather than a per-event log line: contention is expected
+/// under load and logging each one would flood the sink. The count is what makes
+/// a wedge distinguishable from ordinary busyness, so it is reported with the
+/// cadence figures.
+#[cfg(feature = "host-window")]
+static WINDOW_PRESENT_LOCK_BUSY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many presents have been skipped for engine-lock contention.
+#[cfg(feature = "host-window")]
+pub fn window_present_lock_busy_count() -> u64 {
+    WINDOW_PRESENT_LOCK_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Latest window size the pump published, packed `width << 32 | height`.
+/// Zero means nothing is pending. Applied by the next present.
+#[cfg(feature = "host-window")]
+static WINDOW_PRESENT_PENDING_EXTENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Acquire the global engine lock. The single `ENGINE` mutex serializes all 34
 /// engine entry points across the drain worker and the QEMU main/present path,
 /// so this is on every one of them.
@@ -223,23 +245,65 @@ pub fn window_present_attached() -> bool {
     WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire)
 }
 
+/// Record a new window size for the next swapchain recreation.
+///
+/// Publishes to an atomic instead of taking `ENGINE`. This runs on the thread
+/// that owns the host window's message pump, and for the reason spelled out on
+/// [`window_present_frame`] that pump must never wait on the engine lock —
+/// Windows closes the process when it stops for about five seconds.
+///
+/// The size is not dropped when the engine is busy, it is deferred:
+/// `window_present_frame` applies the latest published value under the lock it
+/// already holds. `presenter.resize` only records `desired_extent` and arms
+/// `recreate_pending`, so applying it one present later changes nothing except
+/// when it takes effect. Coalescing is a feature here — a drag emits a resize
+/// per mouse move and only the last extent is wanted.
 #[cfg(feature = "host-window")]
 pub fn window_present_resize(width: u32, height: u32) {
-    let mut guard = lock_engine();
-    if let Some(presenter) = guard.window_presenter.as_mut() {
-        presenter.resize(width, height);
+    let packed = (u64::from(width.max(1)) << 32) | u64::from(height.max(1));
+    WINDOW_PRESENT_PENDING_EXTENT.store(packed, std::sync::atomic::Ordering::Release);
+}
+
+/// Apply any deferred window size. Caller holds `ENGINE`.
+#[cfg(feature = "host-window")]
+fn apply_pending_window_extent(presenter: &mut window_present::WindowPresenter) {
+    let packed = WINDOW_PRESENT_PENDING_EXTENT.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if packed == 0 {
+        return;
     }
+    presenter.resize((packed >> 32) as u32, packed as u32);
 }
 
 /// Present the current compositor resident through the engine-owned swapchain,
 /// falling back to `cpu` for presents no resident carries. Acquire is
 /// nonblocking, so a vblank wait never holds `ENGINE`.
+///
+/// The engine lock is *tried*, never waited on. This runs on the thread that
+/// owns the host window and therefore its OS message pump, and `ENGINE`
+/// serializes 34 entry points shared with the drain worker — including graphics
+/// pipeline creation, which has been measured on this rail at over a second for
+/// an ordinary shader and at over twenty minutes for the compositor's
+/// unstructured one. Waiting here parks the pump for as long as that takes.
+///
+/// On Windows that is fatal rather than merely slow: the host window is the
+/// process's only top-level window (QEMU runs `-display none`), and a top-level
+/// window that stops pumping for about five seconds is declared hung — Windows
+/// logs Application Hang (event 1002) and the process is closed. Repeated boots
+/// here died exactly that way, with the guest kernel log still healthy and no
+/// QEMU diagnostic, because nothing had crashed: the pump had simply stopped.
+///
+/// Declining the present is the cheap half of the trade. A skipped present shows
+/// the previous frame for one more tick and is already a modelled outcome
+/// (`Busy`, which the cadence counters track); a parked pump loses the process.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
     cpu: Option<WindowCpuFrame<'_>>,
 ) -> Result<WindowPresentOutcome, DrawError> {
-    let mut guard = lock_engine();
+    let Some(mut guard) = ENGINE.try_lock() else {
+        WINDOW_PRESENT_LOCK_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(WindowPresentOutcome::Busy);
+    };
     let EngineState {
         ref mut owner,
         ref mut pools,
@@ -251,6 +315,7 @@ pub fn window_present_frame(
     let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
         EngineFacadeDecline::WindowPresenterNotAttached,
     ))?;
+    apply_pending_window_extent(presenter);
     unsafe { presenter.present(ctx, pools, counters, source, cpu) }
 }
 
@@ -1075,5 +1140,50 @@ mod probe_visibility_tests {
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
             assert!(line.ends_with(&format!(" probe={}", probe.name())));
         }
+    }
+}
+
+#[cfg(all(test, feature = "host-window"))]
+mod window_pump_tests {
+    /// A deferred window size survives engine contention and coalesces.
+    ///
+    /// `window_present_resize` runs on the thread that owns the host window's
+    /// message pump, so it must not wait on `ENGINE` — Windows closes the
+    /// process when that pump stops for about five seconds. Publishing to an
+    /// atomic keeps it lock-free, and this pins the two properties that make
+    /// deferring safe rather than lossy: the value is not lost while the engine
+    /// is busy, and only the newest one is applied.
+    #[test]
+    fn a_deferred_window_extent_is_kept_and_coalesced() {
+        use std::sync::atomic::Ordering;
+
+        super::WINDOW_PRESENT_PENDING_EXTENT.store(0, Ordering::Release);
+
+        // Nothing published: nothing to apply, and the slot stays clear.
+        assert_eq!(
+            super::WINDOW_PRESENT_PENDING_EXTENT.swap(0, Ordering::AcqRel),
+            0
+        );
+
+        // A drag emits one resize per mouse move while the engine is held. The
+        // newest extent must be the one that survives.
+        super::window_present_resize(1280, 720);
+        super::window_present_resize(1600, 900);
+        super::window_present_resize(1920, 1080);
+        let packed = super::WINDOW_PRESENT_PENDING_EXTENT.swap(0, Ordering::AcqRel);
+        assert_eq!(((packed >> 32) as u32, packed as u32), (1920, 1080));
+
+        // Consumed exactly once — a second present must not re-apply it.
+        assert_eq!(
+            super::WINDOW_PRESENT_PENDING_EXTENT.swap(0, Ordering::AcqRel),
+            0
+        );
+
+        // A degenerate size is clamped rather than published as zero, which
+        // would be indistinguishable from "nothing pending".
+        super::window_present_resize(0, 0);
+        let packed = super::WINDOW_PRESENT_PENDING_EXTENT.swap(0, Ordering::AcqRel);
+        assert_ne!(packed, 0);
+        assert_eq!(((packed >> 32) as u32, packed as u32), (1, 1));
     }
 }

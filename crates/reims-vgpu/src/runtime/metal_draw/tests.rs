@@ -163,6 +163,60 @@ fn cpu_portability_store_publishes_composite() {
     assert_eq!(state.present.early_front_mapping, mid);
 }
 
+/// Which fragment texture slots must the Vulkan path materialise?
+///
+/// Metal defines sampling an unbound `[[texture(n)]]` as returning zero; Vulkan
+/// has no such rule, and the engine builds its descriptor layout from provided
+/// resources alone. So every declared texture slot has to be enumerable
+/// independently of what the draw bound, or a shader declaring `texture(0)` and
+/// a draw binding only `texture(3)` produces a pipeline whose layout omits the
+/// binding the shader uses — measured live as
+/// `VUID-VkGraphicsPipelineCreateInfo-layout-07988` plus
+/// `VUID-vkCmdDraw-None-08114` on `[Set 0, Binding 160]`, and seen from the
+/// guest as every window trailing its previous contents.
+///
+/// The exact live shape is pinned here: the compositor pipeline declared
+/// `[Texture[0], Buffer[0], Sampler[0], Buffer[1], Texture[3], StaticSampler[1]]`
+/// and bound only texture 3.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn declared_fragment_textures_are_enumerated_whatever_the_draw_bound() {
+    use metal2vulkan::reflect::ResourceKind as K;
+
+    let live_compositor = [
+        rb(K::Texture, 0),
+        rb(K::Buffer, 0),
+        rb(K::Sampler, 0),
+        rb(K::Buffer, 1),
+        rb(K::Texture, 3),
+        rb(K::StaticSampler, 1),
+    ];
+    assert_eq!(
+        declared_fragment_texture_indices(&live_compositor),
+        vec![0, 3],
+        "both declared textures must be enumerated, including the unbound one"
+    );
+
+    // A texture array is a bindable slot and counts; an embedded arg-buffer
+    // texture is not, and the render path declines it under its own name rather
+    // than quietly handing it a zero placeholder.
+    let mixed = [
+        rb(K::TextureArray, 2),
+        rb(K::EmbeddedArgBufferTexture, 9),
+        rb(K::ColorInput, 0),
+        rb(K::StorageImage, 4),
+    ];
+    assert_eq!(declared_fragment_texture_indices(&mixed), vec![2]);
+
+    // Sorted and deduplicated, so the placeholder pass visits each slot once
+    // regardless of declaration order.
+    let repeated = [rb(K::Texture, 5), rb(K::Texture, 1), rb(K::Texture, 5)];
+    assert_eq!(declared_fragment_texture_indices(&repeated), vec![1, 5]);
+
+    // Nothing declared, nothing to materialise.
+    assert!(declared_fragment_texture_indices(&[]).is_empty());
+}
+
 #[test]
 fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
     use metal2vulkan::reflect::ResourceKind as K;
