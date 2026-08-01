@@ -49,6 +49,39 @@ pub const MTL_FORMAT_RG8_UNORM: u16 = 0x1e;
 /// Value read off `MTLPixelFormat.h` like the rest of this table: `RG16Float` is
 /// already here at `0x41` (65), and `RG16Unorm` is 60.
 pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
+/// `MTLPixelFormatRG16Uint = 63`. Four bytes, two channels of 16-bit unsigned
+/// integer.
+///
+/// Read off two independent encodings of the same guest shader rather than from
+/// the enum position. Its SPIR-V declares the image at fragment texture index 3
+/// as integer-sampled:
+///
+/// ```text
+/// %50 = OpTypeImage %uint 2D 0 0 0 1 Unknown
+/// OpDecorate %52 Binding 35            // TEXTURE_BINDING_BASE + 3, pre-relocation
+/// ```
+///
+/// and the AIR metadata it was translated from names the Metal type outright:
+///
+/// ```text
+/// !"air.arg_type_name", !"texture2d<uint, sample>", !"air.arg_name", !"dist_surf"
+/// ```
+///
+/// A distance field: the shader fetches the texel, treats the two channels as a
+/// texel coordinate (`OpConvertUToF` then `OpFSub` against a floored coordinate,
+/// then `Sqrt` of the dot product), and never combines the image with a sampler
+/// — every access is `OpImageFetch` or `OpImageQuerySizeLod`, with `Lod`
+/// operands only. So it needs no filtering, which matters because Vulkan does
+/// not guarantee linear filtering for integer formats.
+///
+/// Deliberately absent from [`render_target_class`], [`texel_to_rgba8`] and
+/// [`rgba8_to_texel`]. Those rails carry colour through 8-bit unorm LUTs, and a
+/// coordinate stored in 16 unsigned bits does not survive that — it would come
+/// back quantized and reinterpreted as a normalized fraction. Declining a
+/// colour-target bind by name is the honest answer until the render rail can
+/// carry integer texels; producing wrong pixels would be worse than producing
+/// none.
+pub const MTL_FORMAT_RG16_UINT: u16 = 0x3f;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
 pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
 pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
@@ -182,6 +215,15 @@ pub enum TexelLayout {
     /// does its own YCbCr conversion, so expanding to RGBA8 would both cost 2x
     /// the staging bytes and quantize ten bits down to eight.
     Rg16Unorm,
+    /// 4 bytes/texel — two channels of 16-bit unsigned integer, sampled natively
+    /// as `R16G16_UINT`.
+    ///
+    /// Integer texels, so this layout exists precisely to keep them off the
+    /// RGBA8 rails: the bytes are uploaded verbatim and the shader fetches them
+    /// with `OpImageFetch`, which is the only way it is ever accessed. Passing
+    /// them through the unorm8 LUTs would quantize a 16-bit coordinate to 8 bits
+    /// and then read it as a fraction.
+    Rg16Uint,
     /// 4 bytes/texel — a single-channel `float32` texture, sampled natively as
     /// `R32_SFLOAT`. Same color-LUT role as [`Self::R16Float`], but its
     /// linear-filter feature is optional (absent on Apple/MoltenVK), so the
@@ -199,7 +241,7 @@ impl TexelLayout {
             Self::R8 => R8_BPP,
             Self::Rg8 => RG8_BPP,
             Self::R16Float | Self::R16Unorm => R16F_BPP,
-            Self::Rg16Unorm => RG16F_BPP,
+            Self::Rg16Unorm | Self::Rg16Uint => RG16F_BPP,
             Self::R32Float => R32F_BPP,
         }
     }
@@ -297,7 +339,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         | MTL_FORMAT_R16_FLOAT
         | MTL_FORMAT_RG8_UNORM
         | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
-        MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+        MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_UINT | MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
         MTL_FORMAT_RGBA8_UNORM
         | MTL_FORMAT_RGBA8_UNORM_SRGB
         | MTL_FORMAT_RGBA8_UINT
@@ -1292,6 +1334,7 @@ mod tests {
             (MTL_FORMAT_R32_SINT, 4),
             (MTL_FORMAT_R32_FLOAT, 4),
             (MTL_FORMAT_RG16_UNORM, 4),
+            (MTL_FORMAT_RG16_UINT, 4),
             (MTL_FORMAT_RG16_FLOAT, 4),
             (MTL_FORMAT_RGBA8_UNORM, 4),
             (MTL_FORMAT_RGBA8_UNORM_SRGB, 4),
