@@ -525,11 +525,24 @@ case "$NET" in
 esac
 
 # Product Reims VGPU: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init).
-if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
-  if [ "${CPU_THREADS}" -gt 8 ] 2>/dev/null; then
-    echo "boot-x86.sh: reims-vgpu-pci — capping SMP at 8 (was threads=$CPU_THREADS cores=$CPU_CORES)"
-    CPU_THREADS=8
-    CPU_CORES=8
+#
+# The cap is a guard, not a law: it was set from a boot that hung above 8, and
+# on a host where WHPX's own reset path fails with SMP at all it is not the only
+# thing in play. REIMS_VGPU_SMP_CAP=0 lifts it for a deliberate measurement;
+# anything else sets the ceiling. The clamp preserves the requested
+# cores-per-socket ratio rather than flattening it to cores=threads, so a
+# capped run still has the topology the caller asked for -- flattening it also
+# changed what CPUID leaf 4 reports, which is exactly the field XNU reads.
+REIMS_VGPU_SMP_CAP="${REIMS_VGPU_SMP_CAP:-8}"
+if [ "$GFX_DEVICE" = "reims-vgpu-pci" ] && [ "$REIMS_VGPU_SMP_CAP" != 0 ]; then
+  if [ "${CPU_THREADS}" -gt "$REIMS_VGPU_SMP_CAP" ] 2>/dev/null; then
+    threads_per_core=$(( CPU_CORES > 0 ? CPU_THREADS / CPU_CORES : 1 ))
+    [ "$threads_per_core" -lt 1 ] && threads_per_core=1
+    echo "boot-x86.sh: reims-vgpu-pci — capping SMP at $REIMS_VGPU_SMP_CAP (was threads=$CPU_THREADS cores=$CPU_CORES)"
+    echo "boot-x86.sh:   set REIMS_VGPU_SMP_CAP=0 to lift it, or to a number to raise it"
+    CPU_THREADS="$REIMS_VGPU_SMP_CAP"
+    CPU_CORES=$(( CPU_THREADS / threads_per_core ))
+    [ "$CPU_CORES" -lt 1 ] && CPU_CORES=1
     CPU_SOCKETS=1
   fi
 fi
