@@ -598,10 +598,26 @@ pub fn lookup_list_entry<M: HostMemory>(
         return None;
     }
     let task = &state.tasks[task_id as usize];
-    if !task.active || task.object_list_count == 0 {
+    // Three different misses used to share one silent `None`. A task that has
+    // not published its list yet is expected control flow early in its life; a
+    // ref past the end of a list that IS published is a stale count, and that
+    // one loses the guest's draw.
+    if !task.active {
         return None;
     }
-    let off = list_object_entry_offset(ref_, task.object_list_count)?;
+    if task.object_list_count == 0 {
+        crate::observe::fail(format!(
+            "object_list_miss reason=list_not_published task={task_id} ref={ref_}"
+        ));
+        return None;
+    }
+    let Some(off) = list_object_entry_offset(ref_, task.object_list_count) else {
+        crate::observe::fail(format!(
+            "object_list_miss reason=ref_beyond_count task={task_id} ref={ref_} count={}",
+            task.object_list_count
+        ));
+        return None;
+    };
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
     gva_mem::read_task_gva_by_id(
