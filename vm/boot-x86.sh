@@ -795,7 +795,15 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
     echo "boot-x86.sh: serial → console AND $SERIAL_LOG" >&2
   fi
   rc=0
-  "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
+  # REIMS_VGPU_GDB=1 runs QEMU under gdb in batch mode and prints a backtrace of
+  # every thread on a fault. QEMU segfaulting leaves nothing in the fail sink and
+  # nothing in the Windows event log — the exit code is the only signal — so this
+  # is how a native crash gets a location instead of a guess.
+  if [ "${REIMS_VGPU_GDB:-0}" = "1" ]; then
+    gdb -batch -ex run -ex "thread apply all bt 25" --args "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
+  else
+    "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
+  fi
   if [ "$BOOT_CLASS" = "snapshot" ] && [ "$rc" -eq 0 ]; then
     # mon:stdio does not fill SERIAL_LOG; promote on clean QEMU exit.
     promote_to_snapshot
