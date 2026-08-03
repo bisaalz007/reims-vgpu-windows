@@ -1062,6 +1062,22 @@ fn flush_render_one<M: HostMemory + HostOps>(
         }
     };
     let bgra: &[u8] = frame.as_ref();
+    // Probe: the one thing the sink cannot say is what a surface actually
+    // contains. A blank icon and a missing material look identical from the
+    // decline side once nothing declines, and they separate here — an all-zero
+    // frame means the render produced nothing, a non-zero one means the loss is
+    // downstream of this read.
+    if crate::observe::dump_flush_surfaces() {
+        let nonzero = bgra.iter().filter(|b| **b != 0).count();
+        crate::observe::fail(format!(
+            "flush_surface_census mapping={} {}x{} fmt={:#x} bytes={} nonzero={nonzero}",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            bgra.len()
+        ));
+    }
     note_render_flush_over_guest_write(state, host, key);
     let ok = crate::runtime::mapping_write::write_bgra8(
         state,
