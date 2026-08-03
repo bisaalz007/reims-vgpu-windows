@@ -99,10 +99,16 @@ struct PendingDraw {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
+    /// First draw of the pass that owns this stencil attachment: the clear is
+    /// its, and every later draw loads what it left.
+    stencil_first_in_pass: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
+    /// Whether a draw in the current pass has already consumed the stencil
+    /// clear. Reset when the pass publishes its stencil attachment.
+    stencil_pass_started: bool,
     pipeline_ref: u32,
     /// Pending clears for color attachments (load=clear).
     clears: Vec<ColorAttachment>,
@@ -1170,6 +1176,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 let stencil = decode_stencil_attachment(payload);
                 if stencil.present && stencil.level == 0 && stencil.resolve_texture_ref == 0 {
                     acc.stencil_attach = Some(stencil);
+                    // New pass attachments: the next draw owns the clear again.
+                    acc.stencil_pass_started = false;
                 }
                 for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
                     let att = decode_color_attachment(payload, i);
@@ -1307,7 +1315,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     stencil_ref: acc.stencil_ref,
                     depth_attach: acc.depth_attach,
                     stencil_attach: acc.stencil_attach,
+                    // The clear belongs to the first draw of the pass; the rest
+                    // load what it left, or the mask one draw writes is gone
+                    // before the next can test it.
+                    stencil_first_in_pass: !acc.stencil_pass_started,
                 });
+                acc.stencil_pass_started = true;
             }
         }
         RenderKind::ExecuteCommands if cmd.indirect_command_buffer_ref != 0 => {
@@ -2067,6 +2080,7 @@ fn fill_draw_binds_from_pending(req: &mut metal_draw::DrawEncodeRequest, pd: &Pe
     req.stencil_ref = pd.stencil_ref;
     req.depth_attach = pd.depth_attach;
     req.stencil_attach = pd.stencil_attach;
+    req.stencil_first_in_pass = pd.stencil_first_in_pass;
 }
 
 fn dirty_color_targets<M: HostMemory + HostOps>(
@@ -3262,6 +3276,7 @@ mod tests {
             stencil_ref: None,
             depth_attach: None,
             stencil_attach: None,
+            stencil_first_in_pass: true,
         });
         finish_stream(&mut state, &mut host, 1, &mut out, &acc);
         // Unresolvable RT → mrt_request fail before encode (not NoMetal); no clear.
@@ -3356,6 +3371,7 @@ mod tests {
             stencil_ref: None,
             depth_attach: None,
             stencil_attach: None,
+            stencil_first_in_pass: true,
         });
         let mut second = acc.draws[0].clone();
         second.pipeline_ref = 8;

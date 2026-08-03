@@ -1236,7 +1236,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 // below build, and disposed the same way after submit.
                 let mut depth_parts = None;
                 if req.depth.is_some() {
-                    let (dimg, dmem, dview) = pools.create_transient_depth(
+                    let (dimg, dmem, dview) = pools.acquire_depth_stencil(
                         ctx,
                         req.width,
                         req.height,
@@ -1259,7 +1259,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 }
                 (primary_image, fb, primary_layout, primary_view)
             } else if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
+                let (dimg, dmem, dview) = pools.acquire_depth_stencil(
                     ctx,
                     req.width,
                     req.height,
@@ -1304,7 +1304,7 @@ pub(crate) unsafe fn execute_draw_inner(
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
             if req.depth.is_some() {
-                let (dimg, dmem, dview) = pools.create_transient_depth(
+                let (dimg, dmem, dview) = pools.acquire_depth_stencil(
                     ctx,
                     req.width,
                     req.height,
@@ -2442,16 +2442,11 @@ pub(crate) unsafe fn execute_draw_inner(
             super::pools::DeferredHandle::Framebuffer(target_fb),
         );
     }
-    if let Some((dimg, dmem, dview)) = transient_depth {
-        pools.dispose(
-            &ctx.device,
-            super::pools::DeferredHandle::Image {
-                image: dimg,
-                view: dview,
-                memory: dmem,
-            },
-        );
-    }
+    // The depth-stencil image is kept by the pool now, not owned by this draw:
+    // a Metal pass clears its stencil once and then has one draw write a mask
+    // and the next test it, which a per-draw image cannot carry. The pool
+    // disposes it when the geometry changes or at teardown.
+    let _ = transient_depth;
 
     // A draw with no pixel readback (resident target, skip_readback) hands
     // the CPU nothing — skip the post-submit fence wait and return while the

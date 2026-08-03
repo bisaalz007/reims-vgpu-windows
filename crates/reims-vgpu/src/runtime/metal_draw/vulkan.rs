@@ -4150,7 +4150,8 @@ fn dump_draw_handoff(
     let meta = format!(
         "pipe={pipe}\nv_func_ref={vertex_func_ref}\nf_func_ref={fragment_func_ref}\n\
          geom={}x{} fmt={}\nvtx_count={} inst={} prim={} indexed={}\n\
-         ftex_refs={ftex:?}\nfbuf_indices={fbuf:?}\ncolors={} depth={} stencil={}\n",
+         ftex_refs={ftex:?}\nfbuf_indices={fbuf:?}\ncolors={} depth={} stencil={}\n\
+         stencil_load={:?} stencil_store={:?} stencil_clear={:?} stencil_tex={:?}\n",
         req.width,
         req.height,
         req.format,
@@ -4161,6 +4162,10 @@ fn dump_draw_handoff(
         req.colors.len(),
         req.depth_attach.is_some(),
         req.stencil_attach.is_some(),
+        req.stencil_attach.as_ref().map(|s| s.load_action),
+        req.stencil_attach.as_ref().map(|s| s.store_action),
+        req.stencil_attach.as_ref().map(|s| s.clear_stencil),
+        req.stencil_attach.as_ref().map(|s| s.texture_ref),
     );
     let _ = std::fs::write(dir.join(format!("pipe{pipe}.draw.txt")), meta);
     crate::observe::fail(format!(
@@ -6051,8 +6056,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 write_enable: ds.depth_write_enabled,
                                 compare,
                                 clear_value,
-                                // Transient buffer: always CLEAR (see above).
-                                load: false,
+                                // The stencil belongs to the pass, not to the
+                                // draw: one draw writes a mask and the next
+                                // tests it, so only the first draw of the pass
+                                // clears and the rest load what it left.
+                                // Clearing every draw is what left Tahoe's icon
+                                // and glass surfaces an outline with no fill.
+                                // Depth alone keeps its per-draw clear — the
+                                // transient depth carries nothing between
+                                // draws and nothing asks it to.
+                                load: stencil.is_some() && !req.stencil_first_in_pass,
                                 stencil,
                             });
                         }
