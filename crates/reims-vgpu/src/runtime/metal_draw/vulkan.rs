@@ -4093,6 +4093,15 @@ fn build_secondary_targets(
     out
 }
 
+/// The `REIMS_VGPU_M2V_DUMP_DRAW_PIPES` selection, shared by the shader handoff
+/// and the fragment-uniform dump so one knob names one set of pipelines.
+fn dump_draw_pipes() -> &'static crate::runtime::compute_exec::HandoffPipeSelection {
+    use crate::runtime::compute_exec::HandoffPipeSelection;
+    use std::sync::OnceLock;
+    static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
+    WANTED.get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_DRAW_PIPES"))
+}
+
 /// Draw-pipeline analog of the compute `dump_kernel_handoff`.
 /// `REIMS_VGPU_M2V_DUMP_DRAW_PIPES` selects pipes through the shared
 /// [`HandoffPipeSelection`] — a comma-separated list of pipeline refs, or
@@ -4109,14 +4118,8 @@ fn dump_draw_handoff(
     fragment_func_ref: u32,
     stages: [DrawHandoffStage<'_>; 2],
 ) {
-    use crate::runtime::compute_exec::HandoffPipeSelection;
-    use std::sync::OnceLock;
-    static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
     let pipe = req.pipeline_ref;
-    if !WANTED
-        .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_DRAW_PIPES"))
-        .wants(pipe)
-    {
+    if !dump_draw_pipes().wants(pipe) {
         return;
     }
     use std::collections::HashSet;
@@ -4433,6 +4436,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 ));
             };
             frag_storage.push((b.index, content));
+        }
+        // Same selection as the AIR/SPIR-V handoff: a shader that translates and
+        // runs but draws the wrong thing is invisible to off-VM inspection
+        // without the uniforms that chose its path. The compositor's uber shader
+        // picks its material — glass included — out of these buffers, so their
+        // bytes are the evidence for "the branch was never asked for" against
+        // "the branch ran and computed nothing".
+        if dump_draw_pipes().wants(req.pipeline_ref) {
+            let dir = crate::runtime::compute_exec::m2v_handoff_dir();
+            if std::fs::create_dir_all(&dir).is_ok() {
+                for (index, content) in &frag_storage {
+                    let _ = std::fs::write(
+                        dir.join(format!("pipe{}.draw.fbuf{index}.bin", req.pipeline_ref)),
+                        content.cpu_bytes().as_ref(),
+                    );
+                }
+            }
         }
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
