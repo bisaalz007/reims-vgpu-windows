@@ -4119,7 +4119,14 @@ fn dump_draw_handoff(
     stages: [DrawHandoffStage<'_>; 2],
 ) {
     let pipe = req.pipeline_ref;
-    if !dump_draw_pipes().wants(pipe) {
+    // Pipeline refs are per-boot, so naming one is no way to catch a shader
+    // whose target is what identifies it. An icon is a small RGBA16Float
+    // canvas; land its handoff whenever the surface census is on, so the
+    // shader that draws one can be found without knowing its ref in advance.
+    let small_float_target = crate::observe::dump_flush_surfaces()
+        && req.width <= 160
+        && req.height <= 160;
+    if !small_float_target && !dump_draw_pipes().wants(pipe) {
         return;
     }
     use std::collections::HashSet;
@@ -5039,6 +5046,38 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     (tw, th)
                 };
+                // What a draw samples decides what it can draw. For a small
+                // float target — an icon canvas — an empty source and an empty
+                // result are the same picture, and only this separates them.
+                if crate::observe::dump_flush_surfaces() && req.width <= 160 && req.height <= 160 {
+                    let census = match &source {
+                        crate::backend::vulkan::engine::SampledSource::Bytes(b) => {
+                            format!("bytes={} nonzero={}", b.len(), b.iter().filter(|x| **x != 0).count())
+                        }
+                        crate::backend::vulkan::engine::SampledSource::Target(id) => {
+                            // Bound, ready and geometry-matched is not the same
+                            // as having content. Read it back so an empty mask
+                            // is distinguishable from a material that computes
+                            // nothing from a good one.
+                            match crate::backend::vulkan::engine::read_target(id) {
+                                Ok(rb) => {
+                                    let px = rb.into_bgra8();
+                                    format!(
+                                        "target_bytes={} target_nonzero={}",
+                                        px.len(),
+                                        px.iter().filter(|x| **x != 0).count()
+                                    )
+                                }
+                                Err(e) => format!("target_read_failed={e}"),
+                            }
+                        }
+                        other => format!("source={other:?}"),
+                    };
+                    crate::observe::fail(format!(
+                        "draw_sampled_census pipe={} target={}x{} bind={img_bind} ref={texture_ref} {tw}x{th} {census}",
+                        req.pipeline_ref, req.width, req.height
+                    ));
+                }
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
                     binding: img_bind,
                     width: tw,
@@ -5610,6 +5649,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
+        // Geometry landing outside a small target is invisible in the sink: the
+        // draw reports success and the surface comes out empty but for whatever
+        // sliver fell inside. Record the two things that decide where it lands
+        // against the size of what it lands on.
+        if crate::observe::dump_flush_surfaces() && req.width <= 256 && req.height <= 256 {
+            crate::observe::fail(format!(
+                "draw_placement pipe={} {}x{} viewport={:?} scissor={:?} vtx={} inst={}",
+                req.pipeline_ref,
+                req.width,
+                req.height,
+                req.viewport,
+                req.scissor,
+                req.vertex_count,
+                req.instance_count
+            ));
+        }
         if let Some(vp) = req.viewport {
             resources
                 .viewports

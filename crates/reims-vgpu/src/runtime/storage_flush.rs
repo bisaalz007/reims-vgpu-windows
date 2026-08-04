@@ -1077,6 +1077,20 @@ fn flush_render_one<M: HostMemory + HostOps>(
             key.pixel_format,
             bgra.len()
         ));
+        // The count says how much was drawn; only the pixels say what. Small
+        // surfaces are the ones in question (icons, glass material) and cost
+        // nothing to keep, so land them raw beside the sinks for off-VM
+        // inspection.
+        if key.width <= 512 && key.height <= 512 {
+            let dir = crate::observe::log_dir();
+            let _ = std::fs::write(
+                dir.join(format!(
+                    "flush-mid{}-{}x{}-fmt{:x}.bgra",
+                    key.mapping_id, key.width, key.height, key.pixel_format
+                )),
+                bgra,
+            );
+        }
     }
     note_render_flush_over_guest_write(state, host, key);
     let ok = crate::runtime::mapping_write::write_bgra8(
