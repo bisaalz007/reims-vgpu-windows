@@ -159,6 +159,38 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> bool {
+    write_bgra8_skipping(
+        state,
+        host,
+        mapping_id,
+        src,
+        src_stride,
+        width,
+        height,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// [`write_bgra8`], landing around `skip_gpas`.
+///
+/// A deferred render window can be older than guest CPU writes into the same
+/// mapping — icon artwork rasterized into an IOSurface, the backdrop tiles the
+/// glass material samples. Landing the whole extent destroys those writes;
+/// dropping the window loses the render everywhere the guest did NOT write.
+/// The hypervisor's dirty bitmap knows which pages the guest touched, so the
+/// flush passes them here and the write goes around them: the render lands
+/// where it is the newest content, the guest's bytes stay where they are.
+#[allow(clippy::too_many_arguments)]
+pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip_gpas: &std::collections::BTreeSet<u64>,
+) -> bool {
     if width == 0
         || height == 0
         || width > MAX_SCANOUT_DIM
@@ -192,6 +224,28 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
     else {
         return false;
+    };
+    // Which guest page a mapping offset lands in, for the skip test below.
+    let page_size = state.page_size();
+    let page_shift = state.page_shift;
+    let page_entries: Vec<u32> = if skip_gpas.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .mappings
+            .get(&mapping_id)
+            .map(|m| m.page_entries.clone())
+            .unwrap_or_default()
+    };
+    let offset_skipped = |offset: u64| -> bool {
+        if skip_gpas.is_empty() {
+            return false;
+        }
+        let index = (offset / page_size) as usize;
+        page_entries.get(index).is_some_and(|entry| {
+            crate::contract::iosurface_pages::entry_gpa_shift(*entry, page_shift)
+                .is_some_and(|gpa| skip_gpas.contains(&gpa))
+        })
     };
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
@@ -233,9 +287,27 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
                 let n = src_row_len.min(row.len());
                 row[..n].copy_from_slice(&src_row[..n]);
             }
+            let row_off = base_off + (y as u64) * (bpr as u64);
             let dst = unsafe { base.add((y as usize).saturating_mul(bpr)) };
-            unsafe {
-                std::ptr::copy_nonoverlapping(row.as_ptr(), dst, tight);
+            if skip_gpas.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(row.as_ptr(), dst, tight);
+                }
+            } else {
+                // Split the row at page boundaries and land only the pages the
+                // guest did not write.
+                let mut i = 0usize;
+                while i < tight {
+                    let off = row_off + i as u64;
+                    let page_end = ((off / page_size) + 1) * page_size;
+                    let n = ((page_end - off) as usize).min(tight - i);
+                    if !offset_skipped(off) {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(row.as_ptr().add(i), dst.add(i), n);
+                        }
+                    }
+                    i += n;
+                }
             }
         }
     } else {
@@ -275,12 +347,57 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
             }
             frame[dst_off..dst_off + tight].copy_from_slice(&row[..tight]);
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame) {
-            return false;
+        if skip_gpas.is_empty() {
+            if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame) {
+                return false;
+            }
+        } else {
+            // Land maximal runs of non-skipped pages.
+            let mut i = 0u64;
+            let len = frame.len() as u64;
+            while i < len {
+                let off = base_off + i;
+                let page_end = ((off / page_size) + 1) * page_size;
+                let n = (page_end - off).min(len - i);
+                if !offset_skipped(off) {
+                    let mut j = i + n;
+                    while j < len {
+                        let o = base_off + j;
+                        if offset_skipped(o) {
+                            break;
+                        }
+                        let pe = ((o / page_size) + 1) * page_size;
+                        j = (j + (pe - o)).min(len);
+                    }
+                    if !mapper::write_mapping_bytes(
+                        state,
+                        host,
+                        mapping_id,
+                        base_off + i,
+                        &frame[i as usize..j as usize],
+                    ) {
+                        return false;
+                    }
+                    i = j;
+                } else {
+                    i += n;
+                }
+            }
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
+    if !skip_gpas.is_empty() {
+        // The guest pages and this frame now disagree on the skipped pages by
+        // design, so the surface cache must not claim this frame is the
+        // mapping's content. The write-gen baseline IS re-stamped: this landing
+        // consumed the guest writes it went around, and our own stores below
+        // land in the same dirty bitmap the verdict reads — an unstamped merge
+        // reads back as "the guest wrote everything" forever, which is the
+        // skip-it-all runaway that blacked out the composited desktop.
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+        return true;
+    }
     let mut cache = vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
     let row_src = width.saturating_mul(RGBA8_BPP) as usize;
     for y in 0..mh as usize {
@@ -1927,6 +2044,77 @@ mod tests {
         assert!(
             state.compute_deferred_flush.is_empty(),
             "the read is a flush trigger, so it must consume the window"
+        );
+    }
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::runtime::host::FakeHost;
+
+    /// The skipped page keeps the guest's bytes; every other page gets the
+    /// frame.
+    ///
+    /// This is the merge that lets a deferred render window land after the
+    /// guest wrote part of the same mapping: neither the render nor the
+    /// guest's write survives the other under a whole-extent policy, and both
+    /// survive this one.
+    #[test]
+    fn a_skipped_page_keeps_the_guests_bytes() {
+        let page = 1usize << PAGE_SHIFT_X86;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        // Two guest pages: rows 0..N-1 in page 3, the rest in page 4.
+        let gpas = [3u64 << PAGE_SHIFT_X86, 4u64 << PAGE_SHIFT_X86];
+        for g in gpas {
+            host.map_range(g, page, 0);
+        }
+        // 32x32 BGRA8 = 4096 bytes = one x86 page per half.
+        let (w, h) = (32u32, 64u32);
+        let m = state.mappings.entry(7).or_default();
+        m.mapped = true;
+        m.has_geom = true;
+        m.width = w;
+        m.height = h;
+        m.format = MTL_FORMAT_BGRA8_UNORM;
+        m.page_entries = vec![
+            (3 << crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+                | crate::contract::iosurface_pages::PAGE_ENTRY_VALID,
+            (4 << crate::contract::iosurface_pages::PAGE_ENTRY_PFN_SHIFT)
+                | crate::contract::iosurface_pages::PAGE_ENTRY_VALID,
+        ];
+        // Guest bytes: 0xGG everywhere.
+        let guest = vec![0x66u8; 2 * page];
+        assert!(crate::runtime::mapper::write_mapping_bytes(
+            &mut state, &mut host, 7, 0, &guest
+        ));
+        // Land a frame of 0xAA around page 4.
+        let frame = vec![0xAAu8; (w * h * 4) as usize];
+        let skip: std::collections::BTreeSet<u64> = [4u64 << PAGE_SHIFT_X86].into();
+        assert!(write_bgra8_skipping(
+            &mut state,
+            &mut host,
+            7,
+            &frame,
+            w * 4,
+            w,
+            h,
+            &skip
+        ));
+        let mut back = vec![0u8; 2 * page];
+        assert!(
+            crate::runtime::mapper::read_mapping_bytes(&mut state, &mut host, 7, 0, &mut back),
+            "fixture must read back"
+        );
+        assert!(
+            back[..page].iter().all(|b| *b == 0xAA),
+            "the kept page must hold the frame"
+        );
+        assert!(
+            back[page..].iter().all(|b| *b == 0x66),
+            "the skipped page must hold the guest's bytes"
         );
     }
 }

@@ -416,6 +416,19 @@ pub trait HostOps {
     fn guest_write_gen(&self, _token: u64) -> Option<u64> {
         None
     }
+
+    /// Which pages of `token`'s set were written since `since_gen`, or `None`
+    /// when the host cannot say.
+    ///
+    /// [`HostOps::guest_write_gen`] answers *whether* the set moved; this
+    /// answers *which pages*, which is what lets a deferred writeback land
+    /// around the guest's own writes instead of choosing between destroying
+    /// them (landing the whole extent) and losing the render (dropping the
+    /// whole window). `None` means the caller must fall back to one of those
+    /// two, knowing only that something moved.
+    fn guest_written_pages(&self, _token: u64, _since_gen: u64) -> Option<Vec<u64>> {
+        None
+    }
 }
 
 /// Arm64e guest page size (16 KiB). FakeHost / map_pages test fixture only —
@@ -522,6 +535,9 @@ pub struct FakeHost {
 #[derive(Debug, Default)]
 struct GuestWriteSet {
     pages: Vec<u64>,
+    /// Parallel to `pages`: the set generation at which each page was last
+    /// written, 0 for never — the fixture's copy of the shim's `page_gen`.
+    page_gen: Vec<u64>,
     page_size: usize,
     gen_: u64,
 }
@@ -617,8 +633,11 @@ impl FakeHost {
                 continue;
             }
             let base = gpa & !(set.page_size as u64 - 1);
-            if set.pages.binary_search(&base).is_ok() {
+            if let Ok(index) = set.pages.binary_search(&base) {
                 set.gen_ = set.gen_.wrapping_add(1);
+                if set.page_gen.len() == set.pages.len() {
+                    set.page_gen[index] = set.gen_;
+                }
             }
         }
     }
@@ -944,10 +963,12 @@ impl HostOps for FakeHost {
         pages.dedup();
         self.guest_write_token_seq = self.guest_write_token_seq.wrapping_add(1);
         let token = self.guest_write_token_seq;
+        let page_gen = vec![0u64; pages.len()];
         self.guest_write_sets.insert(
             token,
             GuestWriteSet {
                 pages,
+                page_gen,
                 page_size,
                 // Starts at 1, not 0: a caller that recorded "no token" as 0
                 // must not read back a matching generation from a live set.
@@ -963,6 +984,21 @@ impl HostOps for FakeHost {
 
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
         self.guest_write_sets.get(&token).map(|s| s.gen_)
+    }
+
+    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        let set = self.guest_write_sets.get(&token)?;
+        if set.page_gen.len() != set.pages.len() {
+            return None;
+        }
+        Some(
+            set.pages
+                .iter()
+                .zip(set.page_gen.iter())
+                .filter(|(_, g)| **g > since_gen)
+                .map(|(p, _)| *p)
+                .collect(),
+        )
     }
 
     /// Contiguous host view; `page_size` is the guest page size from the device.

@@ -917,8 +917,7 @@ fn render_window_identity(
     }
 }
 
-/// Say so when landing a deferred render window overwrites guest bytes the
-/// *guest* wrote after the Store that armed it.
+/// Has the guest written this window's pages since the Store that armed it?
 ///
 /// A deferred window promises to replay a synchronous Store later, and that is
 /// only a replay while nothing else writes the pages in between. `write_bgra8`
@@ -928,35 +927,28 @@ fn render_window_identity(
 /// can see that: `map_generation` covers a rebind, `resident_content_epoch`
 /// covers a later device draw, and neither is a witness for the surface's owner.
 ///
-/// This is a report, not a gate. The window still lands, because dropping it
-/// would lose the Store's whole frame to save the pages the guest happens to
-/// have touched, and the flush has no per-page account of which those are. What
-/// changes is that the loss is named rather than silent — the case is real
-/// traffic (`t11_gw_ref_moved`, thousands per session on the composite rail) and
-/// "Never Fail Silently" makes an unreported loss of guest work the defect
-/// whether or not the fix lands with it.
+/// This used to be a report while the window landed anyway, on the argument
+/// that dropping it loses the Store's whole frame to save the pages the guest
+/// happened to touch. Measured, the trade runs the other way: the surfaces it
+/// fires on are the ones the guest owns by CPU — icon artwork rasterized into
+/// an IOSurface, the backdrop tiles the glass material samples — and landing
+/// the older resident over them is why every one of them staged as zeros
+/// (`draw_sampled_census nonzero=0`, 6 442 in one login). The guest's write is
+/// newer than the Store this window defers, so memory has to show the guest's
+/// bytes; the caller drops the window instead, fail-visibly.
 ///
-/// Only [`GuestWriteVerdict::Wrote`] counts. The other refusals mean "assume
+/// Only [`GuestWriteVerdict::Wrote`] gates. The other refusals mean "assume
 /// written" for a *reuse* decision, where the safe answer is to re-derive; here
 /// the question is whether a write actually happened, and answering "yes" for a
-/// surface whose token was never armed would report a loss that did not occur.
+/// surface whose token was never armed would drop a window that owed nothing.
 #[cfg(feature = "backend-vulkan")]
-fn note_render_flush_over_guest_write<M: HostOps>(
+fn guest_wrote_after_arm<M: HostOps>(
     state: &DeviceState,
     host: &M,
     key: &crate::model::ComputeStorageResidencyKey,
-) {
+) -> bool {
     use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
-    if mapping_guest_write_verdict(state, host, key.mapping_id) != GuestWriteVerdict::Wrote {
-        return;
-    }
-    crate::runtime::drain::note_store_route("render_flush_over_guest_write");
-    crate::observe::fail(format!(
-        "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
-         (the guest wrote these pages after the Store this window defers; \
-         the full-extent writeback replaces them)",
-        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-    ));
+    mapping_guest_write_verdict(state, host, key.mapping_id) == GuestWriteVerdict::Wrote
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1000,6 +992,22 @@ fn flush_render_one<M: HostMemory + HostOps>(
         ));
         return false;
     }
+    // The guest wrote these pages after the Store this window defers. Landing
+    // replaces those bytes with an older render; per-page merging and outright
+    // dropping were both tried live and destabilized the composited desktop,
+    // whose surfaces read as fully guest-written on every flush (our own
+    // landings share the dirty bitmap the verdict reads). The landing stays,
+    // the loss keeps its name, and the reader that actually wants the guest's
+    // newer bytes — sampled-texture staging — reads around the window instead
+    // (see `sampled_reads_guest_directly`).
+    if guest_wrote_after_arm(state, host, key) {
+        crate::runtime::drain::note_store_route("render_flush_over_guest_write");
+        crate::observe::fail(format!(
+            "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={}              (the guest wrote these pages after the Store this window defers;              the full-extent writeback replaces them)",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+    }
+    let skip_gpas: std::collections::BTreeSet<u64> = Default::default();
     // Where the frame comes from, in guest scanout order either way.
     //
     // `Owned` carries its own bytes and cannot miss. It used to read
@@ -1092,8 +1100,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
             );
         }
     }
-    note_render_flush_over_guest_write(state, host, key);
-    let ok = crate::runtime::mapping_write::write_bgra8(
+    let ok = crate::runtime::mapping_write::write_bgra8_skipping(
         state,
         host,
         key.mapping_id,
@@ -1101,6 +1108,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.width.saturating_mul(4),
         key.width,
         key.height,
+        &skip_gpas,
     );
     if !ok {
         crate::observe::fail(format!(
@@ -1127,7 +1135,10 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // The stamp is refused for a slot that is absent or not content_ready, and a
     // failed write leaves `flushed_from_resident` unused, so both fall back to a
     // seed rather than to a wrong frame.
-    if ok {
+    // A merged landing leaves the skipped pages holding the guest's bytes, so
+    // the resident and the mapping deliberately disagree there — the currency
+    // stamp would vouch for a copy that is not one.
+    if ok && skip_gpas.is_empty() {
         if let Some(identity) = flushed_from_resident {
             if let Some(epoch) = state
                 .mappings
@@ -1631,15 +1642,16 @@ mod tests {
         );
     }
 
-    /// Landing a window over pages the guest wrote after the Store reports the
-    /// loss, and landing one over untouched pages says nothing.
+    /// Pages the guest wrote after the Store gate the flush; untouched pages
+    /// let it land.
     ///
-    /// Both halves are the test. A witness that fires on every flush is not a
-    /// witness — `write_bgra8` runs on every landing and the interesting
-    /// population is the subset the guest also wrote — so the clean arm is what
-    /// makes the reporting arm mean anything.
+    /// Both halves are the test. The gate exists because landing an older
+    /// render over the guest's newer bytes destroyed the CPU-rasterized icon
+    /// artwork and the glass backdrop tiles; a gate that fires on every flush
+    /// would instead lose every deferred frame, so the clean arm is what makes
+    /// the gating arm mean anything.
     #[test]
-    fn landing_a_render_window_over_a_guest_write_reports_the_loss() {
+    fn a_guest_write_after_arming_gates_the_flush() {
         use crate::runtime::host::{FakeHost, HostOps};
         let page = 1u64 << PAGE_SHIFT_X86;
         for guest_wrote in [false, true] {
@@ -1658,25 +1670,11 @@ mod tests {
             if guest_wrote {
                 host.guest_wrote_page(page);
             }
-            let cap = crate::observe::FailCapture::start();
-            super::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
-            let clobbers: Vec<String> = cap
-                .lines()
-                .into_iter()
-                .filter(|l| l.split_whitespace().next() == Some("deferred_flush_clobber"))
-                .collect();
             assert_eq!(
-                clobbers.len(),
-                usize::from(guest_wrote),
-                "guest_wrote={guest_wrote} must decide the report: {clobbers:?}"
+                super::guest_wrote_after_arm(&state, &host, &key(9, 0, 256)),
+                guest_wrote,
+                "guest_wrote={guest_wrote} must decide the gate"
             );
-            if guest_wrote {
-                assert!(
-                    clobbers[0].contains("kind=render") && clobbers[0].contains("mapping=9"),
-                    "the report must name the rail and the surface: {}",
-                    clobbers[0]
-                );
-            }
         }
     }
 

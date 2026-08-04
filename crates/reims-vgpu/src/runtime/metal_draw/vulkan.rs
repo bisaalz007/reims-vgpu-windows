@@ -1076,6 +1076,15 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // A ready resident target is authoritative after a product
                 // Store, exactly as it is for a subsequent attachment Load.
                 // Bind it directly before touching full-frame CPU mirrors.
+                //
+                // Gating this on the guest-write verdict was tried live and
+                // produced black window chrome: the dirty bitmap counts this
+                // device's own landings as guest writes (the tracker cannot
+                // attribute a writer), so surfaces whose resident WAS current
+                // read as guest-rewritten and fell through to guest pages the
+                // deferred window had not landed into yet. The verdict can
+                // gate a CPU cache (stale bytes vs re-read) but must not
+                // arbitrate between the resident and guest pages.
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
                     {

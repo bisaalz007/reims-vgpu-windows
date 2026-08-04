@@ -589,6 +589,25 @@ impl HostOps for QemuHost<'_> {
         // resident nothing has ever validated.
         (gen_ != 0).then_some(gen_)
     }
+
+    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        if token == 0 || since_gen == 0 {
+            return None;
+        }
+        let f = self.ops.guest_written_pages?;
+        // Sized for the largest surface this rail flushes: a 1920x1080
+        // RGBA16Float extent is ~4 100 4 KiB pages; the shim answers -1 rather
+        // than truncating when a set outgrows this, and -1 maps to `None`.
+        let mut out = vec![0u64; 8192];
+        // SAFETY: QEMU owns ctx; the shim fills at most `max` entries and
+        // answers from its own lock.
+        let n = unsafe { f(self.ops.ctx, token, since_gen, out.as_mut_ptr(), out.len()) };
+        if n < 0 {
+            return None;
+        }
+        out.truncate(n as usize);
+        Some(out)
+    }
 }
 
 /// Host used when no QEMU ops table is bound (unit tests / headless create).
