@@ -56,3 +56,5 @@ Vulkan-Headers/
 
 # Guest crash reports (.ips) — Apple diagnostic artifacts, keep local, never commit
 .agents/crashes/
+# machine-local working notes (environment-specific; never publish)
+docs-local/
