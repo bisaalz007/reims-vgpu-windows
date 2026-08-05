@@ -435,7 +435,11 @@ fn mask_c_comments(src: &str) -> String {
         if bytes[i..].starts_with(b"/*") {
             match src[i..].find("*/") {
                 Some(end) => {
-                    out.extend(src[i..i + end + 2].chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+                    out.extend(
+                        src[i..i + end + 2]
+                            .chars()
+                            .map(|c| if c == '\n' { '\n' } else { ' ' }),
+                    );
                     i += end + 2;
                 }
                 None => break,
@@ -456,7 +460,13 @@ fn mask_c_comments(src: &str) -> String {
 /// Drop `///` and `//` lines so doc prose naming a field is not read as one.
 fn mask_rust_line_comments(src: &str) -> String {
     src.lines()
-        .map(|line| if line.trim_start().starts_with("//") { "" } else { line })
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                ""
+            } else {
+                line
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -495,7 +505,12 @@ fn windows_is_gated_by_target_os_and_not_by_the_family_predicate() {
         // `target_os="windows"` never matches either, because the character
         // after `cfg(` is `t`, and `not(windows` requires `windows` to be the
         // whole predicate rather than a value.
-        for needle in ["cfg(windows)", "cfg(not(windows))", "cfg(any(windows", "cfg(all(windows"] {
+        for needle in [
+            "cfg(windows)",
+            "cfg(not(windows))",
+            "cfg(any(windows",
+            "cfg(all(windows",
+        ] {
             if folded.contains(needle) {
                 hits.push(format!(
                     "{} names {needle}",

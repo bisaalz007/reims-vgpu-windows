@@ -1246,6 +1246,37 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<Vec<u64>> {
+    mapping_page_gpas_impl(state, host, mapping_id, false)
+}
+
+/// [`mapping_page_gpas`] for a consumer that only ever **reads** the pages.
+///
+/// Identical except under `REIMS_ALLOW_CONTROL_COLLISION_READ=1`, where a
+/// control-page collision is logged and then read through instead of refused.
+/// A read through an aliased page can at worst sample a wrong picture — it
+/// cannot corrupt transport or task-control state — which is what makes it a
+/// legal diagnostic: if the picture is correct, the recorded control span is
+/// stale (the guest recycled those pages into a surface); if it is garbage,
+/// the collision is real. Write consumers have no such variant and never will.
+pub fn mapping_page_gpas_read<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<Vec<u64>> {
+    mapping_page_gpas_impl(
+        state,
+        host,
+        mapping_id,
+        crate::observe::allow_control_collision_read(),
+    )
+}
+
+fn mapping_page_gpas_impl<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    read_through_collision: bool,
+) -> Option<Vec<u64>> {
     if !{ revalidate_mapping_pages(state, host, mapping_id) } {
         return None;
     }
@@ -1263,6 +1294,39 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
         return None;
     }
     if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
+        // One detail line per (mapping, owner-class): which task claims the
+        // colliding span and how it was declared. The refusal line alone
+        // cannot separate "the guest really aliased a surface over its object
+        // list" from "our task entry still describes a span the guest has
+        // recycled", and that span's declaration is the evidence.
+        if owner == "task_object_list"
+            && crate::observe::first_sight("control_collision_list_detail", u64::from(mapping_id))
+        {
+            for (tid, task) in state.tasks.iter().enumerate() {
+                if !task.active || task.object_list_pfn == 0 {
+                    continue;
+                }
+                let first = (task.object_list_pfn as u64) << state.page_shift;
+                let bytes = (task.object_list_count as u64).saturating_mul(16);
+                let end = first.saturating_add(bytes);
+                if gpa >= first && gpa < end.saturating_add(state.page_size() - 1) {
+                    crate::observe::fail(format!(
+                        "control_collision_detail mid={mapping_id} gpa={gpa:#x} task={tid} list_pfn={:#x} count={} span={first:#x}..{end:#x}",
+                        task.object_list_pfn, task.object_list_count
+                    ));
+                }
+            }
+        }
+        if read_through_collision {
+            if crate::observe::first_sight("control_collision_read_allowed", u64::from(mapping_id))
+            {
+                crate::observe::fail(format!(
+                    "mapping_pages control_page_collision_read_allowed mid={mapping_id} gpa={gpa:#x} owner={owner} pages={} (REIMS_ALLOW_CONTROL_COLLISION_READ=1; diagnostic read-through)",
+                    gpas.len()
+                ));
+            }
+            return Some(gpas);
+        }
         crate::observe::fail(format!(
             "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
             gpas.len()
@@ -1568,7 +1632,10 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
             return true;
         }
     }
-    let gpas = match mapping_page_gpas(state, host, mapping_id) {
+    // The read variant: under REIMS_ALLOW_CONTROL_COLLISION_READ=1 a
+    // control-page collision reads through (logged) instead of refusing —
+    // this function only ever copies *out* of the pages.
+    let gpas = match mapping_page_gpas_read(state, host, mapping_id) {
         Some(g) => g,
         None => return false,
     };
@@ -2577,6 +2644,52 @@ mod tests {
             Some((0x551_000, "task_object_list"))
         );
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
+    }
+
+    /// The `REIMS_ALLOW_CONTROL_COLLISION_READ` knob relaxes exactly the
+    /// read-only rail and nothing else: with read-through granted a colliding
+    /// mapping's pages resolve (logged), while the strict form every write
+    /// consumer uses keeps refusing the same mapping unconditionally — there
+    /// is no parameter or variable that lets a write cross a collision.
+    #[test]
+    fn a_collision_read_through_never_extends_to_the_write_rail() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(1, 0x4000_0000, 0x440));
+        assert!(state.set_object_list(1, 0x550, 1024));
+        // Mapping 7's single page sits inside task 1's object-list span.
+        assert!(state.attach_mapping_internal(7, KVA));
+        {
+            let m = state.mappings.get_mut(&7).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![(0x551 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert_eq!(
+            mapping_page_gpas(&mut state, &mut host, 7),
+            None,
+            "the strict (write-capable) rail refuses the collision"
+        );
+        assert_eq!(
+            mapping_page_gpas_impl(&mut state, &mut host, 7, true),
+            Some(vec![0x551_000]),
+            "the read-through diagnostic serves the same pages"
+        );
+        // A mapping with no collision resolves on both rails.
+        assert!(state.attach_mapping_internal(8, KVA + 0x1000));
+        {
+            let m = state.mappings.get_mut(&8).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![(0x660 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert_eq!(
+            mapping_page_gpas(&mut state, &mut host, 8),
+            Some(vec![0x660_000])
+        );
+        assert_eq!(
+            mapping_page_gpas_impl(&mut state, &mut host, 8, false),
+            Some(vec![0x660_000])
+        );
     }
 
     /// The object-list probe is a RANGE query over the surface, and the three

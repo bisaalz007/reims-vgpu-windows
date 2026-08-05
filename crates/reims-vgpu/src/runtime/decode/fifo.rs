@@ -25,6 +25,10 @@ pub const CHILD_OP_CONFIG_40: u16 = 0x40;
 pub const CHILD_RESOURCE_LIST_TASK_ID: u32 = 0x00;
 pub const CHILD_RESOURCE_LIST_COUNT: u32 = 0x04;
 pub const CHILD_RESOURCE_LIST_HEADER_LEN: u32 = 8;
+/// CmdReplacePhysical (`0x3c`): a fixed `{task_id, object_id}` pair.
+pub const CHILD_REPLACE_PHYSICAL_TASK_ID: u32 = 0x00;
+pub const CHILD_REPLACE_PHYSICAL_OBJECT_ID: u32 = 0x04;
+pub const CHILD_REPLACE_PHYSICAL_LEN: u32 = 8;
 /// Per-object record on Invalidate: `{object_id u32}` + 4 validity-op bytes.
 pub const CHILD_INVALIDATE_RECORD_LEN: u32 = 8;
 /// Per-object record on Synchronize: `{object_id u32}` only (no validity ops).
@@ -56,6 +60,17 @@ pub const CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN: u32 = 24;
 pub const CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN: u32 = 16;
 pub const CHILD_EXEC_INDIRECT_CMDBUF_GVA: u32 = 0x00;
 pub const CHILD_EXEC_INDIRECT_CMDBUF_LENGTH: u32 = 0x08;
+
+/// Per-resource descriptor offsets inside the EXEC_INDIRECT2 resource table.
+///
+/// The guest writes one 24-byte record per submitted resource: its object-list
+/// id, the same four validity-op bytes used by CmdInvalidateResources, and a
+/// 16-byte trailing region. The latter was zero on the measured Ventura rail;
+/// retain it so a Tahoe layout change is observable rather than discarded.
+pub const CHILD_EXEC_RESOURCE_OBJECT_ID: u32 = 0x00;
+pub const CHILD_EXEC_RESOURCE_VALIDITY_OPS: u32 = 0x04;
+pub const CHILD_EXEC_RESOURCE_TAIL: u32 = 0x08;
+pub const CHILD_EXEC_RESOURCE_TAIL_LEN: u32 = 16;
 
 // --- display-descriptor timing entries ---
 
@@ -177,6 +192,27 @@ pub struct InvalidateResourcesCommand {
     pub records: Vec<InvalidateResourceRecord>,
 }
 
+/// One resource named by an EXEC_INDIRECT2 submission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecResourceDesc {
+    pub object_id: u32,
+    pub ops: InvalidateValidityOps,
+    pub tail: [u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize],
+}
+
+impl ExecResourceDesc {
+    pub fn tail_nonzero_bytes(&self) -> u32 {
+        self.tail.iter().filter(|byte| **byte != 0).count() as u32
+    }
+}
+
+/// FIFO CmdReplacePhysical (`0x3c`) payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplacePhysicalCommand {
+    pub task_id: u32,
+    pub object_id: u32,
+}
+
 /// FIFO CmdSynchronizeResources (0x35) payload (RE synchronizeForUnwire + live plen=12).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SynchronizeResourcesCommand {
@@ -223,6 +259,52 @@ pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResources
     })
 }
 
+/// Decode the EXEC_INDIRECT2 resource table immediately following its header.
+///
+/// The count is guest-controlled, so prove the complete table is present
+/// before reserving storage or reading any record.
+pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc>> {
+    if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
+        return None;
+    }
+    let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
+    let table_len = (count as u64).checked_mul(CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64)?;
+    let need = (CHILD_EXEC_INDIRECT_HEADER_LEN as u64).checked_add(table_len)?;
+    if need > payload.len() as u64 {
+        return None;
+    }
+
+    let mut records = Vec::with_capacity(count as usize);
+    let mut off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    for _ in 0..count {
+        let flags = ld32(&payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..]);
+        let tail_off = off + CHILD_EXEC_RESOURCE_TAIL as usize;
+        let mut tail = [0u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize];
+        tail.copy_from_slice(&payload[tail_off..tail_off + CHILD_EXEC_RESOURCE_TAIL_LEN as usize]);
+        records.push(ExecResourceDesc {
+            object_id: ld32(&payload[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..]),
+            ops: InvalidateValidityOps::from_le_dword(flags),
+            tail,
+        });
+        off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+    }
+    Some(records)
+}
+
+/// Decode CmdReplacePhysical: `{task_id, object_id}`.
+///
+/// The guest emits this after re-pointing the same GPU virtual address at new
+/// physical pages, so the object id is the only mapping identity it carries.
+pub fn decode_replace_physical(payload: &[u8]) -> Option<ReplacePhysicalCommand> {
+    if payload.len() < CHILD_REPLACE_PHYSICAL_LEN as usize {
+        return None;
+    }
+    Some(ReplacePhysicalCommand {
+        task_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_TASK_ID as usize..]),
+        object_id: ld32(&payload[CHILD_REPLACE_PHYSICAL_OBJECT_ID as usize..]),
+    })
+}
+
 /// Decode CmdSynchronizeResources: header `{task_id, count}` + `count × {object_id}`.
 ///
 /// Guest `synchronizeForUnwire` uses `getCommandBytes(4)` for the object cell (no flags).
@@ -258,6 +340,68 @@ pub fn decode_synchronize_resources(payload: &[u8]) -> Option<SynchronizeResourc
 mod tests {
     use super::*;
     use crate::contract::endian::st32;
+
+    fn exec_payload_with_table(descs: &[(u32, u32, [u8; 16])]) -> Vec<u8> {
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + descs.len() * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+        ];
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            descs.len() as u32,
+        );
+        for (index, (object_id, flags, tail)) in descs.iter().enumerate() {
+            let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + index * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+            st32(
+                &mut payload[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+                *object_id,
+            );
+            st32(
+                &mut payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+                *flags,
+            );
+            let tail_off = off + CHILD_EXEC_RESOURCE_TAIL as usize;
+            payload[tail_off..tail_off + CHILD_EXEC_RESOURCE_TAIL_LEN as usize]
+                .copy_from_slice(tail);
+        }
+        payload
+    }
+
+    #[test]
+    fn decode_exec_resource_table_reads_id_validity_and_tail() {
+        let mut tail = [0u8; 16];
+        tail[0] = 0xaa;
+        tail[15] = 1;
+        let payload = exec_payload_with_table(&[
+            (0x2a, CHILD_INVALIDATE_PAGEON_FLAGS, [0u8; 16]),
+            (0x2b, 0x0000_0100, tail),
+        ]);
+        let records = decode_exec_resource_table(&payload).expect("decode");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].object_id, 0x2a);
+        assert_eq!(records[0].ops, InvalidateValidityOps::PAGEON);
+        assert_eq!(records[0].tail_nonzero_bytes(), 0);
+        assert_eq!(records[1].object_id, 0x2b);
+        assert_eq!(records[1].ops.set_host_valid, 1);
+        assert_eq!(records[1].tail_nonzero_bytes(), 2);
+    }
+
+    #[test]
+    fn decode_exec_resource_table_rejects_unbacked_count() {
+        let mut payload = exec_payload_with_table(&[(1, 0, [0u8; 16])]);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            2,
+        );
+        assert!(decode_exec_resource_table(&payload).is_none());
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            u32::MAX,
+        );
+        assert!(decode_exec_resource_table(&payload).is_none());
+    }
 
     /// RE pageBacking: plen=16 = header + one 8-byte record; LE `01 00 00 01`
     /// = clear_host_valid + set_guest_valid (PVG validity-op bytes).

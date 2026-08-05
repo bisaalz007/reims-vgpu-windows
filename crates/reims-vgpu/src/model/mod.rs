@@ -11,13 +11,13 @@ pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
     ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
-    DeviceState, DisplayHandshake, ExecFault, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
-    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
+    DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
     GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView, HostLinearTexture,
-    HostSurface,
-    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, PacketFault, PaintSrc,
-    PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
-    TaskEntry, TaskMapSpan, WriteGate,
+    HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow,
+    PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState, RenderPipelineSnapshot,
+    RenderWindowSource, StampSlot, SubmissionObjectSnapshot, SubmissionResourceSnapshot,
+    SurfaceWriteKind, TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
+    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;
@@ -114,7 +114,7 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
     use crate::runtime::{
-        FakeHost, HostActionKind, HostMemory, complete_async_job, enqueue_async_stamp_surface,
+        complete_async_job, enqueue_async_stamp_surface, FakeHost, HostActionKind, HostMemory,
     };
 
     #[test]

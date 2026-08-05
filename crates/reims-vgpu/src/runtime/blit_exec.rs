@@ -1192,7 +1192,15 @@ fn copy_bytes<M: HostMemory + HostOps>(
         return Ok(());
     }
     let allowed = dest_window(state, host, task_id, dst_gva, length);
-    copy_bytes_within(host, state, task_id, src_gva, dst_gva, length, allowed.as_ref())
+    copy_bytes_within(
+        host,
+        state,
+        task_id,
+        src_gva,
+        dst_gva,
+        length,
+        allowed.as_ref(),
+    )
 }
 
 /// [`copy_bytes`] with the destination window supplied rather than captured.
@@ -1562,7 +1570,17 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     // them, which is the drift `dest_window` exists to close.
     let allowed = if to_texture {
         texture_region_window(
-            state, host, task_id, tex, tex_ox, tex_oy, tex_oz, copy_w, copy_h, copy_d, storage_bpp,
+            state,
+            host,
+            task_id,
+            tex,
+            tex_ox,
+            tex_oy,
+            tex_oz,
+            copy_w,
+            copy_h,
+            copy_d,
+            storage_bpp,
         )
     } else {
         let span = strided_span(
@@ -1897,7 +1915,17 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     // `None` for the type-11 destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
     let allowed = texture_region_window(
-        state, host, task_id, &dst, ox, oy, oz, copy_w as u32, copy_h, copy_d, copy_bpp,
+        state,
+        host,
+        task_id,
+        &dst,
+        ox,
+        oy,
+        oz,
+        copy_w as u32,
+        copy_h,
+        copy_d,
+        copy_bpp,
     );
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
@@ -2461,7 +2489,17 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     }
     // Mixed or type-11↔type-11: stage rows.
     let allowed = texture_region_window(
-        state, host, task_id, &dst, dox, doy, doz, copy_w as u32, copy_h, copy_d, copy_bpp,
+        state,
+        host,
+        task_id,
+        &dst,
+        dox,
+        doy,
+        doz,
+        copy_w as u32,
+        copy_h,
+        copy_d,
+        copy_bpp,
     );
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
@@ -3045,7 +3083,12 @@ mod tests {
             // Distinctive source bytes: a page of zeroes proves nothing about
             // where a copy landed.
             let payload = vec![0xabu8; LEN as usize];
-            write_task_gva_arm64e(host, &state.tasks[1], SRC_PAGE << PAGE_SHIFT_ARM64E, &payload);
+            write_task_gva_arm64e(
+                host,
+                &state.tasks[1],
+                SRC_PAGE << PAGE_SHIFT_ARM64E,
+                &payload,
+            );
             host.arm_rewire(Rewire {
                 on_read_gpa: second_chunk_src_gpa,
                 on_read_len: 1,
@@ -4308,7 +4351,10 @@ mod tests {
                 assert_eq!(t.slice_stride, ONE_SLICE, "slices stay a full stride apart");
                 assert_eq!(t.slice_index, 1);
                 // The last byte the reader can touch, and it is inside.
-                assert_eq!(t.texel_offset(3, 1, 0), Some(ONE_SLICE + STRIDE as u64 + 12));
+                assert_eq!(
+                    t.texel_offset(3, 1, 0),
+                    Some(ONE_SLICE + STRIDE as u64 + 12)
+                );
                 assert!(t.texel_offset(3, 1, 0).unwrap() + 4 <= EXACT);
                 t.slice_stride
             }

@@ -3,6 +3,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use super::caches::{
@@ -20,6 +21,55 @@ use super::types::{
     ScissorResource, SeedOrder, VertexStepFunction, ViewportResource,
 };
 use super::vk_call::{VkCall, VkOp};
+
+fn encode_primary_seed<'a>(
+    source: &'a [u8],
+    order: SeedOrder,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+) -> Result<Cow<'a, [u8]>, DrawError> {
+    let direct = (crate::backend::vulkan::translate::pixel::is_rgba8_color(format)
+        && matches!(order, SeedOrder::Rgba8))
+        || (crate::backend::vulkan::translate::pixel::is_bgra8_color(format)
+            && matches!(order, SeedOrder::Bgra8));
+    if direct {
+        return Ok(Cow::Borrowed(source));
+    }
+    let mtl = crate::backend::vulkan::translate::pixel::color_mtl_for_vk(format).ok_or({
+        DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported { format })
+    })?;
+    let native_row = crate::contract::pixel_format::tight_row_bytes(width, mtl).ok_or({
+        DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported { format })
+    })? as usize;
+    let rgba_row = width as usize * 4;
+    let mut out = vec![0u8; native_row.saturating_mul(height as usize)];
+    let mut rgba = vec![0u8; rgba_row];
+    for y in 0..height as usize {
+        let src = &source[y * rgba_row..(y + 1) * rgba_row];
+        rgba.copy_from_slice(src);
+        if matches!(order, SeedOrder::Bgra8) {
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        if !crate::contract::pixel_format::convert_rgba8_to_row(
+            mtl,
+            &rgba,
+            width,
+            &mut out[y * native_row..(y + 1) * native_row],
+        ) {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::PrimaryColorConversionFailed {
+                    format,
+                    width,
+                    height,
+                },
+            ));
+        }
+    }
+    Ok(Cow::Owned(out))
+}
 
 /// Stage one draw-time buffer content into a pooled slot, deduplicating
 /// within the draw: several binds sharing one content (an `Arc`'d byte
@@ -132,6 +182,22 @@ enum PreparedSampled {
     },
 }
 
+/// Whether a resident sampled image is also one of this draw's color
+/// attachments.
+///
+/// Vulkan cannot bind that image through the ordinary sampled-image path while
+/// the render pass writes it.  The primary attachment already used a GPU
+/// snapshot for this Metal feedback-loop shape; MRT secondaries have the same
+/// requirement.  Keeping the identity test in one helper also prevents the
+/// batching gate and resource preparation from drifting apart again.
+fn samples_color_attachment(req: &DrawRequest, identity: &super::types::TargetIdentity) -> bool {
+    req.target_identity.as_ref() == Some(identity)
+        || req
+            .secondary_targets
+            .iter()
+            .any(|target| &target.identity == identity)
+}
+
 impl PreparedSampled {
     fn binding(&self) -> u32 {
         match self {
@@ -218,7 +284,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             DrawValidationDecline::EmptyVertexSpirv,
         ));
     }
-    if req.frag_spirv.is_empty() {
+    if !req.fragment_disabled && req.frag_spirv.is_empty() {
         return Err(DrawError::DrawValidation(
             DrawValidationDecline::EmptyFragmentSpirv,
         ));
@@ -796,10 +862,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // destroys and recreates the image on an order mismatch, so a per-path
     // predicate that one path spells differently is a full reallocation per
     // composite, not a wrong colour.
-    let output_bgra = req
+    let requested_bgra = req
         .target_identity
         .as_ref()
         .is_some_and(|id| req.output_bgra || id.is_bgra());
+    let primary_format = match req.primary_format {
+        Some(format) if !crate::backend::vulkan::translate::pixel::is_rgba8_color(format) => format,
+        Some(_) if requested_bgra => crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
+        Some(format) => format,
+        None => crate::backend::vulkan::translate::pixel::resident_color(requested_bgra),
+    };
+    let output_bgra = crate::backend::vulkan::translate::pixel::is_bgra8_color(primary_format);
     // A sampled zero-copy source reads guest RAM when the CB *executes*, and
     // ack-fast means the guest may repaint that buffer as soon as the command
     // is consumed — deferred submit stretches record→execute from ~0 to a
@@ -817,12 +890,10 @@ pub(crate) unsafe fn execute_draw_inner(
         && req.depth.is_none()
         && req.skip_readback
         && req.target_identity.is_some();
-    let samples_own_target = req.sampled_images.iter().any(|s| {
-        matches!(
-            (&s.source, req.target_identity.as_ref()),
-            (SampledSource::Target(t), Some(own)) if t == own
-        )
-    });
+    let samples_own_target = req
+        .sampled_images
+        .iter()
+        .any(|s| matches!(&s.source, SampledSource::Target(t) if samples_color_attachment(req, t)));
     let joins = batch_eligible
         && matches!(req.load_op, Some(LoadOp::LoadFromTarget))
         && req.target_rgba8.is_none()
@@ -831,7 +902,7 @@ pub(crate) unsafe fn execute_draw_inner(
         && req
             .target_identity
             .as_ref()
-            .and_then(|id| pools.batch_slot(id, req.width, req.height, output_bgra))
+            .and_then(|id| pools.batch_slot(id, req.width, req.height, primary_format))
             .is_some();
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
@@ -843,7 +914,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .as_ref()
             .expect("joins requires identity");
         pools
-            .batch_slot(id, req.width, req.height, output_bgra)
+            .batch_slot(id, req.width, req.height, primary_format)
             .expect("joins checked batch_slot")
     } else {
         pools.begin_entry(ctx, counters)?
@@ -898,14 +969,26 @@ pub(crate) unsafe fn execute_draw_inner(
     // the `output_bgra` arm could swizzle in place; that swizzle now happens
     // during the single copy into the mapped staging span
     // (`write_staging_rgba_as_bgra`), so the pixels are touched once either way.
-    let seed_bytes: Option<&[u8]> = match &req.load_op {
+    let seed_rgba8: Option<&[u8]> = match &req.load_op {
         Some(LoadOp::LoadSeed(native)) => Some(native.as_slice()),
         Some(_) => None,
         None => req.target_rgba8.as_ref().map(|v| v.as_slice()),
     };
-    let mut pass_key = PassKey::single(
+    let seed_native = seed_rgba8
+        .map(|bytes| {
+            encode_primary_seed(
+                bytes,
+                req.target_seed_order,
+                primary_format,
+                req.width,
+                req.height,
+            )
+        })
+        .transpose()?;
+    let seed_bytes = seed_native.as_deref();
+    let mut pass_key = PassKey::single_format(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),
-        output_bgra,
+        primary_format,
     );
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
@@ -955,13 +1038,19 @@ pub(crate) unsafe fn execute_draw_inner(
 
     let (vert_digest, vert_module) =
         caches.get_or_create_shader(ctx, &req.vert_spirv, counters, pools)?;
-    let (frag_digest, frag_module) =
-        caches.get_or_create_shader(ctx, &req.frag_spirv, counters, pools)?;
+    let (frag_digest, frag_module) = if req.fragment_disabled {
+        (super::digest::Digest128::default(), None)
+    } else {
+        let (digest, module) =
+            caches.get_or_create_shader(ctx, &req.frag_spirv, counters, pools)?;
+        (digest, Some(module))
+    };
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
     let pipeline_key = PipelineKey {
         vert: vert_digest,
         frag: frag_digest,
+        fragment_disabled: req.fragment_disabled,
         attrs: attr_keys,
         topology: req.primitive_topology,
         blend: req.blend.map(|b| b.key()),
@@ -1121,25 +1210,19 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
-    let seed_slot = if let Some(rgba8) = seed_bytes {
+    let seed_slot = if let Some(native) = seed_bytes {
         let slot = pools.acquire_staging(
             ctx,
-            rgba8.len() as u64,
+            native.len() as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
             counters,
         )?;
-        // Vulkan buffer→image copies do not perform format conversion, so the
-        // staged bytes must already be in the attachment's physical order —
-        // otherwise partial draws preserve an exact R/B-exchanged seed outside
-        // their damaged geometry. The attachment is BGRA when `output_bgra`; the
-        // seed states its own order. Exchange exactly when they disagree, inside
-        // the copy that has to happen anyway.
-        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
-            pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
-        } else {
-            pools.write_staging(ctx, &slot, rgba8)?;
-        }
-        counters.note_seed_upload(rgba8.len() as u64);
+        // `encode_primary_seed` already produced the attachment's native byte
+        // layout. Vulkan copies bytes verbatim; doing another channel exchange
+        // here would corrupt BGRA, and assuming four bytes here would truncate
+        // RGBA16Float.
+        pools.write_staging(ctx, &slot, native)?;
+        counters.note_seed_upload(native.len() as u64);
         Some(slot)
     } else {
         None
@@ -1164,7 +1247,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let primary_pass = if is_mrt || req.depth.is_some() || req.color_input {
         caches.get_or_create_pass(
             ctx,
-            PassKey::single(pass_key.load_seed, pass_key.bgra),
+            PassKey::single_format(pass_key.load_seed, pass_key.primary_format),
             counters,
             pools,
         )?
@@ -1182,6 +1265,21 @@ pub(crate) unsafe fn execute_draw_inner(
     // Image, memory and view only — the framebuffer it is attached to is always
     // `target_fb`, and naming it twice is how a handle gets disposed twice.
     let mut transient_depth: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> = None;
+    // Mark everything this draw is about to read *before* resolving its own
+    // target, because resolving the target is what can take them away:
+    // `registry_ensure` runs `evict_registry_to_cap`, and that walk's `protect`
+    // does not cover this draw's sampled sources. A draw arriving while the
+    // non-pinned population is at cap could otherwise evict one of its own
+    // sources and then fail to find it at `prepare_sampled` — the gap between
+    // the resolver's `resident_content_ready` guard and the lookup. Marking
+    // them used is enough: the cap walk never chooses a just-touched resident
+    // while any older candidate exists, and the same touch protects them from
+    // the idle drain in the same breath.
+    for s in &req.sampled_images {
+        if let SampledSource::Target(identity) = &s.source {
+            pools.registry_note_sampled_use(identity);
+        }
+    }
     let (target_image, target_fb, target_old_layout, target_view) =
         if let Some(identity) = &req.target_identity {
             let gen = identity.generation();
@@ -1192,7 +1290,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.height,
                 primary_pass,
                 gen,
-                output_bgra,
+                primary_format,
                 req.seed_from_target.as_ref(),
                 counters,
             )?;
@@ -1364,12 +1462,12 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            if slot.bgra != output_bgra {
+            if slot.color_format != primary_format {
                 return Err(DrawError::DrawExecution(
                     DrawExecutionDecline::SeedFormatMismatch {
                         identity: seed_identity.clone(),
-                        resident_bgra: slot.bgra,
-                        draw_bgra: output_bgra,
+                        resident_format: slot.color_format,
+                        draw_format: primary_format,
                     },
                 ));
             }
@@ -1434,7 +1532,14 @@ pub(crate) unsafe fn execute_draw_inner(
                 });
             }
             SampledSource::Target(identity) => {
-                let (source_image, source_view, source_layout, source_bgra, source_ready, sw, sh) =
+                // Reading a resident is using it. Marked before the lookup so
+                // the refusal paths below cannot skip it: a resident whose
+                // content is not ready yet, or whose geometry disagrees with
+                // this bind, is still one the guest is actively sampling, and
+                // aging it out between two attempts turns a recoverable
+                // not-ready into a permanent missing.
+                pools.registry_note_sampled_use(identity);
+                let (source_image, source_view, source_layout, source_format, source_ready, sw, sh) =
                     pools
                         .registry_get(identity)
                         .map(|slot| {
@@ -1442,7 +1547,7 @@ pub(crate) unsafe fn execute_draw_inner(
                                 slot.image,
                                 slot.view,
                                 slot.layout,
-                                slot.bgra,
+                                slot.color_format,
                                 slot.content_ready,
                                 slot.width,
                                 slot.height,
@@ -1452,6 +1557,7 @@ pub(crate) unsafe fn execute_draw_inner(
                             DrawError::DrawExecution(DrawExecutionDecline::SampledResidentMissing {
                                 binding: resource.binding,
                                 identity: identity.clone(),
+                                prior: pools.prior_reclaim(identity),
                             })
                         })?;
                 if !source_ready {
@@ -1474,7 +1580,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         },
                     ));
                 }
-                if req.target_identity.as_ref() == Some(identity) {
+                if samples_color_attachment(req, identity) {
                     let image = pools.acquire_sampled(
                         ctx,
                         resource.width,
@@ -1484,7 +1590,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         resource.cube,
                         resource.arrayed,
                         resource.one_dim,
-                        super::super::translate::pixel::resident_color(source_bgra),
+                        source_format,
                         resource.swizzle,
                         counters,
                     )?;
@@ -1549,7 +1655,13 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }
 
-    let rb_size = (req.width as u64) * (req.height as u64) * 4;
+    let primary_texel = crate::backend::vulkan::translate::pixel::bytes_per_texel(primary_format)
+        .ok_or({
+        DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported {
+            format: primary_format,
+        })
+    })?;
+    let rb_size = (req.width as u64) * (req.height as u64) * u64::from(primary_texel);
     let do_readback = !req.skip_readback;
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
@@ -1672,7 +1784,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        target_snapshotted = true;
+        target_snapshotted |= req.target_identity.as_ref() == Some(identity);
         if snapshotted_targets.insert(identity.clone())
             && *source_old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         {
@@ -2067,19 +2179,27 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // MRT secondary attachments that were left shader-readable (sampled by a
     // prior draw) must transition back to color-attachment use, and the write
-    // must wait for that prior read (WAR). A freshly-created secondary tracks
-    // UNDEFINED and needs no barrier — the render pass discards on CLEAR.
-    for (_id, image, old_layout) in &mrt_secondaries {
-        if *old_layout == vk::ImageLayout::UNDEFINED {
+    // must wait for that prior read (WAR). A secondary snapshotted by this draw
+    // is currently TRANSFER_SRC, regardless of the registry layout captured
+    // before recording, so its barrier must order the copy rather than the
+    // older access. A freshly-created, unsampled secondary tracks UNDEFINED and
+    // needs no barrier — the render pass discards on CLEAR.
+    for (id, image, tracked_layout) in &mrt_secondaries {
+        let old_layout = if snapshotted_targets.contains(id) {
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        } else {
+            *tracked_layout
+        };
+        if old_layout == vk::ImageLayout::UNDEFINED {
             continue;
         }
-        let (src_stage, src_access) = layout_source_scope(*old_layout)?;
+        let (src_stage, src_access) = layout_source_scope(old_layout)?;
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(
                 vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )
-            .old_layout(*old_layout)
+            .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(*image)
             .subresource_range(color_range())];
@@ -2402,7 +2522,7 @@ pub(crate) unsafe fn execute_draw_inner(
             identity,
             req.width,
             req.height,
-            output_bgra,
+            primary_format,
             dset.zip(dset_pool),
             sampled_retains,
             counters,
@@ -2481,6 +2601,7 @@ pub(crate) unsafe fn execute_draw_inner(
         VkOp::ExecInvalidateReadback,
     )?;
     counters.note_readback(rb_size);
+    let out = super::native_color_to_8bit(out, primary_format, req.width, req.height, output_bgra)?;
 
     Ok(DrawOutput {
         pixels: out,
@@ -2690,6 +2811,68 @@ mod tests {
     }
 
     #[test]
+    fn rgba16float_seed_uses_eight_native_bytes_per_texel() {
+        let rgba = [255, 128, 0, 255, 0, 64, 255, 128];
+        let encoded = encode_primary_seed(
+            &rgba,
+            SeedOrder::Rgba8,
+            crate::backend::vulkan::translate::pixel::RGBA16_FLOAT_FORMAT,
+            2,
+            1,
+        )
+        .expect("RGBA16Float seed is renderable");
+        assert_eq!(encoded.len(), 16);
+        let mut back = vec![0u8; rgba.len()];
+        assert!(crate::contract::pixel_format::convert_row_to_rgba8(
+            crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+            encoded.as_ref(),
+            2,
+            &mut back,
+        ));
+        assert_eq!(back, rgba);
+    }
+
+    /// An RG16Uint primary target has no CPU seed rail on purpose: a 16-bit
+    /// integer coordinate does not survive an RGBA8 round trip, so the seed
+    /// declines by name rather than quietly clamping coordinate data. GPU
+    /// resident LOAD (`seed_from_target`) is the prior-content path for these
+    /// targets.
+    #[test]
+    fn rg16uint_seed_declines_rather_than_degrading_integer_data() {
+        let rgba = [40, 90, 200, 128];
+        let format = crate::backend::vulkan::translate::pixel::color_attachment(
+            crate::contract::pixel_format::MTL_FORMAT_RG16_UINT,
+        )
+        .expect("RG16Uint is color-attachable")
+        .0;
+        let err = encode_primary_seed(&rgba, SeedOrder::Rgba8, format, 1, 1)
+            .expect_err("integer targets have no 8-bit seed rail");
+        assert!(
+            err.to_string()
+                .contains("vk_draw_exec_primary_color_format_unsupported"),
+            "the decline names the rail: {err}"
+        );
+    }
+
+    #[test]
+    fn bgr10a2_seed_uses_the_guest_packed_word_layout() {
+        let rgba = [255, 0, 0, 255, 0, 0, 255, 255];
+        let encoded = encode_primary_seed(
+            &rgba,
+            SeedOrder::Rgba8,
+            crate::backend::vulkan::translate::pixel::BGR10A2_FORMAT,
+            2,
+            1,
+        )
+        .expect("BGR10A2 seed is renderable");
+        assert_eq!(encoded.len(), 8);
+        let red = (3u32 << 30) | (0x3ffu32 << 20);
+        let blue = (3u32 << 30) | 0x3ffu32;
+        assert_eq!(&encoded[..4], &red.to_le_bytes());
+        assert_eq!(&encoded[4..], &blue.to_le_bytes());
+    }
+
+    #[test]
     fn unsupported_source_layout_returns_the_typed_execution_reason() {
         let decline = match layout_source_scope(vk::ImageLayout::UNDEFINED) {
             Err(DrawError::DrawExecution(decline)) => decline,
@@ -2755,6 +2938,51 @@ mod tests {
             assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
             assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
         }
+    }
+
+    /// A sampled MRT output is the same attachment feedback loop as a sampled
+    /// primary.  Treating only color(0) as an alias binds the secondary image
+    /// for sampling and rendering at once.
+    #[test]
+    fn sampled_secondary_is_a_color_attachment_alias() {
+        use crate::backend::vulkan::engine::types::{SecondaryColorTarget, TargetIdentity};
+
+        let primary = TargetIdentity::Gva {
+            gva: 0x1000,
+            width: 26,
+            height: 26,
+            generation: 0,
+        };
+        let secondary = TargetIdentity::Gva {
+            gva: 0x2000,
+            width: 26,
+            height: 26,
+            generation: 0,
+        };
+        let unrelated = TargetIdentity::Gva {
+            gva: 0x3000,
+            width: 26,
+            height: 26,
+            generation: 0,
+        };
+        let mut req = DrawRequest {
+            target_identity: Some(primary.clone()),
+            ..Default::default()
+        };
+        req.secondary_targets.push(SecondaryColorTarget {
+            identity: secondary.clone(),
+            width: 26,
+            height: 26,
+            format: crate::backend::vulkan::translate::pixel::RG16_FLOAT_FORMAT,
+            clear: [0.0; 4],
+            load: true,
+            blend: None,
+            color_write_mask: Default::default(),
+        });
+
+        assert!(samples_color_attachment(&req, &primary));
+        assert!(samples_color_attachment(&req, &secondary));
+        assert!(!samples_color_attachment(&req, &unrelated));
     }
 
     /// The clear path skips its barrier on `UNDEFINED` alone, which is only
@@ -2973,7 +3201,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_vertex_and_fragment_spirv_have_distinct_reasons() {
+    fn empty_fragment_spirv_is_valid_only_for_an_explicit_fragmentless_pipeline() {
         let mut req = DrawRequest {
             width: 8,
             height: 8,
@@ -2988,6 +3216,12 @@ mod tests {
         assert_eq!(
             validation_slug(&req),
             "vk_draw_validate_empty_fragment_spirv"
+        );
+
+        req.fragment_disabled = true;
+        assert!(
+            validate_v1(&req).is_ok(),
+            "a nil Metal fragment function is represented by an intentionally absent Vulkan stage"
         );
     }
 

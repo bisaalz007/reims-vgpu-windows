@@ -13,10 +13,11 @@ use crate::runtime::decode::blit::{self, Kind as BlitKind, OP_GENERATE_MIPMAPS};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::event as event_decode;
 use crate::runtime::decode::fifo::{
-    CHILD_EXEC_INDIRECT_CMDBUF_COUNT, CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN,
-    CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
-    CHILD_EXEC_INDIRECT_HEADER_LEN, CHILD_EXEC_INDIRECT_RESOURCE_COUNT,
-    CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
+    decode_exec_resource_table, CHILD_EXEC_INDIRECT_CMDBUF_COUNT,
+    CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN, CHILD_EXEC_INDIRECT_CMDBUF_GVA,
+    CHILD_EXEC_INDIRECT_CMDBUF_LENGTH, CHILD_EXEC_INDIRECT_HEADER_LEN,
+    CHILD_EXEC_INDIRECT_RESOURCE_COUNT, CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN,
+    CHILD_EXEC_INDIRECT_TASK_ID,
 };
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
@@ -227,6 +228,7 @@ pub struct ExecResult {
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
+    channel_id: u32,
     payload: &[u8],
 ) -> ExecResult {
     let exec_started = std::time::Instant::now();
@@ -271,6 +273,43 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|| {
+        crate::observe::fail(format!(
+            "exec_res_table decode_fail task={task_id} res={resource_count} plen={}",
+            payload.len()
+        ));
+        Vec::new()
+    });
+    // The per-record validity ops are decoded but not applied on this path —
+    // validity transitions run through CmdInvalidateResources. A packet that
+    // actually requests one must say so rather than lose it silently; latch
+    // per task so a guest resubmitting every frame writes one line, not one
+    // per submission.
+    let ops_requested = resource_descs
+        .iter()
+        .filter(|record| record.ops != Default::default())
+        .count();
+    if ops_requested != 0
+        && crate::observe::first_sight("exec_res_table_ops_unapplied", u64::from(task_id))
+    {
+        crate::observe::fail(format!(
+            "exec_res_table reason=exec_res_table_ops_unapplied task={task_id} records={ops_requested}"
+        ));
+    }
+    if crate::observe::draw_log_enabled() {
+        let ids: Vec<u32> = resource_descs
+            .iter()
+            .map(|record| record.object_id)
+            .collect();
+        let tail_nonzero: u32 = resource_descs
+            .iter()
+            .map(|record| record.tail_nonzero_bytes())
+            .sum();
+        crate::observe::line(format!(
+            "exec_res_table task={task_id} count={} ids={ids:?} tail_nz={tail_nonzero}",
+            resource_descs.len()
+        ));
+    }
     let n_cb = (cmdbuf_count as usize).min(MAX_CMDBUFS);
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
@@ -309,6 +348,23 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         out.streams_loaded += 1;
         streams.push(stream);
     }
+
+    #[cfg(feature = "backend-vulkan")]
+    let stream_refs: Vec<u32> = streams
+        .iter()
+        .flat_map(|stream| submission_object_refs(stream))
+        .collect();
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    let stream_refs: Vec<u32> = Vec::new();
+    objects::retain_submission_resources(
+        state,
+        host,
+        channel_id,
+        task_id,
+        &resource_descs,
+        &stream_refs,
+    );
+    state.active_submission_channel = Some(channel_id);
 
     // Plan before execute: cold AIR translation is immutable CPU work and can
     // run without protocol ownership. Keep the packet unconsumed until every
@@ -361,15 +417,24 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     let translation_pending = false;
     if translation_pending {
+        state.active_submission_channel = None;
         out.deferred = true;
         return out;
     }
 
-    for stream in streams {
+    #[cfg(feature = "backend-vulkan")]
+    let render_pipeline_snapshots: Vec<u32> = streams
+        .iter()
+        .flat_map(|stream| render_pipeline_refs(stream))
+        .collect();
+    for stream in &streams {
         let mut acc = StreamAccum::default();
-        walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
+        walk_stream(state, host, task_id, stream, &mut out, &mut acc);
         finish_stream(state, host, task_id, &mut out, &acc);
     }
+    #[cfg(feature = "backend-vulkan")]
+    metal_draw::release_render_pipeline_snapshots(state, task_id, &render_pipeline_snapshots);
+    objects::release_submission_resources(state, channel_id);
     out.total_us = elapsed_us(exec_started);
     out
 }
@@ -392,7 +457,7 @@ const PIPELINE_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_mil
 
 #[cfg(feature = "backend-vulkan")]
 fn preflight_render_translations<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &M,
     task_id: u32,
     stream: &[u8],
@@ -420,11 +485,13 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
         ) {
             pending = true;
         }
-        if !crate::runtime::m2v_cache::ensure_cached_async(
-            &f_air,
-            metal2vulkan::passes::Stage::Fragment,
-            pipeline_ref,
-        ) {
+        if !f_air.is_empty()
+            && !crate::runtime::m2v_cache::ensure_cached_async(
+                &f_air,
+                metal2vulkan::passes::Stage::Fragment,
+                pipeline_ref,
+            )
+        {
             pending = true;
         }
     }
@@ -464,6 +531,126 @@ fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
     }
 
     pipelines
+}
+
+/// Collect every object reference structurally named by a submitted command
+/// stream before asynchronous translation can yield.
+///
+/// The EXEC resource table is a validity/ownership table, not a complete bind
+/// list: Tahoe icon draws name their sampled artwork in SetFragmentTexture but
+/// omit that ref from the table. Re-reading only the table after translation
+/// therefore loses exactly the source that distinguishes a real icon from its
+/// empty rounded placeholder.
+#[cfg(feature = "backend-vulkan")]
+fn submission_object_refs(stream: &[u8]) -> Vec<u32> {
+    let Ok(segments) = stream::iter_segments(stream) else {
+        return Vec::new();
+    };
+    let mut refs = std::collections::BTreeSet::new();
+    let mut add = |ref_: u32| {
+        if ref_ != 0 {
+            refs.insert(ref_);
+        }
+    };
+
+    for segment in segments {
+        walk_segment_records(stream, &segment, |record| {
+            let start = record.bytes_offset as usize;
+            let end = start.saturating_add(record.length as usize);
+            let Some(bytes) = stream.get(start..end) else {
+                return;
+            };
+            match segment.type_ {
+                SEGMENT_TYPE_RENDER => {
+                    let Ok(command) = render::decode(bytes) else {
+                        return;
+                    };
+                    for ref_ in [
+                        command.pipeline_ref,
+                        command.buffer_ref,
+                        command.texture_ref,
+                        command.sampler_ref,
+                        command.index_buffer_ref,
+                        command.fence_ref,
+                        command.resource_ref,
+                        command.depth_stencil_ref,
+                        command.indirect_command_buffer_ref,
+                        command.icb_args_buffer_ref,
+                    ] {
+                        add(ref_);
+                    }
+                    for &(ref_, _) in &command.buffer_binds {
+                        add(ref_);
+                    }
+                    for &ref_ in &command.ref_binds {
+                        add(ref_);
+                    }
+                    if command.kind == RenderKind::RenderPass && bytes.len() >= 8 {
+                        let payload = &bytes[8..];
+                        for index in 0..PASS_MAX_COLOR_ATTACHMENTS {
+                            let attachment = decode_color_attachment(payload, index);
+                            add(attachment.texture_ref);
+                            add(attachment.resolve_texture_ref);
+                        }
+                        let depth = decode_depth_attachment(payload);
+                        add(depth.texture_ref);
+                        add(depth.resolve_texture_ref);
+                        let stencil = decode_stencil_attachment(payload);
+                        add(stencil.texture_ref);
+                        add(stencil.resolve_texture_ref);
+                    }
+                }
+                SEGMENT_TYPE_COMPUTE => {
+                    let Ok(command) = compute::decode(bytes) else {
+                        return;
+                    };
+                    for ref_ in [
+                        command.pipeline_ref,
+                        command.indirect_buffer_ref,
+                        command.stage_in_indirect_buffer_ref,
+                        command.fence_ref,
+                        command.condition_buffer_ref,
+                        command.indirect_command_buffer_ref,
+                        command.indirect_command_arguments_buffer_ref,
+                    ] {
+                        add(ref_);
+                    }
+                    for binding in &command.buffers {
+                        add(binding.ref_);
+                    }
+                    for binding in &command.textures {
+                        add(binding.ref_);
+                    }
+                    for binding in &command.samplers {
+                        add(binding.ref_);
+                    }
+                    for binding in &command.resources {
+                        add(binding.ref_);
+                    }
+                    for binding in &command.heaps {
+                        add(binding.ref_);
+                    }
+                }
+                SEGMENT_TYPE_BLIT => {
+                    let Ok(command) = blit::decode(bytes) else {
+                        return;
+                    };
+                    for ref_ in [
+                        command.source,
+                        command.destination,
+                        command.resource,
+                        command.buffer,
+                        command.texture,
+                        command.fence,
+                    ] {
+                        add(ref_);
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+    refs.into_iter().collect()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1030,7 +1217,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 if buffer_ref == 0 {
                     match cmd.stage {
-                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers).retain(|b| b.index != index),
+                        Stage::Vertex => {
+                            Arc::make_mut(&mut acc.vertex_buffers).retain(|b| b.index != index)
+                        }
                         Stage::Fragment => {
                             Arc::make_mut(&mut acc.fragment_buffers).retain(|b| b.index != index)
                         }
@@ -1047,7 +1236,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 };
                 match cmd.stage {
                     Stage::Vertex => upsert_buffer(Arc::make_mut(&mut acc.vertex_buffers), bind),
-                    Stage::Fragment => upsert_buffer(Arc::make_mut(&mut acc.fragment_buffers), bind),
+                    Stage::Fragment => {
+                        upsert_buffer(Arc::make_mut(&mut acc.fragment_buffers), bind)
+                    }
                     _ => {}
                 }
             }
@@ -1077,7 +1268,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 if texture_ref == 0 {
                     match cmd.stage {
-                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_textures).retain(|b| b.index != index),
+                        Stage::Vertex => {
+                            Arc::make_mut(&mut acc.vertex_textures).retain(|b| b.index != index)
+                        }
                         Stage::Fragment => {
                             Arc::make_mut(&mut acc.fragment_textures).retain(|b| b.index != index)
                         }
@@ -1096,7 +1289,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 };
                 match cmd.stage {
                     Stage::Vertex => upsert_texture(Arc::make_mut(&mut acc.vertex_textures), bind),
-                    Stage::Fragment => upsert_texture(Arc::make_mut(&mut acc.fragment_textures), bind),
+                    Stage::Fragment => {
+                        upsert_texture(Arc::make_mut(&mut acc.fragment_textures), bind)
+                    }
                     _ => {}
                 }
                 if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
@@ -1120,7 +1315,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 if sampler_ref == 0 {
                     match cmd.stage {
-                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_samplers).retain(|b| b.index != index),
+                        Stage::Vertex => {
+                            Arc::make_mut(&mut acc.vertex_samplers).retain(|b| b.index != index)
+                        }
                         Stage::Fragment => {
                             Arc::make_mut(&mut acc.fragment_samplers).retain(|b| b.index != index)
                         }
@@ -1136,7 +1333,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 };
                 match cmd.stage {
                     Stage::Vertex => upsert_sampler(Arc::make_mut(&mut acc.vertex_samplers), bind),
-                    Stage::Fragment => upsert_sampler(Arc::make_mut(&mut acc.fragment_samplers), bind),
+                    Stage::Fragment => {
+                        upsert_sampler(Arc::make_mut(&mut acc.fragment_samplers), bind)
+                    }
                     _ => {}
                 }
             }
@@ -2236,7 +2435,7 @@ mod tests {
     fn short_payload_noop() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let mut host = FakeHost::new();
-        let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
+        let r = process_exec_indirect2(&mut state, &mut host, 1, &[0u8; 4]);
         assert_eq!(r.streams_loaded, 0);
     }
 
@@ -2269,7 +2468,7 @@ mod tests {
         st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
         st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
 
-        let r = process_exec_indirect2(&mut state, &mut host, &payload);
+        let r = process_exec_indirect2(&mut state, &mut host, 1, &payload);
         assert_eq!(
             r.task_id, 6,
             "the refusal must name the word the guest sent, not the slot we \
@@ -2460,6 +2659,47 @@ mod tests {
         stream.extend_from_slice(&records);
 
         assert_eq!(render_pipeline_refs(&stream), vec![41, 77]);
+    }
+
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn submission_snapshot_collects_bound_texture_missing_from_resource_table() {
+        use crate::runtime::decode::render::{
+            OP_SET_FRAGMENT_TEXTURE, OP_SET_PIPELINE, OP_SET_VERTEX_BUFFER,
+        };
+        use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+
+        let mut records = Vec::new();
+        let mut pipeline = [0u8; 12];
+        st32(&mut pipeline[0..4], OP_SET_PIPELINE);
+        st32(&mut pipeline[4..8], 12);
+        st32(&mut pipeline[8..12], 12);
+        records.extend_from_slice(&pipeline);
+
+        let mut texture = [0u8; 20];
+        st32(&mut texture[0..4], OP_SET_FRAGMENT_TEXTURE);
+        st32(&mut texture[4..8], 20);
+        st32(&mut texture[8..12], 0);
+        st32(&mut texture[12..16], 1);
+        st32(&mut texture[16..20], 4);
+        records.extend_from_slice(&texture);
+
+        let mut buffer = [0u8; 28];
+        st32(&mut buffer[0..4], OP_SET_VERTEX_BUFFER);
+        st32(&mut buffer[4..8], 28);
+        st32(&mut buffer[8..12], 0);
+        st32(&mut buffer[12..16], 1);
+        st32(&mut buffer[16..20], 8);
+        st64(&mut buffer[20..28], 0x300);
+        records.extend_from_slice(&buffer);
+
+        let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+        let stream_len = stream.len() + records.len();
+        st32(&mut stream[0..4], stream_len as u32);
+        stream[4] = SEGMENT_TYPE_RENDER;
+        stream.extend_from_slice(&records);
+
+        assert_eq!(submission_object_refs(&stream), vec![4, 8, 12]);
     }
 
     #[cfg(feature = "backend-vulkan")]
@@ -3575,7 +3815,6 @@ mod tests {
         ));
     }
 }
-
 
 #[cfg(all(test, feature = "backend-vulkan"))]
 mod publish_wait_tests {

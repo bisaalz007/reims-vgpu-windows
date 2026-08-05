@@ -67,11 +67,7 @@ compile_error!(
 // a new port is a deliberate edit to this list, not an accident.
 #[cfg(all(
     feature = "backend-vulkan",
-    not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "windows"
-    ))
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
 ))]
 compile_error!(
     "backend-vulkan is supported on target_os = \"macos\" (MoltenVK), \

@@ -30,6 +30,14 @@ pub enum DrawExecutionDecline {
         prefix: usize,
         bytes_len: usize,
     },
+    PrimaryColorFormatUnsupported {
+        format: vk::Format,
+    },
+    PrimaryColorConversionFailed {
+        format: vk::Format,
+        width: u32,
+        height: u32,
+    },
     LoadTargetContentNotReady {
         identity: TargetIdentity,
     },
@@ -48,12 +56,17 @@ pub enum DrawExecutionDecline {
     },
     SeedFormatMismatch {
         identity: TargetIdentity,
-        resident_bgra: bool,
-        draw_bgra: bool,
+        resident_format: vk::Format,
+        draw_format: vk::Format,
     },
     SampledResidentMissing {
         binding: u32,
         identity: TargetIdentity,
+        /// What this device last did with this identity's resident, or `None`
+        /// if it has no record inside its history window. This is what
+        /// separates a resident reclaimed out from under an active reader from
+        /// one the guest never rendered into — the same log line otherwise.
+        prior: Option<super::pools::ResidentReclaim>,
     },
     SampledResidentNotReady {
         binding: u32,
@@ -83,6 +96,12 @@ impl Decline for DrawExecutionDecline {
             }
             Self::ConstantVertexAllocationOverflow { .. } => {
                 "vk_draw_exec_constant_vertex_allocation_overflow"
+            }
+            Self::PrimaryColorFormatUnsupported { .. } => {
+                "vk_draw_exec_primary_color_format_unsupported"
+            }
+            Self::PrimaryColorConversionFailed { .. } => {
+                "vk_draw_exec_primary_color_conversion_failed"
             }
             Self::LoadTargetContentNotReady { .. } => "vk_draw_exec_load_target_content_not_ready",
             Self::SeedResidentMissing { .. } => "vk_draw_exec_seed_resident_missing",
@@ -114,6 +133,18 @@ impl Decline for DrawExecutionDecline {
                 ("prefix", prefix.to_string()),
                 ("bytes_len", bytes_len.to_string()),
             ],
+            Self::PrimaryColorFormatUnsupported { format } => {
+                vec![("format", format!("{format:?}"))]
+            }
+            Self::PrimaryColorConversionFailed {
+                format,
+                width,
+                height,
+            } => vec![
+                ("format", format!("{format:?}")),
+                ("width", width.to_string()),
+                ("height", height.to_string()),
+            ],
             Self::LoadTargetContentNotReady { identity }
             | Self::SeedResidentMissing { identity }
             | Self::SeedResidentNotReady { identity } => identity_fields(identity),
@@ -135,18 +166,32 @@ impl Decline for DrawExecutionDecline {
             }
             Self::SeedFormatMismatch {
                 identity,
-                resident_bgra,
-                draw_bgra,
+                resident_format,
+                draw_format,
             } => {
                 let mut fields = identity_fields(identity);
                 fields.extend([
-                    ("resident_bgra", resident_bgra.to_string()),
-                    ("draw_bgra", draw_bgra.to_string()),
+                    ("resident_format", format!("{resident_format:?}")),
+                    ("draw_format", format!("{draw_format:?}")),
                 ]);
                 fields
             }
-            Self::SampledResidentMissing { binding, identity }
-            | Self::SampledResidentNotReady { binding, identity } => {
+            Self::SampledResidentMissing {
+                binding,
+                identity,
+                prior,
+            } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(identity_fields(identity));
+                fields.push((
+                    "prior",
+                    prior
+                        .map_or("no_record", super::pools::ResidentReclaim::slug)
+                        .to_string(),
+                ));
+                fields
+            }
+            Self::SampledResidentNotReady { binding, identity } => {
                 let mut fields = vec![("binding", binding.to_string())];
                 fields.extend(identity_fields(identity));
                 fields
@@ -265,12 +310,13 @@ mod tests {
             },
             DrawExecutionDecline::SeedFormatMismatch {
                 identity: identity(),
-                resident_bgra: false,
-                draw_bgra: true,
+                resident_format: crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT,
+                draw_format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             },
             DrawExecutionDecline::SampledResidentMissing {
                 binding: 32,
                 identity: identity(),
+                prior: Some(crate::backend::vulkan::engine::pools::ResidentReclaim::IdleDrained),
             },
             DrawExecutionDecline::SampledResidentNotReady {
                 binding: 32,

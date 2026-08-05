@@ -716,6 +716,35 @@ type LoadedLinearSample = (
 );
 type DrawHandoffStage<'a> = (&'a str, &'a [u8], &'a [u8], &'a [u8]);
 
+/// Stable-enough content address for one diagnostic draw handoff.
+///
+/// Pipeline refs and task slots are guest-owned publication-table indices and
+/// are routinely reused. Keying the once-per-boot dump by either one loses the
+/// later shader -- exactly the case that matters when two short-lived icon
+/// producers both publish `pipe=15`. FNV-1a keeps this probe dependency-free;
+/// it is an artifact name/dedup key, never a correctness or trust decision.
+#[cfg(feature = "backend-vulkan")]
+fn draw_handoff_fingerprint(stages: &[DrawHandoffStage<'_>]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for (stage, mtlb, air, spirv) in stages {
+        for bytes in [stage.as_bytes(), *mtlb, *air, *spirv] {
+            // Separate equal concatenations such as [a, bc] and [ab, c].
+            for byte in (bytes.len() as u64).to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+    }
+    hash
+}
+
 /// Authoritative contents when a fragment texture aliases a GVA color target.
 ///
 /// A serialized Metal render stream may read `color(0)` through texture slot 0
@@ -2847,15 +2876,15 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     let hit = (!crate::observe::content_reuse_disabled(
         crate::observe::ContentReuseRail::GuestLinearMemo,
     ))
-        .then(|| {
-            state
-                .guest_linear_memo
-                .get_touch(&key)
-                // Vec equality is length + byte memcmp with early exit on change.
-                .filter(|m| m.native == scratch)
-                .map(|m| (m.rgba.clone(), m.generation, m.bgra8))
-        })
-        .flatten();
+    .then(|| {
+        state
+            .guest_linear_memo
+            .get_touch(&key)
+            // Vec equality is length + byte memcmp with early exit on change.
+            .filter(|m| m.native == scratch)
+            .map(|m| (m.rgba.clone(), m.generation, m.bgra8))
+    })
+    .flatten();
     if let Some((rgba, generation, bgra8)) = hit {
         let fmt = if bgra8 {
             TexelLayout::Bgra8
@@ -2970,10 +2999,7 @@ fn note_guest_rung_blank(
     // came out empty. 99.5 % of loads on this rung return content, so the
     // population that matters is small enough to name each member of, and the
     // geometry is what joins one of these to something on screen.
-    if crate::observe::first_sight(
-        "lin_rung_guest_blank",
-        gva ^ ((w as u64) << 32) ^ h as u64,
-    ) {
+    if crate::observe::first_sight("lin_rung_guest_blank", gva ^ ((w as u64) << 32) ^ h as u64) {
         crate::observe::off(format!(
             "lin_rung_guest_blank rung={rung} task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
         ));
@@ -3141,8 +3167,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     // reads the same generation and still serves.
     let gva_content_is_current =
         !crate::runtime::surface_cache::gva_guest_wrote_since_store(state, host, gva);
-    if let Some((bgra, host_gen, producer_type)) = (gva_names_these_pages
-        && gva_content_is_current)
+    if let Some((bgra, host_gen, producer_type)) = (gva_names_these_pages && gva_content_is_current)
         .then(|| crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h))
         .flatten()
     {
@@ -3751,6 +3776,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
             width,
             height,
             bgra.clone(),
+            gva,
         );
     }
     if gva != 0 {
@@ -3788,7 +3814,7 @@ fn host_cache_store_rgba8(
         return;
     }
     let bgra = swap_rb_channels(&rgba[..need]);
-    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
+    crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra, 0);
 }
 
 /// Result of a Linux metal2vulkan draw.
@@ -4045,6 +4071,24 @@ fn build_secondary_targets(
             c.clear_color[2] as f32,
             c.clear_color[3] as f32,
         ];
+        if crate::observe::dump_flush_surfaces() && fb_w <= 160 && fb_h <= 160 {
+            crate::observe::fail(format!(
+                "secondary_target_state slot={} {}x{} mtl_format={:#x} vk_format={format:?} load_action={} clear_f64_bits={:016x},{:016x},{:016x},{:016x} clear_f32_bits={:08x},{:08x},{:08x},{:08x}",
+                c.slot,
+                c.width,
+                c.height,
+                c.format,
+                c.load_action,
+                c.clear_color[0].to_bits(),
+                c.clear_color[1].to_bits(),
+                c.clear_color[2].to_bits(),
+                c.clear_color[3].to_bits(),
+                clear[0].to_bits(),
+                clear[1].to_bits(),
+                clear[2].to_bits(),
+                clear[3].to_bits(),
+            ));
+        }
         // This slot's own blend, resolved exactly as the Metal arm resolves it:
         // find the pipeline's attachment entry for this Metal slot. No
         // `or_else(first())` fallback here — the Metal path has one for its
@@ -4117,9 +4161,9 @@ fn dump_draw_pipes() -> &'static crate::runtime::compute_exec::HandoffPipeSelect
 /// `all`, same grammar as `REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES`. A listed pipe's
 /// vertex and fragment stages land under
 /// [`crate::runtime::compute_exec::m2v_handoff_dir`] once per boot as
-/// `pipe<N>.draw.{vertex,fragment}.{mtlb,air,spv}` plus a `.txt` with the draw
-/// shape. Probe tooling only — never alters device behavior; unset env means
-/// zero work per draw beyond one cached parse.
+/// `task<T>.pipe<P>.<content>.draw.{vertex,fragment}.{mtlb,air,spv}` plus a
+/// `.txt` with the draw shape. Probe tooling only — never alters device
+/// behavior; unset env means zero work per draw beyond one cached parse.
 #[cfg(feature = "backend-vulkan")]
 fn dump_draw_handoff(
     req: &DrawEncodeRequest,
@@ -4132,18 +4176,18 @@ fn dump_draw_handoff(
     // whose target is what identifies it. An icon is a small RGBA16Float
     // canvas; land its handoff whenever the surface census is on, so the
     // shader that draws one can be found without knowing its ref in advance.
-    let small_float_target = crate::observe::dump_flush_surfaces()
-        && req.width <= 160
-        && req.height <= 160;
+    let small_float_target =
+        crate::observe::dump_flush_surfaces() && req.width <= 160 && req.height <= 160;
     if !small_float_target && !dump_draw_pipes().wants(pipe) {
         return;
     }
+    let fingerprint = draw_handoff_fingerprint(&stages);
     use std::collections::HashSet;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
     {
         let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if !g.get_or_insert_with(HashSet::new).insert(pipe) {
+        if !g.get_or_insert_with(HashSet::new).insert(fingerprint) {
             return;
         }
     }
@@ -4151,8 +4195,9 @@ fn dump_draw_handoff(
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
+    let base = format!("task{}.pipe{pipe}.{fingerprint:016x}.draw", req.task_id);
     for (stage, mtlb, air, spv) in stages {
-        let stem = format!("pipe{pipe}.draw.{stage}");
+        let stem = format!("{base}.{stage}");
         let _ = std::fs::write(dir.join(format!("{stem}.mtlb")), mtlb);
         let _ = std::fs::write(dir.join(format!("{stem}.air")), air);
         let _ = std::fs::write(dir.join(format!("{stem}.spv")), spv);
@@ -4163,10 +4208,29 @@ fn dump_draw_handoff(
         .map(|t| t.texture_ref)
         .collect();
     let fbuf: Vec<u32> = req.fragment_buffers.iter().map(|b| b.index).collect();
+    let color_meta: Vec<_> = req
+        .colors
+        .iter()
+        .map(|color| {
+            (
+                color.slot,
+                color.texture_ref,
+                color.mapping_id,
+                color.target_gva,
+                color.width,
+                color.height,
+                color.format,
+                color.load_action,
+                color.store_action,
+                color.target_seed_rgba.is_some(),
+            )
+        })
+        .collect();
     let meta = format!(
         "pipe={pipe}\nv_func_ref={vertex_func_ref}\nf_func_ref={fragment_func_ref}\n\
          geom={}x{} fmt={}\nvtx_count={} inst={} prim={} indexed={}\n\
-         ftex_refs={ftex:?}\nfbuf_indices={fbuf:?}\ncolors={} depth={} stencil={}\n\
+         ftex_refs={ftex:?}\nfbuf_indices={fbuf:?}\ncolors={color_meta:?}\n\
+         depth={} stencil={}\n\
          stencil_load={:?} stencil_store={:?} stencil_clear={:?} stencil_tex={:?}\n",
         req.width,
         req.height,
@@ -4175,7 +4239,6 @@ fn dump_draw_handoff(
         req.instance_count,
         req.primitive_type,
         req.indexed.is_some(),
-        req.colors.len(),
         req.depth_attach.is_some(),
         req.stencil_attach.is_some(),
         req.stencil_attach.as_ref().map(|s| s.load_action),
@@ -4183,9 +4246,10 @@ fn dump_draw_handoff(
         req.stencil_attach.as_ref().map(|s| s.clear_stencil),
         req.stencil_attach.as_ref().map(|s| s.texture_ref),
     );
-    let _ = std::fs::write(dir.join(format!("pipe{pipe}.draw.txt")), meta);
+    let _ = std::fs::write(dir.join(format!("{base}.txt")), meta);
     crate::observe::fail(format!(
-        "linux_m2v draw_dump pipe={pipe} dir={}",
+        "linux_m2v draw_dump task={} pipe={pipe} content={fingerprint:016x} dir={}",
+        req.task_id,
         dir.display()
     ));
 }
@@ -4237,37 +4301,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
-    let pd = load_render_pipeline(state, host, req.task_id, req.pipeline_ref).ok_or({
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::PipelineMissing {
-                task_id: req.task_id,
-                pipeline_ref: req.pipeline_ref,
-            },
-        )
-    })?;
-    let v_mtlb = load_mtlb(state, host, req.task_id, pd.vertex_func_ref).ok_or({
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::VertexMtlbMissing {
-                task_id: req.task_id,
-                function_ref: pd.vertex_func_ref,
-            },
-        )
-    })?;
-    let f_mtlb = load_mtlb(state, host, req.task_id, pd.fragment_func_ref).ok_or({
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentMtlbMissing {
-                task_id: req.task_id,
-                function_ref: pd.fragment_func_ref,
-            },
-        )
-    })?;
+    let snapshot = load_render_pipeline_snapshot(state, host, req.task_id, req.pipeline_ref)
+        .map_err(DrawError::DrawPreparation)?;
+    let pd = snapshot.descriptor;
+    let v_mtlb = snapshot.vertex_mtlb;
+    let f_mtlb = snapshot.fragment_mtlb;
+    let fragment_disabled = pd.fragment_func_ref == 0;
     // Borrowed from the `*_mtlb` locals above, which outlive every use below.
     // These were `.to_vec()`, which allocated and copied both AIR blobs on
     // every chain — `drain_duty` measures ~1142 chains/s, so that is ~2300
     // allocations a second on the drain worker for bytes that are only ever
     // read (`translate_cached_reflected` takes `&[u8]`, and its cache is keyed
     // by hashing them).
-    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
+    let v_air = crate::runtime::mtlb::extract_air(v_mtlb.as_ref()).map_err(|reason| {
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::VertexAirExtract {
                 function_ref: pd.vertex_func_ref,
@@ -4275,14 +4321,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentAirExtract {
-                function_ref: pd.fragment_func_ref,
-                reason,
-            },
-        )
-    })?;
+    let f_air = if fragment_disabled {
+        &[][..]
+    } else {
+        crate::runtime::mtlb::extract_air(f_mtlb.as_ref()).map_err(|reason| {
+            DrawError::DrawPreparation(
+                crate::backend::vulkan::engine::DrawPreparationDecline::FragmentAirExtract {
+                    function_ref: pd.fragment_func_ref,
+                    reason,
+                },
+            )
+        })?
+    };
 
     // AIR→SPIR-V is content-cached: live boots re-translated the same pipelines
     // dozens of times on the doorbell vCPU and tripped IPI timeout panics.
@@ -4304,27 +4354,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let f_shader = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        req.pipeline_ref,
-    )
-    .map_err(|reason| {
-        DrawError::DrawPreparation(
-            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentTranslate {
-                pipeline_ref: req.pipeline_ref,
-                reason,
-            },
+    let f_shader = if fragment_disabled {
+        std::sync::Arc::new(crate::runtime::m2v_cache::CachedShader::fragmentless())
+    } else {
+        crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            req.pipeline_ref,
         )
-    })?;
+        .map_err(|reason| {
+            DrawError::DrawPreparation(
+                crate::backend::vulkan::engine::DrawPreparationDecline::FragmentTranslate {
+                    pipeline_ref: req.pipeline_ref,
+                    reason,
+                },
+            )
+        })?
+    };
 
     dump_draw_handoff(
         req,
         pd.vertex_func_ref,
         pd.fragment_func_ref,
         [
-            ("vertex", &v_mtlb, v_air, &v_shader.spirv),
-            ("fragment", &f_mtlb, f_air, &f_shader.spirv),
+            ("vertex", v_mtlb.as_ref(), v_air, &v_shader.spirv),
+            ("fragment", f_mtlb.as_ref(), f_air, &f_shader.spirv),
         ],
     );
 
@@ -4932,11 +4986,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             #[cfg(feature = "backend-vulkan")]
                             SampledSourceRequest::Target(identity) => {
                                 match crate::backend::vulkan::engine::read_target(identity) {
-                                    Ok(rb) => {
-                                        let px = rb.into_rgba8();
-                                        empty = px.iter().all(|&b| b == 0);
-                                        crate::observe::content_summary(&px, 4, tw, th)
-                                    }
+                                    Ok(rb) => match rb.try_into_rgba8() {
+                                        Ok(px) => {
+                                            empty = px.iter().all(|&b| b == 0);
+                                            crate::observe::content_summary(&px, 4, tw, th)
+                                        }
+                                        Err(e) => format!("conversion_failed={e}"),
+                                    },
                                     // Named, not swallowed: a resident the probe
                                     // cannot read is a hole in exactly the
                                     // census this line exists to complete, and
@@ -5059,9 +5115,23 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // float target — an icon canvas — an empty source and an empty
                 // result are the same picture, and only this separates them.
                 if crate::observe::dump_flush_surfaces() && req.width <= 160 && req.height <= 160 {
+                    let capture_dir =
+                        crate::runtime::compute_exec::m2v_handoff_dir().join("draw-stage-captures");
+                    let _ = std::fs::create_dir_all(&capture_dir);
                     let census = match &source {
                         crate::backend::vulkan::engine::SampledSource::Bytes(b) => {
-                            format!("bytes={} nonzero={}", b.len(), b.iter().filter(|x| **x != 0).count())
+                            let _ = std::fs::write(
+                                capture_dir.join(format!(
+                                    "task{}.pipe{}.bind{img_bind}.{tw}x{th}.sample.bin",
+                                    req.task_id, req.pipeline_ref
+                                )),
+                                b.as_slice(),
+                            );
+                            format!(
+                                "bytes={} nonzero={}",
+                                b.len(),
+                                b.iter().filter(|x| **x != 0).count()
+                            )
                         }
                         crate::backend::vulkan::engine::SampledSource::Target(id) => {
                             // Bound, ready and geometry-matched is not the same
@@ -5070,14 +5140,39 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // nothing from a good one.
                             match crate::backend::vulkan::engine::read_target(id) {
                                 Ok(rb) => {
-                                    let px = rb.into_bgra8();
-                                    format!(
-                                        "target_bytes={} target_nonzero={}",
-                                        px.len(),
-                                        px.iter().filter(|x| **x != 0).count()
-                                    )
+                                    let native_format = rb.format;
+                                    let _ = std::fs::write(
+                                        capture_dir.join(format!(
+                                            "task{}.pipe{}.bind{img_bind}.{tw}x{th}.sample.bin",
+                                            req.task_id, req.pipeline_ref
+                                        )),
+                                        &rb.pixels,
+                                    );
+                                    let native_nonfinite_halves = if native_format
+                                        == translate::pixel::RGBA16_FLOAT_FORMAT
+                                    {
+                                        rb.pixels
+                                            .chunks_exact(2)
+                                            .filter(|word| {
+                                                let bits = u16::from_le_bytes([word[0], word[1]]);
+                                                bits & 0x7c00 == 0x7c00
+                                            })
+                                            .count()
+                                    } else {
+                                        0
+                                    };
+                                    match rb.try_into_bgra8() {
+                                        Ok(px) => format!(
+                                            "id={id:?} native_format={native_format:?} native_nonfinite_halves={native_nonfinite_halves} target_bytes={} target_nonzero={}",
+                                            px.len(),
+                                            px.iter().filter(|x| **x != 0).count()
+                                        ),
+                                        Err(e) => format!(
+                                            "id={id:?} native_format={native_format:?} native_nonfinite_halves={native_nonfinite_halves} target_conversion_failed={e}"
+                                        ),
+                                    }
                                 }
-                                Err(e) => format!("target_read_failed={e}"),
+                                Err(e) => format!("id={id:?} target_read_failed={e}"),
                             }
                         }
                         other => format!("source={other:?}"),
@@ -6215,7 +6310,30 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 })
                 .collect::<Vec<_>>()
                 .join(";");
-            let frag0_hex = binding_hex_prefix(&frag_storage, 0, 52);
+            let small_float_target_diag = census_verbose
+                && w <= 160
+                && h <= 160
+                && req
+                    .colors
+                    .first()
+                    .is_some_and(|color| color.format == pixel_format::MTL_FORMAT_RGBA16_FLOAT);
+            // Small float intermediates are where the settled Tahoe UI first
+            // becomes non-finite. Their generated fragment ABI puts fields
+            // beyond the compositor-oriented 52-byte prefix in buffer(0), and
+            // the gradient coefficient records in buffer(3). Keep the larger
+            // capture behind the explicit verbose draw-log gate; unlike the
+            // surface census, this copies already-loaded CPU bytes and adds no
+            // GPU readback wait to login.
+            let frag0_hex = binding_hex_prefix(
+                &frag_storage,
+                0,
+                if small_float_target_diag { 160 } else { 52 },
+            );
+            let frag3_hex = if small_float_target_diag {
+                binding_hex_prefix(&frag_storage, 3, 256)
+            } else {
+                Default::default()
+            };
             // Generated compositor shaders source their six vertices from vertex
             // buffer(1) (48 bytes each) and keep image/blend uniforms in fragment
             // buffer(1). Capture those complete declared prefixes only for the
@@ -6260,6 +6378,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 .collect::<Vec<_>>()
                 .join(";");
             let color_target_meta = color_target_diag(&req.colors);
+            let pipeline_color_meta = pd
+                .color_attachments
+                .iter()
+                .map(|color| {
+                    format!(
+                        "s{}:fmt={:#x}:blend={}:rgb={}/{}/{}:a={}/{}/{}:mask={:?}",
+                        color.slot,
+                        color.pixel_format,
+                        color.blending_enabled as u8,
+                        color.src_rgb,
+                        color.dst_rgb,
+                        color.op_rgb,
+                        color.src_alpha,
+                        color.dst_alpha,
+                        color.op_alpha,
+                        color.write_mask
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
             // Matrix (binding 2) first 4 cols as floats + first vertex color + indices.
             let mat_f: String = resources
                 .storage_buffers
@@ -6289,7 +6427,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let idx_hex: String = resources
                 .indexed
                 .as_ref()
-                .map(|i| hex_prefix(&i.indices, 16))
+                .map(|i| {
+                    hex_prefix(
+                        &i.indices,
+                        if small_float_target_diag { 32 } else { 16 },
+                    )
+                })
                 .unwrap_or_default();
             // The full ~1KB per-draw resource census is verbose-gated (REIMS_VGPU_DRAW_LOG →
             // /tmp/reims-vgpu-draw.log). The always-on log keeps ONLY the `fixed_gap` anomaly
@@ -6299,7 +6442,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // interaction.
             {
                 let record = format!(
-                    "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} seed_rgb={} tex_rgb={} idx={} idx_n={} attr0={} a0hex={} v0col={} idxhex={} frag0hex={} vtx1hex={} frag1hex={} frag4hex={} mat2=[{mat_f}] meta=[{}] ssbo=[{}] sampler=[{}]",
+                    "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] pipe_color=[{}] fixed_gap=[{}] seed={} seed_rgb={} tex_rgb={} idx={} idx_n={} attr0={} a0hex={} v0col={} idxhex={} frag0hex={} frag3hex={} vtx1hex={} frag1hex={} frag4hex={} mat2=[{mat_f}] meta=[{}] ssbo=[{}] sampler=[{}]",
                     req.pipeline_ref,
                     w,
                     h,
@@ -6310,6 +6453,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     resources.samplers.len(),
                     req.colors.len(),
                     color_target_meta,
+                    pipeline_color_meta,
                     fixed_state_gap,
                     resources.target_rgba8.is_some() as u8,
                     seed_rgb,
@@ -6321,6 +6465,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     v0_color,
                     idx_hex,
                     frag0_hex,
+                    frag3_hex,
                     vtx1_hex,
                     frag1_hex,
                     frag4_hex,
@@ -6336,11 +6481,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
 
-        resources.vert_spirv = v_words;
-        resources.frag_spirv = f_words;
+        resources.vert_spirv = v_words.clone();
+        resources.frag_spirv = f_words.clone();
+        resources.fragment_disabled = fragment_disabled;
         resources.width = w;
         resources.height = h;
         resources.vertex_count = vertex_count;
+        resources.primary_format = req.colors.first().and_then(|color| {
+            translate::pixel::color_attachment(color.format)
+                .ok()
+                .map(|(format, _)| format)
+        });
         // True MRT: render every color attachment (slot 1.. as engine secondary
         // residents) instead of dropping the shader's secondary outputs. Gated
         // on a resident primary + resolvable secondaries (empty ⇒ single-RT,
@@ -6369,12 +6520,152 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
             resources.secondary_targets = secs;
+            if crate::observe::dump_flush_surfaces()
+                && w <= 160
+                && h <= 160
+                && !resources.secondary_targets.is_empty()
+            {
+                crate::observe::fail(format!(
+                    "draw_depth_state task={} pipe={} {}x{} depth={:?}",
+                    req.task_id, req.pipeline_ref, w, h, resources.depth
+                ));
+            }
+        }
+        if dump_draw_pipes().wants(req.pipeline_ref) {
+            let dir = crate::runtime::compute_exec::m2v_handoff_dir();
+            if std::fs::create_dir_all(&dir).is_ok() {
+                if let Some(indexed) = resources.indexed.as_ref() {
+                    let _ = std::fs::write(
+                        dir.join(format!(
+                            "task{}.pipe{}.{}x{}.indices.bin",
+                            req.task_id, req.pipeline_ref, w, h
+                        )),
+                        &indexed.indices,
+                    );
+                }
+                if w <= 160 && h <= 160 {
+                    let words_as_bytes = |words: &[u32]| {
+                        words
+                            .iter()
+                            .flat_map(|word| word.to_le_bytes())
+                            .collect::<Vec<_>>()
+                    };
+                    let _ = std::fs::write(
+                        dir.join(format!(
+                            "task{}.pipe{}.{}x{}.live.vertex.spv",
+                            req.task_id, req.pipeline_ref, w, h
+                        )),
+                        words_as_bytes(&v_words),
+                    );
+                    let _ = std::fs::write(
+                        dir.join(format!(
+                            "task{}.pipe{}.{}x{}.live.fragment.spv",
+                            req.task_id, req.pipeline_ref, w, h
+                        )),
+                        words_as_bytes(&f_words),
+                    );
+                }
+            }
+        }
+        if crate::observe::dump_flush_surfaces() && w <= 160 && h <= 160 {
+            if let Some(identity) = resources.target_identity.as_ref() {
+                if let Ok(readback) = crate::backend::vulkan::engine::read_target(identity) {
+                    let capture_dir =
+                        crate::runtime::compute_exec::m2v_handoff_dir().join("draw-stage-captures");
+                    let _ = std::fs::create_dir_all(&capture_dir);
+                    let _ = std::fs::write(
+                        capture_dir.join(format!(
+                            "task{}.pipe{}.{}x{}.primary-before.bin",
+                            req.task_id, req.pipeline_ref, w, h
+                        )),
+                        &readback.pixels,
+                    );
+                }
+            }
         }
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
+        // Diagnostic-only stage boundary for small float canvases. A final
+        // flush saying "NaN" cannot identify which draw in a resident chain
+        // introduced it; reading after every draw while the explicit census
+        // gate is enabled does. The normal product path never pays this wait.
+        if crate::observe::dump_flush_surfaces() && w <= 160 && h <= 160 && resources.skip_readback
+        {
+            if let Some(identity) = resources.target_identity.as_ref() {
+                match crate::backend::vulkan::engine::read_target(identity) {
+                    Ok(readback) => {
+                        let capture_dir = crate::runtime::compute_exec::m2v_handoff_dir()
+                            .join("draw-stage-captures");
+                        let _ = std::fs::create_dir_all(&capture_dir);
+                        let _ = std::fs::write(
+                            capture_dir.join(format!(
+                                "task{}.pipe{}.{}x{}.primary-after.bin",
+                                req.task_id, req.pipeline_ref, w, h
+                            )),
+                            &readback.pixels,
+                        );
+                        let nonfinite = readback.nonfinite_half_words();
+                        let nonzero = readback.pixels.iter().filter(|&&b| b != 0).count();
+                        crate::observe::fail(format!(
+                            "draw_output_census task={} pipe={} {}x{} native_format={:?} bytes={} nonzero={nonzero} nonfinite_halves={nonfinite}",
+                            req.task_id,
+                            req.pipeline_ref,
+                            w,
+                            h,
+                            readback.format,
+                            readback.pixels.len()
+                        ));
+                    }
+                    Err(error) => crate::observe::fail(format!(
+                        "draw_output_census task={} pipe={} {}x{} reason=read_target_failed error={error}",
+                        req.task_id, req.pipeline_ref, w, h
+                    )),
+                }
+            }
+            for (slot, target) in resources.secondary_targets.iter().enumerate() {
+                match crate::backend::vulkan::engine::read_target(&target.identity) {
+                    Ok(readback) => {
+                        let capture_dir = crate::runtime::compute_exec::m2v_handoff_dir()
+                            .join("draw-stage-captures");
+                        let _ = std::fs::create_dir_all(&capture_dir);
+                        let _ = std::fs::write(
+                            capture_dir.join(format!(
+                                "task{}.pipe{}.{}x{}.secondary{}-after.bin",
+                                req.task_id,
+                                req.pipeline_ref,
+                                w,
+                                h,
+                                slot + 1
+                            )),
+                            &readback.pixels,
+                        );
+                        let nonfinite = readback.nonfinite_half_words();
+                        let nonzero = readback.pixels.iter().filter(|&&b| b != 0).count();
+                        crate::observe::fail(format!(
+                            "draw_secondary_census task={} pipe={} slot={} {}x{} native_format={:?} bytes={} nonzero={nonzero} nonfinite_halves={nonfinite}",
+                            req.task_id,
+                            req.pipeline_ref,
+                            slot + 1,
+                            w,
+                            h,
+                            readback.format,
+                            readback.pixels.len()
+                        ));
+                    }
+                    Err(error) => crate::observe::fail(format!(
+                        "draw_secondary_census task={} pipe={} slot={} {}x{} reason=read_target_failed error={error}",
+                        req.task_id,
+                        req.pipeline_ref,
+                        slot + 1,
+                        w,
+                        h
+                    )),
+                }
+            }
+        }
         // RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
         // Resident/import path uses skip_readback → empty `out.pixels` is **expected**
         // and must not be read as "GPU drew black" (use import_content res_rgb_nz).
@@ -6715,15 +7006,15 @@ fn note_type11_sample_rung<M: HostOps>(
     if rung != "t11rung_host_cache" {
         return;
     }
-    crate::runtime::drain::note_store_route(match mapping_guest_write_verdict(
-        state, host, mapping_id,
-    ) {
-        GuestWriteVerdict::Clean => "t11rung_host_cache_gw_clean",
-        GuestWriteVerdict::NoMapping => "t11rung_host_cache_gw_no_mapping",
-        GuestWriteVerdict::NoStamp => "t11rung_host_cache_gw_no_stamp",
-        GuestWriteVerdict::Wrote => "t11rung_host_cache_gw_wrote",
-        GuestWriteVerdict::Unreadable => "t11rung_host_cache_gw_unreadable",
-    });
+    crate::runtime::drain::note_store_route(
+        match mapping_guest_write_verdict(state, host, mapping_id) {
+            GuestWriteVerdict::Clean => "t11rung_host_cache_gw_clean",
+            GuestWriteVerdict::NoMapping => "t11rung_host_cache_gw_no_mapping",
+            GuestWriteVerdict::NoStamp => "t11rung_host_cache_gw_no_stamp",
+            GuestWriteVerdict::Wrote => "t11rung_host_cache_gw_wrote",
+            GuestWriteVerdict::Unreadable => "t11rung_host_cache_gw_unreadable",
+        },
+    );
 }
 
 /// Whether a resident's stamp still vouches for the mapping's current content.
@@ -6816,7 +7107,15 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
         // the engine reports for the image it copied, so it is a no-op on the
         // pooled and GVA residents and a single pass on a BGRA surface. Both are
         // abandon paths, so neither is on a hot rail.
-        Ok(rb) => Some(rb.into_rgba8()),
+        Ok(rb) => match rb.try_into_rgba8() {
+            Ok(pixels) => Some(pixels),
+            Err(e) => {
+                crate::observe::fail(format!(
+                    "chain_resident_land_fail reason=convert_target target={identity:?} err={e}"
+                ));
+                None
+            }
+        },
         Err(e) => {
             crate::observe::fail(format!(
                 "chain_resident_land_fail reason=read_target target={identity:?} \

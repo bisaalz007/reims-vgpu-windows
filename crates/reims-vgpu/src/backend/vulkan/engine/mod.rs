@@ -845,6 +845,9 @@ unsafe fn copy_image_level0_to_host(
 /// crate was watching for.
 pub struct TargetReadback {
     pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub format: ash::vk::Format,
     /// BGRA8 when true, semantic RGBA8 otherwise.
     pub bgra: bool,
 }
@@ -852,13 +855,13 @@ pub struct TargetReadback {
 impl TargetReadback {
     /// The frame in semantic RGBA8, exchanging R and B only when it is not
     /// already in that order.
-    pub fn into_rgba8(mut self) -> Vec<u8> {
-        if self.bgra {
-            for px in self.pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-        }
-        self.pixels
+    pub fn into_rgba8(self) -> Vec<u8> {
+        self.try_into_rgba8()
+            .expect("resident target format must belong to the color contract")
+    }
+
+    pub fn try_into_rgba8(self) -> Result<Vec<u8>, DrawError> {
+        native_color_to_8bit(self.pixels, self.format, self.width, self.height, false)
     }
 
     /// The frame in guest scanout order (BGRA8), exchanging only when needed.
@@ -868,14 +871,79 @@ impl TargetReadback {
     /// caller has to know which namespace it is reading: a `Surface` resident is
     /// already BGRA and this is a no-op, and a resident that is not stays correct
     /// instead of landing R and B exchanged in guest memory.
-    pub fn into_bgra8(mut self) -> Vec<u8> {
-        if !self.bgra {
-            for px in self.pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
+    pub fn into_bgra8(self) -> Vec<u8> {
+        self.try_into_bgra8()
+            .expect("resident target format must belong to the color contract")
+    }
+
+    pub fn try_into_bgra8(self) -> Result<Vec<u8>, DrawError> {
+        native_color_to_8bit(self.pixels, self.format, self.width, self.height, true)
+    }
+
+    /// Non-finite (NaN/Inf) f16 words in the readback when the target's
+    /// native texel is half-float; 0 for every other format, where scanning
+    /// two-byte windows for the f16 exponent mask would be meaningless.
+    /// Answered here so diagnostics in `runtime/` can count without naming
+    /// the Vulkan format family.
+    pub fn nonfinite_half_words(&self) -> usize {
+        if !crate::backend::vulkan::translate::pixel::is_half_float_color(self.format) {
+            return 0;
         }
         self.pixels
+            .chunks_exact(2)
+            .filter(|word| {
+                let bits = u16::from_le_bytes([word[0], word[1]]);
+                bits & 0x7c00 == 0x7c00
+            })
+            .count()
     }
+}
+
+fn native_color_to_8bit(
+    pixels: Vec<u8>,
+    format: ash::vk::Format,
+    width: u32,
+    height: u32,
+    want_bgra: bool,
+) -> Result<Vec<u8>, DrawError> {
+    use crate::backend::vulkan::engine::draw_execution::DrawExecutionDecline;
+    let mtl = crate::backend::vulkan::translate::pixel::color_mtl_for_vk(format).ok_or({
+        DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported { format })
+    })?;
+    let native_row = crate::contract::pixel_format::tight_row_bytes(width, mtl).ok_or({
+        DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported { format })
+    })? as usize;
+    let rgba_row = width as usize * 4;
+    let need = native_row.saturating_mul(height as usize);
+    if pixels.len() < need {
+        return Err(DrawError::DrawExecution(
+            DrawExecutionDecline::PrimaryColorConversionFailed {
+                format,
+                width,
+                height,
+            },
+        ));
+    }
+    let mut out = vec![0u8; rgba_row.saturating_mul(height as usize)];
+    for y in 0..height as usize {
+        let src = &pixels[y * native_row..(y + 1) * native_row];
+        let dst = &mut out[y * rgba_row..(y + 1) * rgba_row];
+        if !crate::contract::pixel_format::convert_row_to_rgba8(mtl, src, width, dst) {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::PrimaryColorConversionFailed {
+                    format,
+                    width,
+                    height,
+                },
+            ));
+        }
+    }
+    if want_bgra {
+        for px in out.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+    Ok(out)
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
@@ -901,7 +969,13 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
     let image = slot.image;
     let old_layout = slot.layout;
     let bgra = slot.bgra;
-    let rb_size = (width as u64) * (height as u64) * 4;
+    let format = slot.color_format;
+    let texel = crate::backend::vulkan::translate::pixel::bytes_per_texel(format).ok_or({
+        DrawError::DrawExecution(
+            draw_execution::DrawExecutionDecline::PrimaryColorFormatUnsupported { format },
+        )
+    })?;
+    let rb_size = (width as u64) * (height as u64) * u64::from(texel);
     unsafe {
         let out = copy_image_level0_to_host(
             ctx,
@@ -926,7 +1000,13 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_target_read(rb_size);
-        Ok(TargetReadback { pixels: out, bgra })
+        Ok(TargetReadback {
+            pixels: out,
+            width,
+            height,
+            format,
+            bgra,
+        })
     }
 }
 
@@ -1047,6 +1127,10 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.target_free_allocs = t_allocs;
     snap.target_recycle_admits = t_admits;
     snap.target_recycle_cap_drops = t_cap_drops;
+    let (idle, cap, recreated) = eng.pools.reclaim_stats();
+    snap.evicts_idle_drained = idle;
+    snap.evicts_cap = cap;
+    snap.evicts_recreated = recreated;
     snap
 }
 
@@ -1140,6 +1224,24 @@ mod probe_visibility_tests {
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
             assert!(line.ends_with(&format!(" probe={}", probe.name())));
         }
+    }
+
+    #[test]
+    fn rgba16float_readback_converts_only_at_the_explicit_8bit_exit() {
+        let native = vec![
+            0x00, 0x3c, // 1.0 R
+            0x00, 0x38, // 0.5 G
+            0x00, 0x00, // 0.0 B
+            0x00, 0x3c, // 1.0 A
+        ];
+        let rb = TargetReadback {
+            pixels: native,
+            width: 1,
+            height: 1,
+            format: crate::backend::vulkan::translate::pixel::RGBA16_FLOAT_FORMAT,
+            bgra: false,
+        };
+        assert_eq!(rb.into_bgra8(), vec![0, 128, 255, 255]);
     }
 }
 

@@ -1,13 +1,50 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{GFX_MMIO_SIZE, LruBytesMemo, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Opaque device instance id (QEMU handle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub u64);
+
+/// Immutable render-pipeline inputs captured while an EXEC packet still owns
+/// the guest object-list entries that name them.
+///
+/// AIR translation is asynchronous on the Vulkan rail. The guest may retire
+/// the pipeline and function entries as soon as it has submitted the packet,
+/// so a retry cannot treat the live object list as storage for that packet.
+/// The EXEC path removes these snapshots after the packet is consumed; task
+/// teardown and redefine are the backstops for an abandoned deferred packet.
+#[derive(Clone, Debug)]
+pub struct RenderPipelineSnapshot {
+    pub descriptor: crate::runtime::decode::resource::RenderPipelineDescriptor,
+    pub vertex_mtlb: Arc<[u8]>,
+    pub fragment_mtlb: Arc<[u8]>,
+}
+
+/// One object-list entry and descriptor retained by the EXEC submission that
+/// names it.
+#[derive(Clone, Debug)]
+pub struct SubmissionObjectSnapshot {
+    pub entry: crate::runtime::decode::resource::ListObjectEntry,
+    pub descriptor: Arc<[u8]>,
+}
+
+/// Immutable resource inputs owned by one child-channel EXEC packet.
+///
+/// A deferred packet remains at that channel's FIFO head, so the channel is a
+/// stable identity until the packet is consumed. Keeping snapshots per channel
+/// prevents two tasks that reuse the same small object refs from sharing stale
+/// descriptors. `resource_ids` distinguishes an unexpected head replacement
+/// and lets the capture path rebuild rather than silently reuse it.
+#[derive(Clone, Debug)]
+pub struct SubmissionResourceSnapshot {
+    pub task_id: u32,
+    pub resource_ids: Arc<[u32]>,
+    pub objects: BTreeMap<u32, SubmissionObjectSnapshot>,
+}
 
 /// Which check found a FIFO packet malformed.
 ///
@@ -1071,6 +1108,13 @@ pub struct HostSurface {
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
+    /// For texture_ref-keyed entries: the target GVA the producing Store
+    /// rendered into, or 0 when the producer had none to record. The ref key is
+    /// an object-list slot the guest reuses and carries no page identity of its
+    /// own, so this address is the only thing that can tie the entry's pixels
+    /// to an allocation. Zero on the surface_id and GVA caches (the GVA cache's
+    /// key *is* the allocation).
+    pub source_gva: u64,
     /// Guest pages these bytes were produced from, for GVA-keyed entries.
     /// `None` on the surface_id/texture_ref caches (their key is not a guest
     /// virtual address) and on any GVA store whose walk did not resolve.
@@ -1534,6 +1578,26 @@ pub struct DeviceState {
     /// publishing is retried rather than lost, and this is what stops that
     /// retry from becoming a wait for something that will never arrive.
     pub pipeline_unreadable_since: std::collections::HashMap<(u32, u32), std::time::Instant>,
+    /// Submission-owned render inputs retained across an asynchronous AIR
+    /// translation retry. Keyed by `(task slot, pipeline ref)`.
+    pub render_pipeline_snapshots: std::collections::HashMap<(u32, u32), RenderPipelineSnapshot>,
+    /// Resource descriptors retained while an EXEC waits for asynchronous AIR
+    /// translation, keyed by the child channel whose FIFO head owns the packet.
+    pub submission_resource_snapshots: BTreeMap<u32, SubmissionResourceSnapshot>,
+    /// Object-list entries and descriptors published inside the task's live
+    /// MapMemory2-declared object-list arena. Tahoe can publish several EXEC
+    /// packets, then clear their list slots before the drain worker reaches the
+    /// later packets. The arena incarnation owns these immutable bytes until
+    /// SetObjectList, an overlapping Unmap, task redefine, or task teardown.
+    pub task_object_snapshots: BTreeMap<(u32, u32), SubmissionObjectSnapshot>,
+    /// Object-list MapMemory2 spans already scanned into
+    /// [`Self::task_object_snapshots`]. An unreadable scan is not inserted, so a
+    /// later EXEC retries it after the guest finishes publishing its PTEs.
+    pub task_object_list_scans: BTreeSet<(u32, u64, u64)>,
+    /// Channel whose submission is currently being planned or executed. Object
+    /// lookup consults only this snapshot; retained packets on other channels
+    /// cannot leak their descriptors into the active one.
+    pub active_submission_channel: Option<u32>,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
     pub child_stamps: [ChannelStamps; MAX_CHANNELS],
@@ -1826,6 +1890,11 @@ impl DeviceState {
             present_translation_hold_mask: 0,
             present_translation_hold_since: None,
             pipeline_unreadable_since: std::collections::HashMap::new(),
+            render_pipeline_snapshots: std::collections::HashMap::new(),
+            submission_resource_snapshots: BTreeMap::new(),
+            task_object_snapshots: BTreeMap::new(),
+            task_object_list_scans: BTreeSet::new(),
+            active_submission_channel: None,
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
             child_stamps: std::array::from_fn(|_| ChannelStamps::default()),
@@ -2292,15 +2361,16 @@ impl DeviceState {
         }
     }
 
-    /// Deferred GVA render-Store windows lose their GVA walk with the task
-    /// (walks try `task_id` then `task_id >> 1`) — hand them to the runtime
-    /// for a cache-only landing (`storage_flush::retire_gva_windows`); never
-    /// write guest pages from teardown.
+    /// Deferred GVA render-Store windows lose their GVA walk with the task —
+    /// hand only that task's windows to the runtime for a cache-only landing
+    /// (`storage_flush::retire_gva_windows`); never write guest pages from
+    /// teardown. Both ids here are resolved task slots. Treating a doubled id
+    /// as an alias would retire unrelated live tasks' pending frames.
     fn retire_task_gva_windows(&mut self, task_id: u32) {
         let doomed: Vec<u64> = self
             .gva_deferred_flush
             .iter()
-            .filter(|(_, e)| e.task_id == task_id || e.task_id >> 1 == task_id)
+            .filter(|(_, e)| e.task_id == task_id)
             .map(|(&gva, _)| gva)
             .collect();
         for gva in doomed {
@@ -2337,6 +2407,22 @@ impl DeviceState {
         }
         // Drop objects for this task on redefine.
         self.objects.retain(|&(t, _)| t != task_id);
+        self.pipeline_unreadable_since
+            .retain(|&(task, _), _| task != task_id);
+        self.render_pipeline_snapshots
+            .retain(|&(task, _), _| task != task_id);
+        self.submission_resource_snapshots
+            .retain(|_, snapshot| snapshot.task_id != task_id);
+        self.task_object_snapshots
+            .retain(|&(task, _), _| task != task_id);
+        self.task_object_list_scans
+            .retain(|&(task, _, _)| task != task_id);
+        if self
+            .active_submission_channel
+            .is_some_and(|channel| !self.submission_resource_snapshots.contains_key(&channel))
+        {
+            self.active_submission_channel = None;
+        }
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
@@ -2512,6 +2598,22 @@ impl DeviceState {
             // Keep spans that do not overlap the unmap range.
             !(s.gva < end && gva < s_end)
         });
+        let invalidates_object_list =
+            self.task_object_list_scans
+                .iter()
+                .any(|&(task, scan_gva, scan_len)| {
+                    let scan_end = scan_gva.saturating_add(scan_len);
+                    task == task_id && scan_gva < end && gva < scan_end
+                });
+        if invalidates_object_list {
+            // Per-channel submission snapshots remain alive: a FIFO packet
+            // already owns those bytes. Only the task-arena cache follows the
+            // guest's Unmap lifetime.
+            self.task_object_snapshots
+                .retain(|&(task, _), _| task != task_id);
+            self.task_object_list_scans
+                .retain(|&(task, _, _)| task != task_id);
+        }
     }
 
     pub fn clear_task_map_spans(&mut self, task_id: u32) {
@@ -2702,6 +2804,22 @@ impl DeviceState {
             return false;
         }
         self.objects.retain(|&(t, _)| t != task_id);
+        self.pipeline_unreadable_since
+            .retain(|&(task, _), _| task != task_id);
+        self.render_pipeline_snapshots
+            .retain(|&(task, _), _| task != task_id);
+        self.submission_resource_snapshots
+            .retain(|_, snapshot| snapshot.task_id != task_id);
+        self.task_object_snapshots
+            .retain(|&(task, _), _| task != task_id);
+        self.task_object_list_scans
+            .retain(|&(task, _, _)| task != task_id);
+        if self
+            .active_submission_channel
+            .is_some_and(|channel| !self.submission_resource_snapshots.contains_key(&channel))
+        {
+            self.active_submission_channel = None;
+        }
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
@@ -2735,6 +2853,16 @@ impl DeviceState {
         if !self.tasks[task_id as usize].active {
             StateMutationDecline::SetObjectListTaskInactive { task_id }.emit(u64::from(task_id));
             return false;
+        }
+        let changed = {
+            let task = &self.tasks[task_id as usize];
+            task.object_list_pfn != pfn || task.object_list_count != count
+        };
+        if changed {
+            self.task_object_snapshots
+                .retain(|&(task, _), _| task != task_id);
+            self.task_object_list_scans
+                .retain(|&(task, _, _)| task != task_id);
         }
         self.tasks[task_id as usize].object_list_pfn = pfn;
         self.tasks[task_id as usize].object_list_count = count;

@@ -145,6 +145,7 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
         p::MTL_FORMAT_BGRA8_UNORM_SRGB => {
             srgb(vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, 4)
         }
+        p::MTL_FORMAT_BGR10A2_UNORM => linear(vk::Format::A2R10G10B10_UNORM_PACK32, 4),
         p::MTL_FORMAT_RGB9E5_FLOAT => linear(vk::Format::E5B9G9R9_UFLOAT_PACK32, 4),
         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
@@ -259,18 +260,28 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
 /// currently ignores the transfer function *consistently* and a target written
 /// unencoded then sampled undecoded cancels out.
 ///
-/// The narrowing is deliberate and stays. Metal renders to far more formats
-/// than these three; admitting one the rest of the pass machinery has never
-/// carried would trade a named decline for a wrong picture.
+/// The narrowing is deliberate and stays. Metal renders to far more formats;
+/// admitting one the rest of the pass machinery has never carried would trade
+/// a named decline for a wrong picture.
 pub fn color_attachment(
     mtl: u16,
 ) -> Result<(vk::Format, Option<TranslateReason>), TranslateReason> {
     let f = translate(mtl)?;
+    // Renderability is the contract's question, and the Vulkan-format
+    // narrowing below cannot answer it alone: A8Unorm shares `R8_UNORM`
+    // storage with R8Unorm but Metal does not color-render to it, so telling
+    // the two apart takes the Metal-side `render_target_class` set.
+    if pixel_format::render_target_class(mtl).is_none() {
+        return Err(TranslateReason::NoColorAttachmentFormat(mtl));
+    }
     if !matches!(
         f.linear_vk,
-        vk::Format::R8G8B8A8_UNORM
+        vk::Format::R8_UNORM
+            | vk::Format::R8G8B8A8_UNORM
             | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::A2R10G10B10_UNORM_PACK32
             | vk::Format::R16G16_SFLOAT
+            | vk::Format::R16G16_UINT
             | vk::Format::R16G16B16A16_SFLOAT
     ) {
         return Err(TranslateReason::NoColorAttachmentFormat(mtl));
@@ -372,10 +383,42 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
 /// A test holds it equal to what the pixel table answers for
 /// `MTL_FORMAT_BGRA8_UNORM`, so it cannot become a second opinion.
 pub const SCANOUT_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+pub const SCANOUT_SRGB_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 
 /// The engine's neutral resident colour format, used where content is not
 /// destined straight for scanout and the channel order does not matter.
 pub const RESIDENT_RGBA_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+pub const RESIDENT_RGBA_SRGB_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+pub const RGBA16_FLOAT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+pub const RG16_FLOAT_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+pub const BGR10A2_FORMAT: vk::Format = vk::Format::A2R10G10B10_UNORM_PACK32;
+
+/// Whether a colour target's native texel is IEEE half-float, i.e. whether a
+/// readback of it can meaningfully be scanned for non-finite f16 words.
+/// Answered here so a diagnostic in `runtime/` can ask without naming the
+/// Vulkan format family itself.
+pub fn is_half_float_color(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::R16G16_SFLOAT | vk::Format::R16G16B16A16_SFLOAT
+    )
+}
+
+/// Whether a colour-attachment format is an *integer* format, on which both
+/// Metal and Vulkan forbid blending (`VkPipelineColorBlendAttachmentState`
+/// requires the format to support `BLEND`; integer formats never do). Covers
+/// the formats [`color_attachment`] can admit — extend it alongside that set.
+pub fn is_integer_color(format: vk::Format) -> bool {
+    matches!(format, vk::Format::R16G16_UINT)
+}
+
+pub fn is_rgba8_color(format: vk::Format) -> bool {
+    format == RESIDENT_RGBA_FORMAT || format == RESIDENT_RGBA_SRGB_FORMAT
+}
+
+pub fn is_bgra8_color(format: vk::Format) -> bool {
+    format == SCANOUT_FORMAT || format == SCANOUT_SRGB_FORMAT
+}
 
 /// The transient depth attachment format. Depth-only passes use this; a pass
 /// that also needs stencil negotiates a combined format against the device,
@@ -423,6 +466,7 @@ pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
         | vk::Format::R8G8B8A8_SINT
         | vk::Format::B8G8R8A8_UNORM
         | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::A2R10G10B10_UNORM_PACK32
         | vk::Format::E5B9G9R9_UFLOAT_PACK32
         | vk::Format::D32_SFLOAT
         | vk::Format::D24_UNORM_S8_UINT => 4,
@@ -430,6 +474,30 @@ pub fn bytes_per_texel(format: vk::Format) -> Option<u32> {
         | vk::Format::R16G16B16A16_SFLOAT
         | vk::Format::D32_SFLOAT_S8_UINT => 8,
         vk::Format::R32G32B32A32_UINT | vk::Format::R32G32B32A32_SFLOAT => 16,
+        _ => return None,
+    })
+}
+
+/// Metal color format whose native bytes have the given Vulkan attachment
+/// format. This is intentionally limited to the color-renderable contract; it
+/// is used when seed uploads and target readbacks must retain that contract's
+/// native texel width instead of routing through an RGBA8 staging image.
+pub fn color_mtl_for_vk(format: vk::Format) -> Option<u16> {
+    // The seed/readback conversion vocabulary — `color_attachment`'s admitted
+    // set MINUS the integer formats, whose texels deliberately have no 8-bit
+    // CPU rail (a 16-bit coordinate does not survive an RGBA8 round trip;
+    // native resident sampling and raw native writeback carry them instead).
+    // `R16G16_UINT` is therefore absent on purpose.
+    use pixel_format as p;
+    Some(match format {
+        vk::Format::R8_UNORM => p::MTL_FORMAT_R8_UNORM,
+        vk::Format::R16G16_SFLOAT => p::MTL_FORMAT_RG16_FLOAT,
+        vk::Format::R8G8B8A8_UNORM => p::MTL_FORMAT_RGBA8_UNORM,
+        vk::Format::R8G8B8A8_SRGB => p::MTL_FORMAT_RGBA8_UNORM_SRGB,
+        vk::Format::B8G8R8A8_UNORM => p::MTL_FORMAT_BGRA8_UNORM,
+        vk::Format::B8G8R8A8_SRGB => p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+        vk::Format::A2R10G10B10_UNORM_PACK32 => p::MTL_FORMAT_BGR10A2_UNORM,
+        vk::Format::R16G16B16A16_SFLOAT => p::MTL_FORMAT_RGBA16_FLOAT,
         _ => return None,
     })
 }
@@ -546,6 +614,12 @@ mod tests {
             TransferFunction::Linear,
         ),
         (
+            p::MTL_FORMAT_R16_UNORM,
+            vk::Format::R16_UNORM,
+            2,
+            TransferFunction::Linear,
+        ),
+        (
             p::MTL_FORMAT_R16_FLOAT,
             vk::Format::R16_SFLOAT,
             2,
@@ -572,6 +646,18 @@ mod tests {
         (
             p::MTL_FORMAT_R32_FLOAT,
             vk::Format::R32_SFLOAT,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RG16_UNORM,
+            vk::Format::R16G16_UNORM,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_RG16_UINT,
+            vk::Format::R16G16_UINT,
             4,
             TransferFunction::Linear,
         ),
@@ -620,6 +706,12 @@ mod tests {
         (
             p::MTL_FORMAT_RGB9E5_FLOAT,
             vk::Format::E5B9G9R9_UFLOAT_PACK32,
+            4,
+            TransferFunction::Linear,
+        ),
+        (
+            p::MTL_FORMAT_BGR10A2_UNORM,
+            vk::Format::A2R10G10B10_UNORM_PACK32,
             4,
             TransferFunction::Linear,
         ),
@@ -892,9 +984,19 @@ mod tests {
             TranslateReason::NoSampledLayout(p::MTL_FORMAT_A8_UNORM)
         );
         assert!(sampled_pixels(p::MTL_FORMAT_R8_UNORM).is_ok());
+        // Same byte-size pair on the colour rail: R8Unorm is renderable,
+        // A8Unorm shares its `R8_UNORM` storage but Metal does not
+        // color-render to it, so it must decline for the mapping.
+        assert!(color_attachment(p::MTL_FORMAT_R8_UNORM).is_ok());
         assert_eq!(
-            color_attachment(p::MTL_FORMAT_R8_UNORM).unwrap_err(),
-            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_R8_UNORM)
+            color_attachment(p::MTL_FORMAT_A8_UNORM).unwrap_err(),
+            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_A8_UNORM)
+        );
+        // Translates and samples fine, but no rail renders to it: the decline
+        // must say *this rail*, not *unknown format*.
+        assert_eq!(
+            color_attachment(p::MTL_FORMAT_RG8_UNORM).unwrap_err(),
+            TranslateReason::NoColorAttachmentFormat(p::MTL_FORMAT_RG8_UNORM)
         );
         assert_eq!(
             color_attachment(0xffff).unwrap_err(),
@@ -990,7 +1092,7 @@ mod tests {
     /// `OpImageQuerySizeLod`, never `OpSampledImage` — so it needs no linear
     /// filtering, which Vulkan does not offer for integer formats anyway.
     #[test]
-    fn two_channel_uint_samples_as_integer_texels_and_never_as_colour() {
+    fn two_channel_uint_keeps_its_native_integer_layout_for_sample_and_color() {
         use crate::contract::pixel_format::{self as p, TexelLayout};
 
         let (layout, _decline) =
@@ -1001,13 +1103,30 @@ mod tests {
 
         // Distinct from the other two four-byte two-channel layouts: reading
         // integer texels as unorm or float would be a different image.
-        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::Rg16Unorm));
-        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::R16Float));
+        assert_ne!(
+            vk_texel_layout(layout),
+            vk_texel_layout(TexelLayout::Rg16Unorm)
+        );
+        assert_ne!(
+            vk_texel_layout(layout),
+            vk_texel_layout(TexelLayout::R16Float)
+        );
 
-        // Kept off every rail that carries colour through 8-bit unorm LUTs. A
-        // 16-bit coordinate does not survive that round trip, and AGENTS.md is
-        // explicit that a wrong pixel is worse than a named refusal.
-        assert_eq!(p::render_target_class(p::MTL_FORMAT_RG16_UINT), None);
+        // Metal's feature table gives RG16Uint the Color capability. The color
+        // rail therefore binds the identical native Vulkan integer format; it
+        // does not reinterpret the target through an 8-bit unorm attachment.
+        assert_eq!(
+            p::render_target_class(p::MTL_FORMAT_RG16_UINT),
+            Some((p::RenderTargetClass::Rg16Uint, 4))
+        );
+        assert_eq!(
+            color_attachment(p::MTL_FORMAT_RG16_UINT),
+            Ok((vk::Format::R16G16_UINT, None))
+        );
+
+        // CPU color conversion remains deliberately unavailable. A 16-bit
+        // coordinate does not survive an RGBA8 round trip; native resident
+        // sampling or raw native writeback must carry these texels instead.
         assert_eq!(p::texel_to_rgba8(p::MTL_FORMAT_RG16_UINT, &[0u8; 4]), None);
         assert!(!p::rgba8_to_texel(
             p::MTL_FORMAT_RG16_UINT,
@@ -1043,7 +1162,10 @@ mod tests {
         assert_eq!(layout.bytes_per_texel(), 2);
         assert_ne!(layout, TexelLayout::Rg8);
         assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::Rg8));
-        assert_ne!(vk_texel_layout(layout), vk_texel_layout(TexelLayout::R16Float));
+        assert_ne!(
+            vk_texel_layout(layout),
+            vk_texel_layout(TexelLayout::R16Float)
+        );
     }
 
     #[test]
@@ -1081,6 +1203,7 @@ mod tests {
                 // this rail cannot carry, and binding it as bare R8 would hand
                 // the shader the byte in red instead of alpha.
                 p::MTL_FORMAT_R8_UNORM,
+                p::MTL_FORMAT_R16_UNORM,
                 // Single-channel float rides its own native rail (color LUTs).
                 // Both layouts are named here; the runtime gates R32F on the
                 // optional linear-filter capability, but the decode contract
@@ -1088,6 +1211,8 @@ mod tests {
                 p::MTL_FORMAT_R16_FLOAT,
                 p::MTL_FORMAT_RG8_UNORM,
                 p::MTL_FORMAT_R32_FLOAT,
+                p::MTL_FORMAT_RG16_UNORM,
+                p::MTL_FORMAT_RG16_UINT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
@@ -1102,11 +1227,21 @@ mod tests {
         assert_eq!(
             color,
             vec![
+                // Metal color-renders to R8Unorm (coverage/mask passes render
+                // into it); its byte-identical sibling A8Unorm stays out — see
+                // `render_target_class` for that boundary.
+                p::MTL_FORMAT_R8_UNORM,
+                // Two-channel integer render targets carry Tahoe's glass
+                // distortion/index intermediates; blending never applies to
+                // them (Metal forbids blending on integer formats).
+                p::MTL_FORMAT_RG16_UINT,
                 p::MTL_FORMAT_RG16_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,
                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                // The guest's wide-gamut compositor surfaces arrive this way.
+                p::MTL_FORMAT_BGR10A2_UNORM,
                 // Tahoe renders its glass material into RGBA16Float: every app
                 // icon and every Liquid Glass surface is a target of this
                 // format. Refusing it did not degrade those surfaces, it lost
@@ -1134,6 +1269,26 @@ mod tests {
         assert_eq!(
             TRANSIENT_DEPTH_FORMAT,
             translate(p::MTL_FORMAT_DEPTH32_FLOAT).unwrap().vk
+        );
+        assert_eq!(
+            SCANOUT_SRGB_FORMAT,
+            translate(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap().vk
+        );
+        assert_eq!(
+            RESIDENT_RGBA_SRGB_FORMAT,
+            translate(p::MTL_FORMAT_RGBA8_UNORM_SRGB).unwrap().vk
+        );
+        assert_eq!(
+            RGBA16_FLOAT_FORMAT,
+            translate(p::MTL_FORMAT_RGBA16_FLOAT).unwrap().vk
+        );
+        assert_eq!(
+            RG16_FLOAT_FORMAT,
+            translate(p::MTL_FORMAT_RG16_FLOAT).unwrap().vk
+        );
+        assert_eq!(
+            BGR10A2_FORMAT,
+            translate(p::MTL_FORMAT_BGR10A2_UNORM).unwrap().vk
         );
         assert_eq!(resident_color(true), SCANOUT_FORMAT);
         assert_eq!(resident_color(false), RESIDENT_RGBA_FORMAT);

@@ -3995,9 +3995,8 @@ fn spawn_compute_engine_stall_watchdog(
         crate::observe::fail(format!(
             "compute_engine_stall reason=backend_call_unreturned pipe={pipeline_ref} elapsed_ms={elapsed_ms} grid={grid:?} nbuf={buffers} nimg={images} image_geom={image_geometry:?}"
         ));
-        let base = crate::observe::log_path(&format!(
-            "reims-vgpu-compute-stall-pipe-{pipeline_ref}"
-        ));
+        let base =
+            crate::observe::log_path(&format!("reims-vgpu-compute-stall-pipe-{pipeline_ref}"));
         let mut bytes = Vec::with_capacity(spirv.len().saturating_mul(4));
         for word in spirv {
             bytes.extend_from_slice(&word.to_le_bytes());
@@ -4222,12 +4221,7 @@ fn specialized_storage_image_format(
         // engine only as sampled textures — they have no storage selector — so
         // a shader declaring one as a storage image is refused here rather than
         // given a view whose storage support was never established.
-        V::R32Sint
-        | V::R32Float
-        | V::Rgb9e5Ufloat
-        | V::R16Unorm
-        | V::Rg16Unorm
-        | V::Rg16Uint => {
+        V::R32Sint | V::R32Float | V::Rgb9e5Ufloat | V::R16Unorm | V::Rg16Unorm | V::Rg16Uint => {
             return Err("spirv_sampled_only_format_as_storage");
         }
         V::Rgba32Float => (0, S::Rgba32Float),

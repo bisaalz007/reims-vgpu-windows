@@ -248,9 +248,7 @@ fn spirv_module_shape(words: &[u32]) -> ModuleShape {
             // that can name an image are worth following: OpLoad (61),
             // OpSampledImage (86), OpImage (100), OpCopyObject (83) and
             // OpFunctionParameter (55) all carry `result-type, result-id`.
-            55 | 61 | 83 | 86 | 100
-                if word_count >= 3 && opaque_types.contains(&words[i + 1]) =>
-            {
+            55 | 61 | 83 | 86 | 100 if word_count >= 3 && opaque_types.contains(&words[i + 1]) => {
                 opaque_types.insert(words[i + 2]);
             }
             248 => shape.blocks = shape.blocks.saturating_add(1),
@@ -260,17 +258,13 @@ fn spirv_module_shape(words: &[u32]) -> ModuleShape {
             }
             // OpCompositeInsert: result-type, result-id, object, composite, ...
             // The object is word 3.
-            OP_COMPOSITE_INSERT
-                if word_count >= 5 && opaque_types.contains(&words[i + 3]) =>
-            {
+            OP_COMPOSITE_INSERT if word_count >= 5 && opaque_types.contains(&words[i + 3]) => {
                 shape.opaque_in_composite = true;
             }
             // OpCompositeExtract: result-type, result-id, composite, ... — an
             // opaque *result type* means a handle is being read back out of a
             // composite it could never have been put into.
-            OP_COMPOSITE_EXTRACT
-                if word_count >= 4 && opaque_types.contains(&words[i + 1]) =>
-            {
+            OP_COMPOSITE_EXTRACT if word_count >= 4 && opaque_types.contains(&words[i + 1]) => {
                 shape.opaque_in_composite = true;
             }
             _ => {}
@@ -318,6 +312,18 @@ impl CachedShader {
             words: Arc::new(words),
             frag_reloc: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Reflection/word placeholder for a Metal render pipeline whose fragment
+    /// function is nil. No shader is synthesized: the Vulkan engine omits the
+    /// stage, while the empty reflection keeps the shared resource assembly
+    /// path from inventing fragment descriptors.
+    pub fn fragmentless() -> Self {
+        let meta = metal2vulkan::meta::FragMeta::default();
+        Self::new(
+            Vec::new(),
+            Arc::new(ShaderReflection::from_fragment(&meta, None)),
+        )
     }
 
     /// Fragment words with stage-collision binding relocations applied.
@@ -979,8 +985,8 @@ mod tests {
 
         // A sampler handle counts too, and so does reading one back out.
         let extract_sampler = module(&[
-            op(26, &[10]),                   // OpTypeSampler
-            op(81, &[10, 14, 21, 0]),        // OpCompositeExtract, result type %10
+            op(26, &[10]),            // OpTypeSampler
+            op(81, &[10, 14, 21, 0]), // OpCompositeExtract, result type %10
         ]);
         assert!(spirv_module_shape(&extract_sampler).opaque_in_composite);
 

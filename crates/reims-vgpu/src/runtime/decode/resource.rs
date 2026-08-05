@@ -693,8 +693,9 @@ pub fn texture_view_type_is_3d(texture_type: u16) -> bool {
 // destinationRGBBlendFactor, rgbBlendOperation, sourceAlphaBlendFactor,
 // destinationAlphaBlendFactor, alphaBlendOperation, writeMask — so the tag is
 // the property's one-based header index. Tag `0x00` sits before the first
-// property and is not one; it rides every entry with value 0 in every workload
-// measured and is reported by `note_color_entry_fields` as unconsumed.
+// property and is not one: it is the attachment index, matching tag 0x00 in
+// the sibling vertex-attribute and vertex-layout sections.
+pub const COLOR_ATTACHMENT_TAG_INDEX: u8 = 0x00;
 pub const COLOR_ATTACHMENT_TAG_PIXEL_FORMAT: u8 = 0x01;
 pub const COLOR_ATTACHMENT_TAG_BLEND_ENABLE: u8 = 0x02;
 pub const COLOR_ATTACHMENT_TAG_SRC_RGB: u8 = 0x03;
@@ -1472,11 +1473,9 @@ pub fn decode_render_pipeline_descriptor(
 
 /// A colour-attachment TLV field this decoder does not read.
 ///
-/// The entry is `[field_count][tag][len][value…]*` and eight tags are consumed
-/// (`COLOR_ATTACHMENT_TAG_PIXEL_FORMAT` through `..._ALPHA_OP`). Anything else
-/// is a field the guest serialized and we dropped on the floor — including,
-/// per `translate/coverage.rs`, `colorAttachments[n].writeMask`, whose position
-/// in this block is unknown and is an RE question rather than a guess.
+/// The entry is `[field_count][tag][len][value…]*` and ten tags are consumed:
+/// its attachment index and the nine descriptor properties. Anything else is
+/// a field the guest serialized and we dropped on the floor.
 struct ColorAttachDropped {
     tag: u8,
 }
@@ -1491,7 +1490,8 @@ impl crate::observe::Decline for ColorAttachDropped {
     }
 }
 
-const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 9] = [
+const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 10] = [
+    COLOR_ATTACHMENT_TAG_INDEX,
     COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
     COLOR_ATTACHMENT_TAG_BLEND_ENABLE,
     COLOR_ATTACHMENT_TAG_SRC_RGB,
@@ -1502,6 +1502,20 @@ const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 9] = [
     COLOR_ATTACHMENT_TAG_ALPHA_OP,
     COLOR_ATTACHMENT_TAG_WRITE_MASK,
 ];
+
+struct ColorAttachIndexOutOfRange {
+    declared: u32,
+}
+
+impl crate::observe::Decline for ColorAttachIndexOutOfRange {
+    fn slug(&self) -> &'static str {
+        "color_attachment_index_out_of_range"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("declared", self.declared.to_string())]
+    }
+}
 
 /// A colour-attachment `writeMask` outside `MTLColorWriteMask`'s four bits.
 ///
@@ -1617,8 +1631,32 @@ fn parse_one_color_entry(
     bytes: &[u8],
     len: usize,
     entry: usize,
-    slot: u32,
+    position: u32,
 ) -> PipelineColorAttachment {
+    let slot = match entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_INDEX) {
+        Some(declared) if (declared as usize) < MAX_COLOR_ATTACHMENTS => {
+            if declared != position {
+                crate::runtime::drain::note_store_route("type7_color_slot_off_position");
+            }
+            declared
+        }
+        Some(declared) => {
+            if crate::observe::first_sight(
+                "color_attachment_index_out_of_range",
+                u64::from(declared),
+            ) {
+                crate::observe::Emit::decline(
+                    "type7_color_attach",
+                    &ColorAttachIndexOutOfRange { declared },
+                )
+                .field("position", position)
+                .field("max", MAX_COLOR_ATTACHMENTS)
+                .fail();
+            }
+            position
+        }
+        None => position,
+    };
     note_color_entry_fields(bytes, len, entry, slot);
     let mut out = PipelineColorAttachment {
         slot,
@@ -1695,7 +1733,10 @@ fn parse_one_color_entry(
     out
 }
 
-/// Parse all color-attachment entries (slot = entry index in the section).
+const MAX_COLOR_ATTACHMENTS: usize = 8;
+
+/// Parse all color-attachment entries. Each entry's tag 0x00 declares the slot;
+/// table position is only the fallback for descriptors that omit that tag.
 pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
@@ -1706,7 +1747,7 @@ pub fn parse_color_attachments(
         return out;
     }
     let count = ld32(&bytes[section_off..]) as usize;
-    for i in 0..count.min(8) {
+    for i in 0..count.min(MAX_COLOR_ATTACHMENTS) {
         let offloc = section_off + 4 + i * 4;
         if offloc + 4 > len {
             break;
@@ -2864,6 +2905,54 @@ mod tests {
         assert_eq!(c.slot, 0);
         let all = parse_color_attachments(&buf, buf.len(), off);
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn a_colour_attachment_takes_the_slot_the_guest_declared() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
+
+        // Two entries declared out of table order. All consumers select blend,
+        // format and write-mask state by `slot`, so table position is not an
+        // interchangeable label.
+        let off = 16usize;
+        let entry_len = 1 + 2 * 6;
+        let mut buf = vec![0u8; off + 12 + 2 * entry_len];
+        st32(&mut buf[off..], 2);
+        st32(&mut buf[off + 4..], 12);
+        st32(&mut buf[off + 8..], (12 + entry_len) as u32);
+        let mut put = |entry: usize, index: u32, fmt: u32| {
+            buf[entry] = 2;
+            buf[entry + 1] = COLOR_ATTACHMENT_TAG_INDEX;
+            buf[entry + 2] = 4;
+            st32(&mut buf[entry + 3..], index);
+            buf[entry + 7] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+            buf[entry + 8] = 4;
+            st32(&mut buf[entry + 9..], fmt);
+        };
+        put(off + 12, 3, MTL_FORMAT_BGRA8_UNORM as u32);
+        put(off + 12 + entry_len, 1, MTL_FORMAT_RGBA8_UNORM as u32);
+
+        let got = parse_color_attachments(&buf, buf.len(), off);
+        assert_eq!((got[0].slot, got[1].slot), (3, 1));
+        assert_eq!(
+            got.iter().find(|a| a.slot == 3).map(|a| a.pixel_format),
+            Some(MTL_FORMAT_BGRA8_UNORM as u32)
+        );
+        assert_eq!(
+            got.iter().find(|a| a.slot == 1).map(|a| a.pixel_format),
+            Some(MTL_FORMAT_RGBA8_UNORM as u32)
+        );
+
+        let cap = crate::observe::FailCapture::start();
+        let _ = parse_color_attachments(&buf, buf.len(), off);
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|line| line.contains("reason=color_attachment_field_dropped")),
+            "tag 0x00 is consumed as the slot: {:?}",
+            cap.lines()
+        );
     }
 
     /// A colour-attachment field this decoder does not read is guest intent

@@ -330,7 +330,11 @@ mod writer {
     }
 
     fn open(path: &str) -> Option<BufWriter<std::fs::File>> {
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             Ok(file) => Some(BufWriter::new(file)),
             Err(e) => {
                 // The sink is the whole failure-visibility mechanism, so losing
@@ -552,6 +556,28 @@ pub fn sampled_cache_disabled() -> bool {
     })
 }
 
+/// Diagnostic knob (`REIMS_ALLOW_CONTROL_COLLISION_READ=1`): let a **read-only**
+/// consumer read through a `control_page_collision` refusal instead of failing.
+///
+/// The collision check protects live transport and task-control pages from
+/// being written through a surface alias; a *read* through the alias cannot
+/// corrupt them — at worst it samples a wrong picture. Reading through is how
+/// the refusal's basis is tested on a live boot: a correct picture means the
+/// recorded control span is stale (the guest recycled those pages into a
+/// surface); garbage means the collision is real. Every read-through is logged.
+/// Write consumers ignore this knob unconditionally — there is no variable
+/// that lets a write cross a collision.
+///
+/// Default off; a diagnostic arm, never a product configuration.
+pub fn allow_control_collision_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("REIMS_ALLOW_CONTROL_COLLISION_READ")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Which content-reuse rail a call site belongs to, so
 /// [`content_reuse_disabled`] can be armed one rail at a time.
 ///
@@ -679,8 +705,7 @@ impl ContentReuseRail {
 pub fn content_reuse_disabled(rail: ContentReuseRail) -> bool {
     static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {
-        std::env::var_os("REIMS_VGPU_CONTENT_REUSE_OFF")
-            .map(|v| v.to_string_lossy().into_owned())
+        std::env::var_os("REIMS_VGPU_CONTENT_REUSE_OFF").map(|v| v.to_string_lossy().into_owned())
     });
     content_reuse_spec_arms(spec.as_deref(), rail)
 }
@@ -1096,7 +1121,10 @@ mod tests {
         // The two whole-family spellings.
         for spec in ["1", "all"] {
             for r in all {
-                assert!(content_reuse_spec_arms(Some(spec), r), "{spec} must arm {r:?}");
+                assert!(
+                    content_reuse_spec_arms(Some(spec), r),
+                    "{spec} must arm {r:?}"
+                );
             }
         }
         // One rail names one rail.
@@ -1137,7 +1165,10 @@ mod tests {
         }
         for spec in ["1", "all"] {
             for r in all {
-                assert!(store_defer_spec_arms(Some(spec), r), "{spec} must arm {r:?}");
+                assert!(
+                    store_defer_spec_arms(Some(spec), r),
+                    "{spec} must arm {r:?}"
+                );
             }
         }
         assert!(store_defer_spec_arms(Some("t11surface"), Type11Surface));

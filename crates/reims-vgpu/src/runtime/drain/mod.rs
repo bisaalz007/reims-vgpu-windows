@@ -317,6 +317,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };
+    crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
     let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
     let page_size = state.page_size() as usize;
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
@@ -795,6 +796,10 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // Root stamp = slot 0.
                 if state.gfx.fifo_base_page != 0 {
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
+                        // Root packets publish completion directly instead of
+                        // going through `write_stamp`; they own the same fence
+                        // ordering before slot 0 becomes visible to the guest.
+                        crate::runtime::storage_flush::flush_all_windows_before_fence(state, host);
                         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
                         if gpa_map::write_u32(
                             host,
@@ -2035,8 +2040,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Process this channel's exec packet. Archive does not drain
                 // other child FIFOs here; surface RAW is render_wait_surface on
                 // the specific type-11/GVA key at sample/Load/swap sites.
-                let result =
-                    crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload);
+                let result = crate::runtime::exec::process_exec_indirect2(
+                    state,
+                    host,
+                    channel_id,
+                    &packet.payload,
+                );
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
                 if result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
@@ -2089,6 +2098,54 @@ fn process_child_packet<H: HostMemory + HostOps>(
         crate::runtime::decode::fifo::CHILD_OP_CONFIG_40 => {
             let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
         }
+        // The object id is a mapping id directly. Object-list refs are a
+        // separate id space that can collide numerically, so never route this
+        // packet through `texture_to_mapping`.
+        CHILD_OP_REPLACE_PHYSICAL => {
+            use crate::runtime::decode::fifo::{
+                decode_replace_physical, CHILD_REPLACE_PHYSICAL_LEN,
+            };
+
+            if let Some(cmd) = decode_replace_physical(&packet.payload) {
+                // Keep this branch's established fingerprint verdict: the
+                // next resolve decides whether the backing really changed.
+                // Immediate invalidation here caused broad Tahoe login damage
+                // because routine ReplacePhysical traffic can announce a
+                // recommit whose resolved page plan is unchanged.
+                let mode = if state.mapping_backing_condemned(cmd.object_id) {
+                    "pending"
+                } else if state.condemn_surface_backing(cmd.object_id) {
+                    "condemned"
+                } else {
+                    crate::runtime::storage_flush::drop_windows(
+                        state,
+                        cmd.object_id,
+                        "replace_physical",
+                    );
+                    let _ = state.invalidate_mapping_pages(cmd.object_id);
+                    "nothing_cached"
+                };
+                crate::runtime::mapper::flush_retired_views(state, host);
+                note_store_route(match mode {
+                    "condemned" => "replace_physical_condemned",
+                    "pending" => "replace_physical_pending",
+                    _ => "replace_physical_nothing_cached",
+                });
+                if crate::observe::draw_log_enabled() {
+                    crate::observe::line(format!(
+                        "map_family op=ReplacePhysical ch={channel_id} task={} object={} plen={} mode={mode}",
+                        cmd.task_id,
+                        cmd.object_id,
+                        packet.payload.len()
+                    ));
+                }
+            } else {
+                crate::observe::fail(format!(
+                    "child_packet_short reason=replace_physical_short ch={channel_id} plen={} need={CHILD_REPLACE_PHYSICAL_LEN}",
+                    packet.payload.len()
+                ));
+            }
+        }
         // PVG bookkeeping family: accept + stamp (already below). Full PT/map
         // semantics land with metal2vulkan encode; until then fail-visible
         // UnknownChildOpcode flooded /tmp/reims-vgpu-fail and hid draw telemetry.
@@ -2096,8 +2153,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         | CHILD_OP_MAP_MEMORY2
         | CHILD_OP_INVALIDATE_RESOURCES
         | CHILD_OP_SYNCHRONIZE_RESOURCES
-        | CHILD_OP_DELETE_IOSURFACE_BACKING2
-        | CHILD_OP_REPLACE_PHYSICAL => {
+        | CHILD_OP_DELETE_IOSURFACE_BACKING2 => {
             // Stamp-complete for PT wire (no invent). Unmap/Map retire
             // gva_host_views; verbose-gated map_probe census for stage Unmapped.
             //
@@ -2106,7 +2162,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
             let plen = packet.payload.len();
             let name = match packet.opcode {
                 CHILD_OP_MAP_MEMORY2 => "MapMemory2",
-                CHILD_OP_REPLACE_PHYSICAL => "ReplacePhysical",
                 CHILD_OP_UNMAP_MEMORY => "UnmapMemory",
                 CHILD_OP_INVALIDATE_RESOURCES => "InvalidateResources",
                 CHILD_OP_SYNCHRONIZE_RESOURCES => "SynchronizeResources",
@@ -2198,6 +2253,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             ));
                         }
                         state.note_task_map(task_id, gva, length);
+                        // MapMemory2 is the last ordered point at which the
+                        // object-list PTEs are guaranteed live. Tahoe may clear
+                        // them after publishing a later EXEC, before AIR
+                        // translation lets the drain worker reach that packet.
+                        crate::runtime::objects::retain_object_list_map_range(
+                            state,
+                            host,
+                            task_id,
+                            gva,
+                            length,
+                            "map_memory2",
+                        );
                     }
                 }
                 // Deferred GVA render-Store windows overlapping the notified
@@ -2211,11 +2278,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         .gva_deferred_flush
                         .iter()
                         .filter(|(&wgva, e)| {
-                            (e.task_id == task_id
-                                || e.task_id == task_id >> 1
-                                || e.task_id >> 1 == task_id)
-                                && wgva < hi
-                                && gva < wgva.saturating_add(e.span())
+                            // A virtual range overlaps only inside the task
+                            // address space that named it. Both values are
+                            // resolved task slots; shifted matches select
+                            // unrelated live tasks.
+                            e.task_id == task_id && wgva < hi && gva < wgva.saturating_add(e.span())
                         })
                         .map(|(&wgva, _)| wgva)
                         .collect();
@@ -2275,57 +2342,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
                         "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
-                    ));
-                }
-            } else if packet.opcode == CHILD_OP_REPLACE_PHYSICAL && plen >= 8 {
-                // Archived lead: {taskID, objectID}; live total_size=20 ⇒ header+payload.
-                // Guest may rebind physical pages under the object — drop cached
-                // page_entries / contig so the next Store re-resolves (safe
-                // zero-copy / freelist-prevention). Object id is typically a
-                // texture ref; also try as mapping_id when texture map misses.
-                let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
-                let object_id = crate::contract::endian::ld32(&packet.payload[4..]);
-                // Guest MAY rebind physical pages under the object — retire the
-                // cached bindings so the next Store re-resolves (freelist
-                // prevention). Like the trailing delete, this must not destroy
-                // a live incarnation's deferred paint (a tile's only copy sits
-                // in the GPU resident until writeback): condemn with a page
-                // fingerprint and let the next resolve decide. A genuine rebind
-                // resolves to different pages → bump + windows dropped there;
-                // a revalidation/no-op resolves identical → content survives.
-                let mut n_inv = 0u32;
-                let mut n_cond = 0u32;
-                let mut targets = vec![object_id];
-                if let Some(&mid) = state.texture_to_mapping.get(&(task_id, object_id)) {
-                    if mid != object_id {
-                        targets.push(mid);
-                    }
-                }
-                for id in targets {
-                    if state.mapping_backing_condemned(id) {
-                        // Decision already pending; the next resolve settles it.
-                        continue;
-                    }
-                    if state.condemn_surface_backing(id) {
-                        n_cond = n_cond.saturating_add(1);
-                    } else {
-                        // No resolved pages ⇒ nothing a stale replace could
-                        // hurt; keep the old teardown semantics.
-                        crate::runtime::storage_flush::drop_windows(state, id, "replace_physical");
-                        if state.invalidate_mapping_pages(id) {
-                            n_inv = n_inv.saturating_add(1);
-                        }
-                    }
-                }
-                // Per-op echo of a routine lifecycle op — the always-on rate is
-                // the `teardown_churn ... replace=` window summary
-                // (lifecycle_churn). Keep the per-op detail (inv/condemn split)
-                // gated so it does not flood the always-on sink; the
-                // `draw_log_enabled()` guard also skips the format alloc on a
-                // healthy boot (mirrors the DeleteIOSurfaceBacking2 site above).
-                if crate::observe::draw_log_enabled() {
-                    crate::observe::line(format!(
-                        "map_family op=ReplacePhysical ch={channel_id} task={task_id} object={object_id} plen={plen} inv_pages={n_inv} condemned={n_cond}"
                     ));
                 }
             } else if packet.opcode == CHILD_OP_INVALIDATE_RESOURCES {
@@ -2741,6 +2757,106 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
 
     state.draining_mask &= !bit;
     state.draining_channel = prev_channel;
+}
+
+/// Read the consecutive MapMemory2/SetObjectList prefix at a sibling FIFO head
+/// without consuming it.
+///
+/// Tahoe can publish an EXEC on one channel before the MapMemory2 notifications
+/// that make its object-list PTEs readable on another. A cold AIR translation
+/// parks the EXEC and preserves cross-FIFO ordering, so executing the sibling
+/// maps early would also let view retirement and later teardown overtake it.
+/// Peeking is enough: MapMemory2 is notify-after-PTE-update, and retaining the
+/// immutable object-list bytes changes none of the guest-visible FIFO state.
+fn observe_translation_map_prefix<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel_id: u32,
+) {
+    if state.gfx.root_page == 0 || channel_id == 0 || channel_id as usize >= MAX_CHANNELS {
+        return;
+    }
+    let Some(regs_off) = child_reg_block_offset(channel_id) else {
+        return;
+    };
+    let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
+    let Ok(mut head) = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD) else {
+        return;
+    };
+    let Ok(tail) = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL) else {
+        return;
+    };
+    let Ok(base_pfn) = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_BASE_PFN) else {
+        return;
+    };
+    let ring_length = ensure_child_ring(state, host, channel_id, base_pfn);
+    if ring_length == 0 {
+        return;
+    }
+    let page_gpas = state.child_rings[channel_id as usize].page_gpas.clone();
+    let mut observed_maps = 0u32;
+    while head != tail {
+        let Some(available) = published_byte_count(head, tail, ring_length) else {
+            break;
+        };
+        if available < PACKET_HEADER_LEN {
+            break;
+        }
+        let Ok(header) = read_child_ring_bytes(
+            host,
+            &page_gpas,
+            ring_length,
+            head,
+            PACKET_HEADER_LEN,
+            state.page_shift,
+        ) else {
+            break;
+        };
+        let opcode = ld16(&header[PACKET_OPCODE..]);
+        if !matches!(opcode, CHILD_OP_SET_OBJECT_LIST | CHILD_OP_MAP_MEMORY2) {
+            break;
+        }
+        let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
+        if total_size < PACKET_HEADER_LEN || total_size > ring_length || available < total_size {
+            break;
+        }
+        let Ok(snap) = read_child_ring_bytes(
+            host,
+            &page_gpas,
+            ring_length,
+            head,
+            total_size,
+            state.page_shift,
+        ) else {
+            break;
+        };
+        let Ok(packet) = decode_packet(&snap, head, available) else {
+            break;
+        };
+        if opcode == CHILD_OP_MAP_MEMORY2 && packet.payload.len() >= 20 {
+            let task_id = ld32(&packet.payload[0..]);
+            let gva = crate::contract::endian::ld64(&packet.payload[4..]);
+            let length = crate::contract::endian::ld64(&packet.payload[12..]);
+            crate::runtime::objects::retain_object_list_map_range(
+                state,
+                host,
+                task_id,
+                gva,
+                length,
+                "translation_peek",
+            );
+            observed_maps = observed_maps.saturating_add(1);
+        }
+        head = packet.next_head;
+    }
+    if observed_maps != 0
+        && crate::observe::first_sight("translation_map_peek", u64::from(channel_id))
+    {
+        crate::observe::off(format!(
+            "translation_map_peek ch={channel_id} maps={observed_maps} producer_mask={:#x}",
+            state.translation_deferred_mask
+        ));
+    }
 }
 
 /// Drain iosfc mapper producer→consumer handshake.
@@ -3303,7 +3419,8 @@ fn emit_engine_delta() {
          shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
          sampled_cache_hits={} sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} seed_uploads={} seed_upload_bytes={} \
-         ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
+         ring_retire_blocks={} target_evicts={} evicts_idle={} evicts_cap={} \
+         evicts_recreated={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
         d.allocs,
         d.batch_opens,
@@ -3328,6 +3445,9 @@ fn emit_engine_delta() {
         d.seed_upload_bytes,
         d.ring_retire_blocks,
         d.target_evicts,
+        d.evicts_idle_drained,
+        d.evicts_cap,
+        d.evicts_recreated,
         d.desc_pool_grow,
         d.gen_mismatch,
     ));
@@ -4049,6 +4169,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             note_translation_order_hold(state, TRANSLATION_ROOT_FIFO_BIT);
         }
         let sibling_pending = state.pending.child_mask & !deferred;
+        for ch in 1..MAX_CHANNELS as u32 {
+            let bit = 1u32 << ch;
+            if sibling_pending & bit != 0 {
+                observe_translation_map_prefix(state, host, ch);
+            }
+        }
         note_translation_order_hold(state, sibling_pending);
         for ch in 1..MAX_CHANNELS as u32 {
             let bit = 1u32 << ch;

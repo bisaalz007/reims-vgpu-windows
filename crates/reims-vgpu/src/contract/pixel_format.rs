@@ -285,6 +285,21 @@ pub enum RenderTargetClass {
     /// `mrt color RT resolve fail` lines name this format, and the caller
     /// abandons the rest of the serialized draw list on each one.
     R16Float = 7,
+    /// Packed 10-bit wide-gamut colour used by Tahoe for dynamically generated
+    /// icon and compositor surfaces. The native word is A2:R10:G10:B10 from
+    /// high to low bits, matching Vulkan's `A2R10G10B10_UNORM_PACK32` exactly.
+    Bgr10A2Unorm = 8,
+    /// Two-channel unsigned-integer color target. Metal lists `RG16Uint` with
+    /// the Color capability, and Vulkan carries the same native texel through
+    /// `R16G16_UINT`. Its 16-bit values must never transit the RGBA8 color
+    /// conversion helpers: resident render/sample and raw native writeback are
+    /// the lossless rails for this class.
+    Rg16Uint = 9,
+    /// Single-channel 8-bit normalized color target. Metal gives `R8Unorm` the
+    /// Color and Blend capabilities, and Vulkan's `R8_UNORM` is byte-identical.
+    /// CPU load/store keeps the red channel exactly; the absent channels read
+    /// as zero and alpha as one, matching texture sampling semantics.
+    R8Unorm = 10,
 }
 
 #[repr(u8)]
@@ -357,9 +372,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
         // Depth32Float_Stencil8 / X32_Stencil8: 64-bit cells on Apple Silicon
         // (40-bit logical DS + pad; Metal allocates 8 B/texel for this family).
         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 | MTL_FORMAT_X32_STENCIL8 => 8,
-        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => {
-            RGBA16_BPP
-        }
+        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
         _ => return None,
     })
@@ -742,6 +755,9 @@ pub fn render_target_class(format: u16) -> Option<(RenderTargetClass, u32)> {
         MTL_FORMAT_RGBA16_FLOAT => (RenderTargetClass::Rgba16Float, RGBA16F_BPP),
         MTL_FORMAT_RG16_FLOAT => (RenderTargetClass::Rg16Float, RG16F_BPP),
         MTL_FORMAT_R16_FLOAT => (RenderTargetClass::R16Float, R16F_BPP),
+        MTL_FORMAT_BGR10A2_UNORM => (RenderTargetClass::Bgr10A2Unorm, 4),
+        MTL_FORMAT_RG16_UINT => (RenderTargetClass::Rg16Uint, RG16F_BPP),
+        MTL_FORMAT_R8_UNORM => (RenderTargetClass::R8Unorm, R8_BPP),
         _ => return None,
     })
 }
@@ -1029,6 +1045,9 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
         return false;
     }
     match format {
+        MTL_FORMAT_R8_UNORM => {
+            dst[0] = rgba[COMPONENT_R];
+        }
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => {
             dst[..4].copy_from_slice(&rgba);
         }
@@ -1037,6 +1056,19 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
             dst[1] = rgba[COMPONENT_G];
             dst[2] = rgba[COMPONENT_R];
             dst[3] = rgba[COMPONENT_A];
+        }
+        MTL_FORMAT_BGR10A2_UNORM => {
+            // Inverse of `texel_to_rgba8`: expand each 8-bit colour channel to
+            // 10-bit UNORM by replicating its high bits, then quantize alpha to
+            // the four representable A2 levels. Vulkan copies this packed word
+            // byte-for-byte into `A2R10G10B10_UNORM_PACK32` attachments.
+            let expand10 = |v: u8| (u32::from(v) << 2) | (u32::from(v) >> 6);
+            let a2 = (u32::from(rgba[COMPONENT_A]) * 3 + 127) / 255;
+            let word = (a2 << 30)
+                | (expand10(rgba[COMPONENT_R]) << 20)
+                | (expand10(rgba[COMPONENT_G]) << 10)
+                | expand10(rgba[COMPONENT_B]);
+            dst[..4].copy_from_slice(&word.to_le_bytes());
         }
         MTL_FORMAT_RGBA16_FLOAT => {
             let lut = unorm8_to_f16_lut();
@@ -1252,6 +1284,22 @@ mod tests {
             texel_to_rgba8(MTL_FORMAT_BGR10A2_UNORM, &green_transparent.to_le_bytes()),
             Some([0, 255, 0, 0])
         );
+
+        // The write side must use the identical field order. This is the path
+        // used to seed and store a packed colour attachment.
+        let mut packed = [0u8; 4];
+        assert!(rgba8_to_texel(
+            MTL_FORMAT_BGR10A2_UNORM,
+            [255, 0, 0, 255],
+            &mut packed
+        ));
+        assert_eq!(u32::from_le_bytes(packed), red);
+        assert!(rgba8_to_texel(
+            MTL_FORMAT_BGR10A2_UNORM,
+            [0, 0, 255, 255],
+            &mut packed
+        ));
+        assert_eq!(u32::from_le_bytes(packed), blue);
     }
 
     /// `RGBA16Unorm` is likewise pinned to the guest's allocation, and its
@@ -1307,17 +1355,39 @@ mod tests {
                 [value, 77, 88, 99],
                 &mut texel
             ));
-            let back = texel_to_rgba8(MTL_FORMAT_R16_FLOAT, &texel)
-                .expect("R16Float must decode");
+            let back = texel_to_rgba8(MTL_FORMAT_R16_FLOAT, &texel).expect("R16Float must decode");
             assert_eq!(back[COMPONENT_R], value, "R must survive at {value}");
             assert_eq!(back[COMPONENT_G], 0);
             assert_eq!(back[COMPONENT_B], 0);
             assert_eq!(back[COMPONENT_A], UNORM8_MAX);
         }
 
-        // A format that genuinely is not colour-renderable stays refused, so the
-        // table is still a statement and not a rubber stamp.
-        assert_eq!(render_target_class(MTL_FORMAT_R8_UNORM), None);
+        // A depth format genuinely is not a colour target, so the table is
+        // still a statement and not a rubber stamp.
+        assert_eq!(render_target_class(MTL_FORMAT_DEPTH32_FLOAT), None);
+    }
+
+    /// `R8Unorm` is a Metal color target, not merely a sampled/storage image.
+    /// The native byte round-trip is exact for the one channel the format owns.
+    #[test]
+    fn r8_unorm_target_is_renderable_and_round_trips_red() {
+        assert_eq!(
+            render_target_class(MTL_FORMAT_R8_UNORM),
+            Some((RenderTargetClass::R8Unorm, 1))
+        );
+        for red in [0u8, 1, 64, 128, 200, 255] {
+            let mut native = [0u8; 1];
+            assert!(rgba8_to_texel(
+                MTL_FORMAT_R8_UNORM,
+                [red, 77, 88, 99],
+                &mut native
+            ));
+            assert_eq!(native[0], red);
+            assert_eq!(
+                texel_to_rgba8(MTL_FORMAT_R8_UNORM, &native),
+                Some([red, 0, 0, 255])
+            );
+        }
     }
 
     #[test]
@@ -1489,9 +1559,24 @@ mod tests {
             render_target_class(MTL_FORMAT_RG16_FLOAT),
             Some((RenderTargetClass::Rg16Float, 4))
         );
-        // Integer / non-color formats stay fail-closed.
+        assert_eq!(
+            render_target_class(MTL_FORMAT_BGR10A2_UNORM),
+            Some((RenderTargetClass::Bgr10A2Unorm, 4))
+        );
+        assert_eq!(
+            render_target_class(MTL_FORMAT_RG16_UINT),
+            Some((RenderTargetClass::Rg16Uint, 4))
+        );
+        // Metal color-renders to R8Unorm (mask/coverage passes target it);
+        // A8Unorm shares the byte layout but is not renderable, so the pair
+        // pins the boundary between them.
+        assert_eq!(
+            render_target_class(MTL_FORMAT_R8_UNORM),
+            Some((RenderTargetClass::R8Unorm, 1))
+        );
+        assert_eq!(render_target_class(MTL_FORMAT_A8_UNORM), None);
+        // Four-channel integer formats stay fail-closed.
         assert_eq!(render_target_class(MTL_FORMAT_RGBA8_UINT), None);
-        assert_eq!(render_target_class(MTL_FORMAT_R8_UNORM), None);
     }
 
     /// RG16Float MRT slots (vibrancy UI tile masks) must admit as color RTs so
@@ -1541,6 +1626,7 @@ mod tests {
             (MTL_FORMAT_BGRA8_UNORM, 4),
             (MTL_FORMAT_BGRA8_UNORM_SRGB, 4),
             (MTL_FORMAT_RGBA16_FLOAT, 8),
+            (MTL_FORMAT_BGR10A2_UNORM, 4),
         ] {
             assert_eq!(render_target_bpp(fmt), Some(bpp), "fmt={fmt:#x}");
             // Round-trip tight row for write_gva / mapping store.

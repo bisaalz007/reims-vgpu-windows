@@ -48,6 +48,11 @@ fn store_into(
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
+    // Provenance does not survive a content replacement: the new bytes came
+    // from whatever store is running now, and only [`store_texture`] records an
+    // address for them. A stale address tying the old allocation to the new
+    // pixels is exactly the mix-up `source_gva` exists to prevent.
+    entry.source_gva = 0;
 }
 
 fn get_from(
@@ -201,12 +206,17 @@ pub fn get_shared(
 }
 
 /// Type-2/3 encode cache by texture object ref (not surface_id).
+/// `source_gva` is the target GVA the producing Store rendered into, or 0 when
+/// the producer has none — the LOAD-seed ref door refuses an entry that cannot
+/// say where its pixels came from, so passing 0 stores bytes that only the
+/// geometry-matched [`get_texture`] samplers can serve.
 pub fn store_texture(
     state: &mut DeviceState,
     texture_ref: u32,
     width: u32,
     height: u32,
     bgra: Vec<u8>,
+    source_gva: u64,
 ) {
     let generation = state.next_sampled_content_generation();
     store_into(
@@ -217,6 +227,15 @@ pub fn store_texture(
         std::sync::Arc::new(bgra),
         generation,
     );
+    // Only the store that actually landed may claim provenance: `store_into`
+    // refuses zero/oversized geometry and short buffers, and stamping a
+    // refused store's address onto a surviving older entry would tie its
+    // pixels to the wrong allocation.
+    if let Some(entry) = state.host_texture_surfaces.get_mut(&texture_ref) {
+        if entry.host_gen == generation {
+            entry.source_gva = source_gva;
+        }
+    }
 }
 
 pub fn get_texture(
@@ -226,6 +245,24 @@ pub fn get_texture(
     height: u32,
 ) -> Option<&[u8]> {
     get_from(&state.host_texture_surfaces, texture_ref, width, height)
+}
+
+/// The allocation the ref-keyed entry's pixels were produced over, for the
+/// LOAD-seed provenance gate: `Some(0)` means the entry exists at this geometry
+/// but its producer recorded no address, `None` means no entry at this
+/// geometry at all. Both refuse the ref door; they are separated so a census
+/// can tell "no record" from "no entry".
+pub fn texture_source_gva(
+    state: &DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Option<u64> {
+    let e = state.host_texture_surfaces.get(&texture_ref)?;
+    if e.width != width || e.height != height || e.bgra.is_empty() {
+        return None;
+    }
+    Some(e.source_gva)
 }
 
 /// Any size under texture_ref (sample path when descriptor geom unknown).
@@ -487,7 +524,7 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => {}
         _ => return,
     }
-    store_texture(state, texture_ref, width, height, bgra.clone());
+    store_texture(state, texture_ref, width, height, bgra.clone(), gva);
     let backing = gva_backing(state, host, task_id, gva, width, height);
     store_gva_owned(state, gva, width, height, bgra, 0, backing);
     arm_gva_guest_write_witness(state, host, gva);
@@ -853,7 +890,8 @@ pub fn mark_gva_backing_suspect(
         // decides — so an over-mark costs one walk that comes back
         // `Confirmed`, while a missed mark leaves a stale entry serving with
         // nobody ever asking it to prove itself.
-        if !crate::runtime::gva_view::task_matches(backing.task_id, task_id) || entry.backing_suspect
+        if !crate::runtime::gva_view::task_matches(backing.task_id, task_id)
+            || entry.backing_suspect
         {
             continue;
         }
@@ -996,8 +1034,12 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
 
         store(&mut st, 7, 4, 4, px.clone());
-        seen.insert(get_from_with_gen(&st.host_surfaces, 7, 4, 4).expect("mid store").1);
-        store_texture(&mut st, 9, 4, 4, px.clone());
+        seen.insert(
+            get_from_with_gen(&st.host_surfaces, 7, 4, 4)
+                .expect("mid store")
+                .1,
+        );
+        store_texture(&mut st, 9, 4, 4, px.clone(), 0);
         seen.insert(
             get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
                 .expect("ref store")
@@ -1012,7 +1054,10 @@ mod tests {
         seen.insert(st.host_surfaces.get(&7).expect("ceded entry").host_gen);
 
         assert_eq!(seen.len(), 4, "four stores, four distinct generations");
-        assert!(!seen.contains(&0), "0 is reserved for 'no host content yet'");
+        assert!(
+            !seen.contains(&0),
+            "0 is reserved for 'no host content yet'"
+        );
     }
 
     /// Deferred linear residency lifecycle: note marks the entry
@@ -1213,7 +1258,7 @@ mod tests {
         let mut tex = vec![0u8; 16];
         tex[0] = 2;
         store(&mut st, 5, w, h, surface);
-        store_texture(&mut st, 5, w, h, tex);
+        store_texture(&mut st, 5, w, h, tex, 0);
         assert_eq!(get(&st, 5, w, h).unwrap()[0], 1);
         assert_eq!(get_texture(&st, 5, w, h).unwrap()[0], 2);
     }
@@ -1595,7 +1640,15 @@ mod tests {
         }
         // An entry stored with no recorded backing cannot be marked — there is
         // nothing to compare it against, and it reports `Unrecorded` forever.
-        store_gva_owned(&mut st, 9 * page, w, h, vec![0u8; (w * h * 4) as usize], 0, None);
+        store_gva_owned(
+            &mut st,
+            9 * page,
+            w,
+            h,
+            vec![0u8; (w * h * 4) as usize],
+            0,
+            None,
+        );
 
         // Exactly the two entries the range overlaps.
         assert_eq!(mark_gva_backing_suspect(&mut st, 1, 2 * page, 2 * page), 2);
@@ -1774,7 +1827,10 @@ mod tests {
         // store records the new pages.
         repoint_pte(&mut host, root_gpa, 1, 12);
         let second_gpa = store_armed(&mut st, &mut host, gva, 0x5A);
-        assert_ne!(first_gpa, second_gpa, "the address names different pages now");
+        assert_ne!(
+            first_gpa, second_gpa,
+            "the address names different pages now"
+        );
 
         // A write to the *old* pages says nothing about this entry.
         host.guest_wrote_page(first_gpa);
@@ -1847,7 +1903,11 @@ mod tests {
 
         evict_gva(&mut st, page);
         crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
-        assert_eq!(host.tracked_guest_write_sets(), 1, "the evicted entry's set");
+        assert_eq!(
+            host.tracked_guest_write_sets(),
+            1,
+            "the evicted entry's set"
+        );
 
         let _ = st.take_all_host_views();
         crate::runtime::mapper::flush_retired_views(&mut st, &mut host);

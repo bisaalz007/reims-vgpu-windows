@@ -24,6 +24,203 @@ fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
     );
 }
 
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn draw_handoff_dedup_uses_shader_content_not_reused_pipeline_refs() {
+    let vertex_mtlb = [1, 2];
+    let vertex_air = [3, 4];
+    let vertex_spv = [5, 6];
+    let fragment_mtlb = [7, 8];
+    let fragment_air = [9, 10];
+    let fragment_spv = [11, 12];
+    let stages = [
+        (
+            "vertex",
+            vertex_mtlb.as_slice(),
+            vertex_air.as_slice(),
+            vertex_spv.as_slice(),
+        ),
+        (
+            "fragment",
+            fragment_mtlb.as_slice(),
+            fragment_air.as_slice(),
+            fragment_spv.as_slice(),
+        ),
+    ];
+    let first = draw_handoff_fingerprint(&stages);
+    assert_eq!(first, draw_handoff_fingerprint(&stages));
+
+    let changed_fragment_air = [9, 13];
+    let reused_ref_content = [
+        stages[0],
+        (
+            "fragment",
+            fragment_mtlb.as_slice(),
+            changed_fragment_air.as_slice(),
+            fragment_spv.as_slice(),
+        ),
+    ];
+    assert_ne!(
+        first,
+        draw_handoff_fingerprint(&reused_ref_content),
+        "the later shader must not be suppressed because its guest pipe ref was reused"
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn half_census_distinguishes_infinity_and_nan_from_finite_values() {
+    use crate::backend::vulkan::engine::TargetReadback;
+    use crate::backend::vulkan::translate::pixel;
+    let words = [0x0000u16, 0x3c00, 0x7bff, 0x7c00, 0x7e00, 0xfc00];
+    let bytes: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+    let half = TargetReadback {
+        pixels: bytes.clone(),
+        width: 3,
+        height: 1,
+        format: pixel::RG16_FLOAT_FORMAT,
+        bgra: false,
+    };
+    assert_eq!(half.nonfinite_half_words(), 3);
+    // The same bytes under a non-half format are not f16 words at all; the
+    // census must answer 0 rather than scan a meaningless exponent mask.
+    let unorm = TargetReadback {
+        pixels: bytes,
+        width: 3,
+        height: 1,
+        format: pixel::RESIDENT_RGBA_FORMAT,
+        bgra: false,
+    };
+    assert_eq!(unorm.nonfinite_half_words(), 0);
+}
+
+/// Cold AIR translation must not turn the guest's object-list publication
+/// table into storage for an EXEC packet. A one-shot icon producer removes the
+/// entries before the retry; the captured descriptor and MTLBs still belong to
+/// that already-submitted packet and must remain executable until it is
+/// consumed.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_async_render_retry_uses_its_submission_pipeline_snapshot() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+    let descriptor = RenderPipelineDescriptor {
+        vertex_func_ref: 17,
+        fragment_func_ref: 19,
+        ..RenderPipelineDescriptor::default()
+    };
+    state.render_pipeline_snapshots.insert(
+        (16, 31),
+        crate::model::RenderPipelineSnapshot {
+            descriptor: descriptor.clone(),
+            vertex_mtlb: std::sync::Arc::from([1u8, 2, 3, 4]),
+            fragment_mtlb: std::sync::Arc::from([5u8, 6, 7, 8]),
+        },
+    );
+
+    // No task/object-list memory is mapped in the host fixture. The only
+    // correct source is therefore the packet-owned snapshot.
+    let replay = load_render_pipeline_snapshot(&mut state, &host, 16, 31)
+        .expect("the deferred EXEC owns its captured pipeline inputs");
+    assert_eq!(replay.descriptor, descriptor);
+    assert_eq!(replay.vertex_mtlb.as_ref(), [1, 2, 3, 4]);
+    assert_eq!(replay.fragment_mtlb.as_ref(), [5, 6, 7, 8]);
+
+    release_render_pipeline_snapshots(&mut state, 16, &[31]);
+    assert!(state.render_pipeline_snapshots.is_empty());
+    assert!(load_render_pipeline_snapshot(&mut state, &host, 16, 31).is_err());
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn task_lifecycle_drops_abandoned_pipeline_snapshots() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let snapshot = || crate::model::RenderPipelineSnapshot {
+        descriptor: RenderPipelineDescriptor::default(),
+        vertex_mtlb: std::sync::Arc::from([1u8]),
+        fragment_mtlb: std::sync::Arc::from([2u8]),
+    };
+
+    assert!(state.define_task(7, 0x10000, 0x20));
+    state.render_pipeline_snapshots.insert((7, 3), snapshot());
+    assert!(state.define_task(7, 0x20000, 0x30));
+    assert!(state.render_pipeline_snapshots.is_empty());
+
+    state.render_pipeline_snapshots.insert((7, 4), snapshot());
+    assert!(state.delete_task(7));
+    assert!(state.render_pipeline_snapshots.is_empty());
+}
+
+/// Tahoe's icon compositor binds a type-5 serialized IOSurface view as the
+/// color attachment. The view geometry/format, not the base surface geometry,
+/// is the Metal render target contract, and the submission-owned descriptor
+/// remains usable after the live list slot is gone.
+#[test]
+fn type5_submission_view_is_an_exact_render_target() {
+    use crate::contract::endian::{st16, st32};
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+    use crate::model::{SubmissionObjectSnapshot, SubmissionResourceSnapshot};
+    use crate::runtime::decode::resource::ListObjectEntry;
+
+    const TASK: u32 = 20;
+    const CHANNEL: u32 = 1;
+    const TEXTURE_REF: u32 = 5;
+    const SURFACE_ID: u32 = 14;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+    assert!(state.map_surface(SURFACE_ID));
+    assert!(state.set_mapping_geom(SURFACE_ID, 320, 320, MTL_FORMAT_BGRA8_UNORM));
+    state.mappings.get_mut(&SURFACE_ID).unwrap().page_entries = (1..=64)
+        .map(|pfn| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+        .collect();
+
+    let mut descriptor = vec![0u8; 56];
+    st32(&mut descriptor[objects::TYPE5_SURFACE_ID..], SURFACE_ID);
+    let record = objects::TYPE5_ARG_RECORD;
+    descriptor[record] = objects::TYPE5_RECORD_TAG_COLOR_VIEW;
+    st16(
+        &mut descriptor[record + objects::TYPE5_RECORD_FORMAT..],
+        MTL_FORMAT_RGBA16_FLOAT,
+    );
+    st32(&mut descriptor[record + objects::TYPE5_RECORD_WIDTH..], 130);
+    st32(
+        &mut descriptor[record + objects::TYPE5_RECORD_HEIGHT..],
+        130,
+    );
+    st32(&mut descriptor[record + objects::TYPE5_RECORD_DEPTH..], 1);
+    let mut objects_by_ref = std::collections::BTreeMap::new();
+    objects_by_ref.insert(
+        TEXTURE_REF,
+        SubmissionObjectSnapshot {
+            entry: ListObjectEntry {
+                object_type: objects::OBJECT_TYPE_REF_TEXTURE,
+                descriptor_length: descriptor.len() as u32,
+                descriptor_gva: 0x1000,
+            },
+            descriptor: descriptor.into(),
+        },
+    );
+    state.submission_resource_snapshots.insert(
+        CHANNEL,
+        SubmissionResourceSnapshot {
+            task_id: TASK,
+            resource_ids: std::sync::Arc::from([TEXTURE_REF]),
+            objects: objects_by_ref,
+        },
+    );
+    state.active_submission_channel = Some(CHANNEL);
+
+    let (mapping, gva, width, height, bpr, format) =
+        lookup_render_target(&mut state, &host, TASK, TEXTURE_REF)
+            .expect("the serialized type-5 view is renderable");
+    assert_eq!(mapping, SURFACE_ID);
+    assert_eq!(gva, 0);
+    assert_eq!((width, height, format), (130, 130, MTL_FORMAT_RGBA16_FLOAT));
+    assert!(bpr >= 130 * 8);
+}
+
 /// One reflection binding of `kind` at `metal_index` for the
 /// `frag_declared_unbound` guard tests. Only kind + index are load-bearing.
 fn rb(
@@ -1196,8 +1393,8 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
-    let entry_for = |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
-        | PAGE_ENTRY_VALID;
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1294,9 +1491,8 @@ fn the_guest_write_verdict_separates_its_refusals() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
-    let entry_for = |gpa: u64| {
-        (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
-    };
+    let entry_for =
+        |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
     let page = state.page_size();
@@ -1362,8 +1558,8 @@ fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::runtime::host::{FakeHost, HostOps};
 
-    let entry_for = |gpa: u64, shift: u32| (((gpa >> shift) as u32) << PAGE_ENTRY_PFN_SHIFT)
-        | PAGE_ENTRY_VALID;
+    let entry_for =
+        |gpa: u64, shift: u32| (((gpa >> shift) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -1446,9 +1642,9 @@ fn a_host_that_cannot_observe_guest_writes_never_vouches() {
     assert!(state.map_surface(7));
     {
         let m = state.mappings.get_mut(&7).expect("mapped above");
-        m.page_entries =
-            vec![((((0x40 * page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
-                | PAGE_ENTRY_VALID];
+        m.page_entries = vec![
+            ((((0x40 * page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        ];
     }
     assert_eq!(
         crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7),
@@ -1819,6 +2015,7 @@ fn binding_hex_prefix_selects_binding_and_bounds_output() {
         (4, (0u8..80).collect::<Vec<u8>>().into()),
     ];
     assert_eq!(binding_hex_prefix(&storage, 4, 4), "00010203");
+    assert_eq!(binding_hex_prefix(&storage, 4, 256).len(), 80 * 2);
     assert_eq!(binding_hex_prefix(&storage, 1, 64), "aaaaaa");
     assert_eq!(binding_hex_prefix(&storage, 9, 64), "");
 }
@@ -3092,9 +3289,8 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
     // without either is unwitnessable, and the sample path below refuses it
     // rather than serving bytes it cannot vouch for — so a fixture that skipped
     // this would be testing the fall-through, not the cache rung it names.
-    let backing =
-        crate::runtime::surface_cache::gva_backing(&state, &host, 1, texel_gva, w, h)
-            .expect("texel walk resolves");
+    let backing = crate::runtime::surface_cache::gva_backing(&state, &host, 1, texel_gva, w, h)
+        .expect("texel walk resolves");
     crate::runtime::surface_cache::store_gva_owned(
         &mut state,
         texel_gva,
@@ -3379,6 +3575,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
         w,
         h,
         vec![0, 180, 0, 255, 0, 180, 0, 255],
+        target_gva + 0x1000,
     );
     crate::runtime::surface_cache::store_gva(
         &mut state,
@@ -3400,8 +3597,9 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     .expect("exact GVA cache seed");
     assert_eq!(seed, vec![0, 0, 0, 255, 0, 0, 0, 255]);
 
-    // Without a GVA match, use the texture namespace (green), never the
-    // colliding surface namespace (red).
+    // Without a GVA match, the texture namespace serves — but only for the
+    // allocation its pixels were produced over (the store above recorded
+    // `target_gva + 0x1000`), never the colliding surface namespace (red).
     let texture_seed = seed_color_load(
         &mut state,
         &mut host,
@@ -3413,6 +3611,25 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     )
     .expect("texture-ref cache seed");
     assert_eq!(texture_seed, vec![0, 180, 0, 255, 0, 180, 0, 255]);
+
+    // A target the entry was NOT produced over must refuse the ref door: a
+    // LOAD seed is the attachment's prior content, and serving another
+    // allocation's picture arms the next frame to load what this one stored.
+    // With the guest pages unmapped in this fixture, the refusal surfaces as
+    // "no seed" rather than the wrong picture.
+    assert_eq!(
+        seed_color_load(
+            &mut state,
+            &mut host,
+            task_id,
+            texture_ref,
+            target_gva + 0x2000,
+            w,
+            h,
+        ),
+        None,
+        "a ref-door entry from another allocation must not seed this one"
+    );
 }
 
 /// A type-5 ref is not itself a surface id. The descriptor's surface_id
@@ -4377,7 +4594,10 @@ fn only_a_moved_backing_refuses_a_gva_cache_hit() {
     use crate::runtime::surface_cache::BackingVerdict as V;
     let serve = |v| note_gva_backing_verdict(v, "test", 1, 0xa42000, 64, 64);
     assert!(serve(V::Unchanged), "no notify has touched the span");
-    assert!(serve(V::Confirmed), "the same pages came back (wallpaper class)");
+    assert!(
+        serve(V::Confirmed),
+        "the same pages came back (wallpaper class)"
+    );
     assert!(
         serve(V::Unrecorded),
         "nothing to compare against is not evidence of a move"
@@ -4524,7 +4744,16 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     // kernel reported over its freed heap element.
     assert!(
         write_gva_rgba8_within(
-            &mut state, &mut host, 1, page, 64, 64, 64 * 4, c0.format, &rgba, None,
+            &mut state,
+            &mut host,
+            1,
+            page,
+            64,
+            64,
+            64 * 4,
+            c0.format,
+            &rgba,
+            None,
         )
         .is_ok(),
         "without the bound the same write succeeds into the new owner's page"
@@ -4657,8 +4886,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
             .host
             .read_gpa(StoreRig::frame_gpa(moved_to), &mut victim);
         assert_eq!(
-            victim,
-            [0xffu8; 4],
+            victim, [0xffu8; 4],
             "packed={packed}: and it succeeds by painting the new owner's page"
         );
     }

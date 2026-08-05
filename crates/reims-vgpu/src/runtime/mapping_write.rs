@@ -419,6 +419,125 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     true
 }
 
+/// Write an image that is already in the mapping's native Metal texel layout,
+/// preserving formats wider than RGBA8. Page skips have the same ordering
+/// contract as [`write_bgra8_skipping`], but no color conversion is permitted:
+/// an RGBA16Float resident therefore lands as its original eight bytes/texel.
+#[allow(clippy::too_many_arguments)]
+pub fn write_native_image_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    format: u16,
+    skip_gpas: &std::collections::BTreeSet<u64>,
+) -> bool {
+    if width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return false;
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return false;
+    };
+    if src_stride < tight || src.len() < (src_stride as usize).saturating_mul(height as usize) {
+        return false;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return false;
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return false;
+    }
+    let Some((base_off, surface_bpr, span_end)) =
+        type11_sample_window(m, mapping_id, width, height, format)
+    else {
+        return false;
+    };
+    if skip_gpas.is_empty() {
+        let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
+            return false;
+        };
+        if !write_full_rect_raw_at(
+            state,
+            host,
+            mapping_id,
+            base_off,
+            surface_bpr,
+            span_end,
+            width,
+            height,
+            bpp,
+            src,
+            src_stride,
+        ) {
+            return false;
+        }
+    } else {
+        let page_size = state.page_size();
+        let page_shift = state.page_shift;
+        let page_entries = state
+            .mappings
+            .get(&mapping_id)
+            .map(|m| m.page_entries.clone())
+            .unwrap_or_default();
+        let offset_skipped = |offset: u64| -> bool {
+            let index = (offset / page_size) as usize;
+            page_entries.get(index).is_some_and(|entry| {
+                crate::contract::iosurface_pages::entry_gpa_shift(*entry, page_shift)
+                    .is_some_and(|gpa| skip_gpas.contains(&gpa))
+            })
+        };
+        crate::runtime::storage_flush::flush_intersecting(
+            state, host, mapping_id, base_off, span_end,
+        );
+        for y in 0..height as usize {
+            let src_row = &src[y * src_stride as usize..y * src_stride as usize + tight as usize];
+            let row_off = base_off + y as u64 * u64::from(surface_bpr);
+            let mut i = 0u64;
+            while i < u64::from(tight) {
+                let off = row_off + i;
+                let page_end = ((off / page_size) + 1) * page_size;
+                let n = (page_end - off).min(u64::from(tight) - i);
+                if !offset_skipped(off)
+                    && !mapper::write_mapping_bytes(
+                        state,
+                        host,
+                        mapping_id,
+                        off,
+                        &src_row[i as usize..(i + n) as usize],
+                    )
+                {
+                    return false;
+                }
+                i += n;
+            }
+        }
+        state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+        let _ = state.mark_mapping_written(mapping_id);
+    }
+    if skip_gpas.is_empty() {
+        let mut bgra = vec![0u8; width as usize * height as usize * 4];
+        let mut rgba = vec![0u8; width as usize * 4];
+        for y in 0..height as usize {
+            let src_row = &src[y * src_stride as usize..y * src_stride as usize + tight as usize];
+            if !convert_row_to_rgba8(format, src_row, width, &mut rgba) {
+                return false;
+            }
+            for (dst, px) in bgra[y * width as usize * 4..(y + 1) * width as usize * 4]
+                .chunks_exact_mut(4)
+                .zip(rgba.chunks_exact(4))
+            {
+                dst.copy_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        crate::runtime::surface_cache::store(state, mapping_id, width, height, bgra);
+    }
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    true
+}
+
 /// Write a tight RGBA8 image into a type-11 mapping, optionally as changed-spans.
 ///
 /// Archive `apple_pv_gpu_write_type11_image_changed`: when `seed_rgba` is present
@@ -483,6 +602,13 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let tight = tight as usize;
     let mut native = vec![0u8; tight];
     let mut seed_native = vec![0u8; tight];
+    // Every mapping write must land an older deferred window first. The
+    // fragmented branch below eventually reaches `write_mapping_bytes`, which
+    // already flushes; the contiguous branch writes through a raw host pointer
+    // and otherwise lets the older frame land on top of this one afterwards.
+    let _ = crate::runtime::storage_flush::flush_intersecting(
+        state, host, mapping_id, base_off, span_end,
+    );
     let contig = contig_for_span(state, host, mapping_id, span_end);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
@@ -1119,6 +1245,13 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
+    // Keep the contiguous and fragmented storage shapes ordered identically:
+    // an armed window represents an earlier write and must land before this
+    // rect. This is re-entrant-safe because the flush removes intersecting
+    // windows before writing them back through this function.
+    let _ = crate::runtime::storage_flush::flush_intersecting(
+        state, host, mapping_id, base_off, span_end,
+    );
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
         // The fragmented full-plane branch below already rejects on the same bound
         // (`frame_end > span_end`); enforce it here too so the contig fast paths
@@ -1961,6 +2094,127 @@ mod tests {
         assert!(!write_rect_raw(
             &mut state, &mut host, 5, 3, 0, 2, 1, &src, 8
         ));
+    }
+
+    #[test]
+    fn native_rgba16float_writeback_preserves_out_of_unorm_range_bits() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x18u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(17);
+        state.attach_mapping_internal(17, 0);
+        let m = state.mappings.get_mut(&17).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(17, 1, 1, pixel_format::MTL_FORMAT_RGBA16_FLOAT,));
+        // -1.0, +2.0, 0.5, 1.0. An RGBA8 round trip clamps the first two;
+        // native writeback must retain every half bit verbatim.
+        let native = [0x00, 0xbc, 0x00, 0x40, 0x00, 0x38, 0x00, 0x3c];
+        assert!(write_native_image_skipping(
+            &mut state,
+            &mut host,
+            17,
+            &native,
+            8,
+            1,
+            1,
+            pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+            &std::collections::BTreeSet::new(),
+        ));
+        let mut landed = [0u8; 8];
+        host.read_gpa(gpa, &mut landed).unwrap();
+        assert_eq!(landed, native);
+    }
+
+    /// Both mapping write entries must consume an earlier deferred Store before
+    /// writing the newer bytes, regardless of whether the guest pages admit the
+    /// contiguous raw-pointer fast path.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn write_entries_flush_armed_windows_on_both_storage_shapes() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 16;
+        const H: u32 = 16;
+        const BPR: u32 = W * 4;
+
+        for packed in [true, false] {
+            for entry in ["rect", "rgba8_changed"] {
+                let mut state = DeviceState::new(DeviceId(4), PAGE_SHIFT_X86);
+                let mut host = FakeHost::new();
+                host.strict_linux_map = !packed;
+                let base_pfn = 0x80u32;
+                host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 4 * PAGE as usize, 0);
+                let order: Vec<u32> = if packed {
+                    (0..4).collect()
+                } else {
+                    vec![3, 2, 1, 0]
+                };
+                let page_entries = order
+                    .into_iter()
+                    .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                    .collect();
+
+                state.map_surface(5);
+                state.attach_mapping_internal(5, 0);
+                {
+                    let mapping = state.mappings.get_mut(&5).unwrap();
+                    mapping.mapping_internal = 1;
+                    mapping.page_entries = page_entries;
+                }
+                assert!(state.set_mapping_geom(5, W, H, MTL_FORMAT_BGRA8_UNORM));
+                state.compute_deferred_flush.insert(
+                    crate::model::ComputeStorageResidencyKey {
+                        mapping_id: 5,
+                        map_generation: state.mappings[&5].map_generation,
+                        surface_offset: 0,
+                        surface_bpr: BPR,
+                        span_end: (W * H * 4) as u64,
+                        width: W,
+                        height: H,
+                        pixel_format: MTL_FORMAT_BGRA8_UNORM,
+                        texture_ref: 0,
+                    },
+                    crate::model::DeferredOwner::Render {
+                        armed_seq: 1,
+                        source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                            0u8;
+                            (W * H * 4) as usize
+                        ])),
+                    },
+                );
+
+                let newer = vec![0x33u8; (W * H * 4) as usize];
+                let wrote = match entry {
+                    "rect" => write_rect_raw_at(
+                        &mut state,
+                        &mut host,
+                        5,
+                        0,
+                        BPR,
+                        (W * H * 4) as u64,
+                        0,
+                        0,
+                        W,
+                        H,
+                        4,
+                        &newer,
+                        BPR,
+                    ),
+                    _ => write_rgba8_image_changed(&mut state, &mut host, 5, &newer, None, W, H),
+                };
+
+                assert!(wrote, "packed={packed} entry={entry}: write failed");
+                assert!(
+                    state.compute_deferred_flush.is_empty(),
+                    "packed={packed} entry={entry}: older window remained armed"
+                );
+            }
+        }
     }
 
     /// A rect read through the **contiguous** path must observe a deferred

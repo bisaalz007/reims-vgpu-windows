@@ -341,11 +341,7 @@ impl DeviceContext {
             // non-empty list, such a host declines at attach time instead of
             // creating a WSI-less instance that a later `create_surface` would
             // use as though it had one.
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "linux",
-                target_os = "windows"
-            )))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let platform: &[&CStr] = &[];
             let available: Vec<&CStr> = platform
                 .iter()

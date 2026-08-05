@@ -38,6 +38,10 @@ impl ResourcePools {
             compute_storage_order: VecDeque::new(),
             registry: HashMap::new(),
             registry_order: VecDeque::new(),
+            reclaim_history: VecDeque::new(),
+            reclaims_idle: 0,
+            reclaims_cap: 0,
+            reclaims_recreated: 0,
             idle_clock_ms: 0,
             last_drain_ms: 0,
             settled_drain_passes: 0,
@@ -392,11 +396,13 @@ impl ResourcePools {
         };
         let drained = victims.len();
         for k in victims {
-            if let Some(pos) = self.registry_order.iter().position(|x| x == &k) {
-                self.registry_order.remove(pos);
-            }
-            if let Some(old) = self.registry.remove(&k) {
-                self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+            if let Some(old) = self.unregister_resident(&k, ResidentReclaim::IdleDrained) {
+                // A slot created by `registry_ensure_color` carries no
+                // framebuffer; spending a graveyard entry on a null handle is
+                // the divergence the unified retire path exists to prevent.
+                if old.framebuffer != vk::Framebuffer::null() {
+                    self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+                }
                 // Terminal DESTROY, not RecycleTarget: an idle-drained resident is
                 // stale by `IDLE_TARGET_AGE_MS` — it is not being actively recycled
                 // (that is the capacity-eviction path's job for a per-frame video
@@ -457,16 +463,12 @@ impl ResourcePools {
         self.registry_order.len().saturating_sub(pinned)
     }
 
-    /// Evict non-pinned resident targets (LRU, oldest at the front of
-    /// `registry_order`) until the non-pinned population is at or below
-    /// [`REGISTRY_CAP`]. Pinned slots (deferred render Stores whose only copy is
-    /// on the GPU) and an optional `protect`ed identity rotate to the back
-    /// instead of evicting — they are bounded separately and must not count
-    /// toward the cap, or a pinned burst would force the active set out (thrash).
-    /// One full rotation is the budget. `registry_order` is a `VecDeque`, so each
-    /// front pop / rotate-to-back is O(1) and the whole sweep is O(n) — not the
-    /// O(n²) a `Vec` front-`remove(0)` per rotation would cost under a large
-    /// pinned population (`reg=512` measured under multi-4K load).
+    /// Evict non-pinned resident targets — least-recently-**used** first — until
+    /// the non-pinned population is at or below [`REGISTRY_CAP`]. Pinned slots
+    /// (deferred render Stores whose only copy is on the GPU) and an optional
+    /// `protect`ed identity are never victims — they are bounded separately and
+    /// must not count toward the cap, or a pinned burst would force the active
+    /// set out (thrash).
     ///
     /// Shared by both admit paths (`registry_ensure` passes the just-resolved
     /// identity as `protect`; `registry_ensure_color` passes `None`).
@@ -477,43 +479,74 @@ impl ResourcePools {
         protect: Option<&TargetIdentity>,
     ) {
         let mut non_pinned = self.non_pinned_registry_len();
-        let mut rotations = self.registry_order.len();
-        while non_pinned > REGISTRY_CAP && rotations > 0 {
-            rotations -= 1;
-            let Some(old_k) = self.registry_order.front().cloned() else {
+        while non_pinned > REGISTRY_CAP {
+            // Least-recently-used, for real. `registry_order` is insertion
+            // order — nothing promotes an entry when a draw reuses it — so
+            // popping its front evicted the oldest-*created* resident. A
+            // compositor backdrop is created early and lives for the whole
+            // session, which made it the permanent front and the first victim
+            // of every burst, however hard the current frame was reading it.
+            //
+            // Selecting the minimum `last_touch_ms` protects an in-use resident
+            // without giving up the hard bound: skipping recent entries instead
+            // would let a burst touching more than `REGISTRY_CAP` targets
+            // inside the age window evict nothing at all and grow the registry
+            // without limit. Here the cap always finds a victim while any
+            // evictable entry exists, and the victim is never more recently
+            // used than an alternative.
+            let Some(victim) = self.cap_eviction_victim(protect) else {
+                // Everything left is pinned or protected. Pinned residents are
+                // bounded separately by the rail that armed them, so the
+                // registry soft-exceeds the cap rather than dropping content
+                // whose only copy is on the GPU.
                 break;
             };
-            if self
-                .registry
-                .get(&old_k)
-                .is_some_and(|slot| slot.pin_count > 0)
-                || protect == Some(&old_k)
-            {
-                self.registry_order.pop_front();
-                self.registry_order.push_back(old_k);
-                continue;
-            }
-            if let Some(old) = self.registry.remove(&old_k) {
-                if old.framebuffer != vk::Framebuffer::null() {
-                    self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-                }
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::RecycleTarget(FreeTargetImage {
-                        image: old.image,
-                        memory: old.memory,
-                        view: old.view,
-                        width: old.width,
-                        height: old.height,
-                        format: old.color_format,
-                    }),
-                );
-                counters
-                    .target_evicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.registry_order.pop_front();
+            self.retire_resident(ctx, &victim, ResidentReclaim::CapEvicted, counters);
             non_pinned = non_pinned.saturating_sub(1);
+        }
+    }
+
+    /// The resident the capacity walk should evict next, or `None` when every
+    /// entry left is pinned or protected.
+    ///
+    /// Least-recently-used, chosen by `last_touch_ms`. Split out from
+    /// [`Self::evict_registry_to_cap`] because that function needs a live
+    /// `DeviceContext` to dispose what it evicts, and the choice — the part
+    /// with the policy in it — is worth testing without a GPU.
+    ///
+    /// Iterates `registry_order` rather than the map so the result is
+    /// deterministic: `min_by_key` returns the first minimum, so equal stamps
+    /// fall to the oldest-created entry — which is what this walk chose for
+    /// every entry before it consulted recency at all. O(n) per eviction rather
+    /// than O(1) amortised, and evictions are rare next to binds — the cost
+    /// this avoids paying is a promotion on every sampled bind of every draw.
+    fn cap_eviction_victim(&self, protect: Option<&TargetIdentity>) -> Option<TargetIdentity> {
+        self.registry_order
+            .iter()
+            .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
+            .filter(|(k, slot)| slot.pin_count == 0 && protect != Some(k))
+            .min_by_key(|(_, slot)| slot.last_touch_ms)
+            .map(|(k, _)| k.clone())
+    }
+
+    /// Record that a draw is reading this resident as a **sampled source**, so
+    /// both reclaim paths count it as in use.
+    ///
+    /// Reading a resident was not a use: `last_touch_ms` was refreshed by
+    /// `registry_ensure` (a draw rendering *into* the target), by the present
+    /// touch, and by nothing else — the sampled-source resolve goes through
+    /// `registry_get`, which takes `&self` and cannot mark anything. A resident
+    /// that every frame samples but no frame draws into consequently aged as if
+    /// it were abandoned. That is the shape of a compositor backdrop: rendered
+    /// once, then read by every vibrancy draw over it. The idle drain took it
+    /// (a terminal destroy), the next draw to sample it refused with
+    /// `vk_draw_exec_sampled_resident_missing`, and nothing recreates a
+    /// resident except a draw rendering into that identity — so the refusal
+    /// held for the life of the boot.
+    pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
+        let touch = self.idle_clock_ms;
+        if let Some(slot) = self.registry.get_mut(identity) {
+            slot.last_touch_ms = touch;
         }
     }
 
@@ -1005,7 +1038,7 @@ impl ResourcePools {
         self.in_flight += 1;
     }
 
-    /// The open batch's (CB, fence) when a draw at (identity, geometry, bgra)
+    /// The open batch's (CB, fence) when a draw at (identity, geometry, format)
     /// can append to it. `None` means the caller must claim its own slot (and
     /// `begin_entry` will flush the batch first).
     ///
@@ -1024,14 +1057,14 @@ impl ResourcePools {
         identity: &TargetIdentity,
         width: u32,
         height: u32,
-        bgra: bool,
+        color_format: vk::Format,
     ) -> Option<(vk::CommandBuffer, vk::Fence)> {
         let b = self.open_batch.as_ref()?;
         (b.draws < BATCH_MAX_DRAWS
             && b.identity == *identity
             && b.width == width
             && b.height == height
-            && b.bgra == bgra)
+            && b.color_format == color_format)
             .then_some((b.cb, b.fence))
     }
 
@@ -1051,7 +1084,7 @@ impl ResourcePools {
         identity: TargetIdentity,
         width: u32,
         height: u32,
-        bgra: bool,
+        color_format: vk::Format,
         dset: Option<(vk::DescriptorSet, vk::DescriptorPool)>,
         sampled_retains: Vec<(
             vk::Image,
@@ -1079,7 +1112,7 @@ impl ResourcePools {
                     identity,
                     width,
                     height,
-                    bgra,
+                    color_format,
                     draws: 1,
                     dsets: dset.into_iter().collect(),
                     sampled_retains,
@@ -1439,61 +1472,6 @@ impl ResourcePools {
                 // here), so the copy overwrites every mapped byte — a preceding
                 // full-span zeroing would just be overwritten. Copy only.
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-            }
-        }
-        Ok(())
-    }
-
-    /// Copy into a mapped staging slot with R and B exchanged.
-    ///
-    /// The exchange is an involution, so this serves both directions: a
-    /// semantic-RGBA seed into a BGRA attachment, and a guest-scanout-order seed
-    /// (what `surface_cache` holds) into the RGBA pooled target. Which one is
-    /// wanted is decided by the caller from `target_seed_order` against
-    /// `output_bgra`; the transformation is the same either way.
-    ///
-    /// It used to run over a heap copy of the seed, which cost a full-frame
-    /// allocation, a memcpy to fill it, a second pass to swizzle it and a third
-    /// to write it into the mapped span. Being per-pixel and order-independent
-    /// it folds into the copy: read from the caller's borrow, write the exchanged
-    /// bytes straight into mapped memory, one pass, no allocation.
-    ///
-    /// Mapped staging is host-visible and written only, never read back, so
-    /// this writes each destination byte exactly once and never loads from
-    /// `ptr` — a read-modify-write in place would fault the write-combined
-    /// case into a far slower path.
-    ///
-    /// A trailing partial pixel (`len % 4 != 0`) is copied through unswizzled;
-    /// a seed is always whole RGBA8 pixels, so the remainder is empty in
-    /// practice and this only keeps the mapped span fully defined.
-    pub(crate) unsafe fn write_staging_swap_rb(
-        &self,
-        ctx: &DeviceContext,
-        slot: &BufferSlot,
-        rgba: &[u8],
-    ) -> Result<(), DrawError> {
-        let size = rgba.len().max(4) as u64;
-        let ptr = staging_write_ptr(ctx, slot, size)?;
-        unsafe {
-            if rgba.is_empty() {
-                std::ptr::write_bytes(ptr, 0, size as usize);
-                return Ok(());
-            }
-            let whole = rgba.len() / 4 * 4;
-            for i in (0..whole).step_by(4) {
-                let px = rgba.as_ptr().add(i);
-                let dst = ptr.add(i);
-                *dst = *px.add(2);
-                *dst.add(1) = *px.add(1);
-                *dst.add(2) = *px;
-                *dst.add(3) = *px.add(3);
-            }
-            if whole < rgba.len() {
-                std::ptr::copy_nonoverlapping(
-                    rgba.as_ptr().add(whole),
-                    ptr.add(whole),
-                    rgba.len() - whole,
-                );
             }
         }
         Ok(())

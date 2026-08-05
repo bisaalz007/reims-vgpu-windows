@@ -264,6 +264,15 @@ engine_counters! {
         target_free_allocs,
         target_recycle_admits,
         target_recycle_cap_drops,
+        /// Registry removals split by the path that took them (the same
+        /// `ResidentReclaim` record the sampled-missing decline reads for
+        /// `prior=`). `target_evicts` counts the recycle exits in aggregate;
+        /// these separate an idle-out from cap pressure from a
+        /// geometry/generation replace, which want three different fixes.
+        /// Owned by `ResourcePools`; merged in by `engine::counter_snapshot`.
+        evicts_idle_drained,
+        evicts_cap,
+        evicts_recreated,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

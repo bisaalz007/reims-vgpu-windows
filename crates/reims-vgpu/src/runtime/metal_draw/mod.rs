@@ -769,6 +769,15 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
         None::<RenderPipelineDescriptor>
     };
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, pipeline_ref) else {
+        if let Some(snapshot) = state
+            .render_pipeline_snapshots
+            .get(&(task_id, pipeline_ref))
+        {
+            crate::observe::off(format!(
+                "render_pipeline_snapshot_replay task={task_id} ref={pipeline_ref} reason=object_list_entry_absent"
+            ));
+            return Some(snapshot.descriptor.clone());
+        }
         return say("object_list_entry_absent");
     };
     // Live object-list: render pipeline is type-7 with subtype 0x0e.
@@ -781,7 +790,11 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
     let Ok(p) = decode_render_pipeline_descriptor(&desc) else {
         return say("descriptor_decode_failed");
     };
-    if p.vertex_func_ref == 0 || p.fragment_func_ref == 0 {
+    // A vertex function is required. A nil fragment function is a legal Metal
+    // pipeline on the Vulkan rail: it writes no color while depth/stencil and
+    // visibility processing may still run. The Metal-direct ABI still requires
+    // both MTLBs, so keep its existing refusal until that ABI represents nil.
+    if p.vertex_func_ref == 0 || (p.fragment_func_ref == 0 && !cfg!(feature = "backend-vulkan")) {
         crate::observe::fail(format!(
             "render_pipeline_unresolved reason=function_ref_unbound task={task_id}              ref={pipeline_ref} vtx={} frag={} object={} mesh={}",
             p.vertex_func_ref, p.fragment_func_ref, p.object_func_ref, p.mesh_func_ref
@@ -789,6 +802,93 @@ fn load_render_pipeline<M: HostMemory + HostOps>(
         return None;
     }
     Some(p)
+}
+
+/// Resolve and retain every immutable input needed to translate and later
+/// execute one render pipeline.
+///
+/// The guest object list is a publication table, not packet-owned storage. A
+/// one-shot producer can remove its pipeline and function entries while cold
+/// AIR translation is still running. The first preflight therefore captures
+/// the descriptor and its bound MTLBs; a retry uses that exact submission snapshot
+/// when the live entries have gone. A live descriptor always wins and replaces
+/// the snapshot, so ref reuse cannot silently select an older pipeline.
+#[cfg(feature = "backend-vulkan")]
+fn load_render_pipeline_snapshot<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> Result<crate::model::RenderPipelineSnapshot, DrawPreparationDecline> {
+    let key = (task_id, pipeline_ref);
+    let cached = state.render_pipeline_snapshots.get(&key).cloned();
+    let descriptor = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
+        DrawPreparationDecline::PipelineMissing {
+            task_id,
+            pipeline_ref,
+        },
+    )?;
+
+    let vertex_mtlb = load_mtlb(state, host, task_id, descriptor.vertex_func_ref);
+    let fragment_mtlb = if descriptor.fragment_func_ref == 0 {
+        Some(Vec::new())
+    } else {
+        load_mtlb(state, host, task_id, descriptor.fragment_func_ref)
+    };
+    let (vertex_mtlb, _fragment_mtlb) = match (vertex_mtlb, fragment_mtlb) {
+        (Some(vertex_mtlb), Some(fragment_mtlb)) => {
+            let snapshot = crate::model::RenderPipelineSnapshot {
+                descriptor,
+                vertex_mtlb: std::sync::Arc::from(vertex_mtlb),
+                fragment_mtlb: std::sync::Arc::from(fragment_mtlb),
+            };
+            state
+                .render_pipeline_snapshots
+                .insert(key, snapshot.clone());
+            return Ok(snapshot);
+        }
+        missing => missing,
+    };
+    let vertex_missing = vertex_mtlb.is_none();
+
+    // Function entries can disappear in the same object-list update as the
+    // pipeline entry. Reuse cached MTLBs only when the still-readable pipeline
+    // descriptor is byte-for-byte the decoded descriptor we captured with
+    // them; otherwise the ref has been republished and the old bytes are stale.
+    if let Some(snapshot) = cached.filter(|snapshot| snapshot.descriptor == descriptor) {
+        crate::observe::off(format!(
+            "render_pipeline_snapshot_replay task={task_id} ref={pipeline_ref} reason=function_entry_absent"
+        ));
+        return Ok(snapshot);
+    }
+
+    if vertex_missing {
+        Err(DrawPreparationDecline::VertexMtlbMissing {
+            task_id,
+            function_ref: descriptor.vertex_func_ref,
+        })
+    } else {
+        Err(DrawPreparationDecline::FragmentMtlbMissing {
+            task_id,
+            function_ref: descriptor.fragment_func_ref,
+        })
+    }
+}
+
+/// Release submission snapshots after the EXEC packet that owns them has been
+/// consumed. Deferred packets deliberately skip this call and keep theirs for
+/// the translation retry.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn release_render_pipeline_snapshots(
+    state: &mut DeviceState,
+    task_id: u32,
+    pipeline_refs: &[u32],
+) {
+    for &pipeline_ref in pipeline_refs {
+        state
+            .render_pipeline_snapshots
+            .remove(&(task_id, pipeline_ref));
+    }
 }
 
 /// Is this pipeline object merely not readable *yet*?
@@ -824,41 +924,28 @@ pub(crate) fn render_pipeline_unreadable_yet<M: HostMemory + HostOps>(
 /// background thread while unrelated child FIFOs continue draining.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn load_render_air_pair<M: HostMemory + HostOps>(
-    state: &DeviceState,
+    state: &mut DeviceState,
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
-    let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
-        DrawPreparationDecline::PipelineMissing {
-            task_id,
-            pipeline_ref,
-        },
-    )?;
-    let v_mtlb = load_mtlb(state, host, task_id, pd.vertex_func_ref).ok_or(
-        DrawPreparationDecline::VertexMtlbMissing {
-            task_id,
-            function_ref: pd.vertex_func_ref,
-        },
-    )?;
-    let f_mtlb = load_mtlb(state, host, task_id, pd.fragment_func_ref).ok_or(
-        DrawPreparationDecline::FragmentMtlbMissing {
-            task_id,
-            function_ref: pd.fragment_func_ref,
-        },
-    )?;
-    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb)
+    let snapshot = load_render_pipeline_snapshot(state, host, task_id, pipeline_ref)?;
+    let v_air = crate::runtime::mtlb::extract_air(snapshot.vertex_mtlb.as_ref())
         .map_err(|reason| DrawPreparationDecline::VertexAirExtract {
-            function_ref: pd.vertex_func_ref,
+            function_ref: snapshot.descriptor.vertex_func_ref,
             reason,
         })?
         .to_vec();
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb)
-        .map_err(|reason| DrawPreparationDecline::FragmentAirExtract {
-            function_ref: pd.fragment_func_ref,
-            reason,
-        })?
-        .to_vec();
+    let f_air = if snapshot.descriptor.fragment_func_ref == 0 {
+        Vec::new()
+    } else {
+        crate::runtime::mtlb::extract_air(snapshot.fragment_mtlb.as_ref())
+            .map_err(|reason| DrawPreparationDecline::FragmentAirExtract {
+                function_ref: snapshot.descriptor.fragment_func_ref,
+                reason,
+            })?
+            .to_vec()
+    };
     Ok((v_air, f_air))
 }
 
@@ -3267,8 +3354,8 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     // mids — guest pages stay empty and dual-mid thrash paints black.
     // Type-4: object-list index is surface_id. Type-5 RefTextureHandle: surfaceID@0
     // (allocateRefTextureHandle) — product color RTs are type-5 wrapping type-4.
-    let type4_sid = if live_type == Some(objects::OBJECT_TYPE_SURFACE) {
-        Some(resolved_ref)
+    let type4_target = if live_type == Some(objects::OBJECT_TYPE_SURFACE) {
+        Some((resolved_ref, None))
     } else if live_type == Some(objects::OBJECT_TYPE_REF_TEXTURE) {
         let entry = live.as_ref()?;
         let desc = objects::read_descriptor(state, host, task_id, entry)?;
@@ -3279,15 +3366,15 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         if sid == 0 {
             return None;
         }
-        Some(sid)
+        Some((sid, objects::decode_type5_texture_view(&desc)))
     } else {
         None
     };
-    if let Some(surface_id) = type4_sid {
+    if let Some((surface_id, type5_view)) = type4_target {
         if view_level != 0 {
             return None;
         }
-        if !objects::resolve_type4_surface(state, host, surface_id) {
+        if !objects::ensure_surface_for_present(state, host, surface_id) {
             crate::observe::fail(format!(
                 "rt_resolve FAIL type4 tex_ref={resolved_ref} sid={surface_id} live_type={live_type:?}"
             ));
@@ -3302,15 +3389,38 @@ fn lookup_render_target<M: HostMemory + HostOps>(
             ));
             return None;
         }
-        let base_fmt = if m.format != 0 {
-            m.format
+        let (width, height, fmt, bpr) = if let Some(view) = type5_view {
+            let fmt = effective_view_sample_format(view.pixel_format, view_fmt_override)
+                .unwrap_or(view.pixel_format);
+            pixel_format::render_target_bpp(fmt)?;
+            let (_, bpr, span_end, _) = mapping_write::type5_sample_window(
+                m,
+                view.plane_index,
+                view.width,
+                view.height,
+                fmt,
+            )?;
+            let page_bytes = (m.page_entries.len() as u64) << state.page_shift;
+            if span_end > page_bytes {
+                crate::observe::fail(format!(
+                    "rt_resolve FAIL type5_span tex_ref={resolved_ref} sid={surface_id} view={}x{} fmt={fmt:#x} span={span_end} page_bytes={page_bytes}",
+                    view.width, view.height
+                ));
+                return None;
+            }
+            (view.width, view.height, fmt, bpr)
         } else {
-            MTL_FORMAT_BGRA8_UNORM
+            let base_fmt = if m.format != 0 {
+                m.format
+            } else {
+                MTL_FORMAT_BGRA8_UNORM
+            };
+            let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
+            pixel_format::render_target_bpp(fmt)?;
+            (m.width, m.height, fmt, 0)
         };
-        let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
-        pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.
-        return Some((surface_id, 0, m.width, m.height, 0, fmt));
+        return Some((surface_id, 0, width, height, bpr, fmt));
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
     let entry = live?;
@@ -3998,18 +4108,52 @@ fn seed_color_load<M: HostMemory + HostOps>(
     // recycling. Fall back to the type-2/3 texture namespace, never the
     // unrelated type-4 surface_id namespace. Guest memory is last.
     if width > 0 && height > 0 {
-        let cached = if target_gva != 0 {
+        let gva_served = target_gva != 0
+            && crate::runtime::surface_cache::has_gva(state, target_gva, width, height);
+        // The ref door only answers for the allocation its pixels came from.
+        //
+        // A LOAD seed is the attachment's *prior content*, and the matching
+        // Store writes the composite back — so a door that hands the pass
+        // another allocation's picture arms the next frame to load what this
+        // one stored. The GVA door cannot do that: its key *is* the
+        // allocation. The ref door's key is an object-list slot the guest
+        // reuses, and its entry carries no page identity, so `source_gva` —
+        // the address the producing Store rendered into — is the only thing
+        // that can separate "same allocation, GVA entry gone" from "the guest
+        // re-pointed this texture and this is the previous one's picture".
+        //
+        // An entry that cannot say where its pixels came from is refused for
+        // the same reason, and so is a target with no address of its own:
+        // neither can establish that these are this attachment's bytes.
+        // Refusing costs a guest re-read below (`load_sampled_rgba_static`),
+        // never a lost seed — the guest's own pages are the authoritative
+        // source, and any deferred window over this address was landed at the
+        // top of this function.
+        let ref_served = !gva_served
+            && texture_ref != 0
+            && target_gva != 0
+            && crate::runtime::surface_cache::texture_source_gva(state, texture_ref, width, height)
+                == Some(target_gva);
+        if gva_served {
+            crate::runtime::drain::note_store_route("load_seed_color_from_gva");
+        } else if texture_ref != 0 {
+            // The denominator. A door that served nothing because the GVA door
+            // always won and one that was asked and refused read identically
+            // at zero, and only the second says what this gate costs.
+            crate::runtime::drain::note_store_route("load_seed_color_ref_asked");
+            crate::runtime::drain::note_store_route(if ref_served {
+                "load_seed_color_from_ref"
+            } else {
+                "load_seed_color_ref_refused"
+            });
+        }
+        let cached = if gva_served {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
+        } else if ref_served {
+            crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
         } else {
             None
-        }
-        .or_else(|| {
-            (texture_ref != 0)
-                .then(|| {
-                    crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
-                })
-                .flatten()
-        });
+        };
         if let Some(bgra) = cached {
             return Some(swap_rb_channels(bgra));
         }

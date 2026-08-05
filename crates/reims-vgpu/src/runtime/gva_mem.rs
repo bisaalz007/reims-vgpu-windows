@@ -660,19 +660,10 @@ pub fn task_gva_page_gpas_dense<M: HostMemory>(
     page_shift: u32,
 ) -> Vec<u64> {
     let mut out = Vec::new();
-    visit_task_gva_pages(
-        host,
-        tasks,
-        task_id,
-        gva,
-        span,
-        page_shift,
-        1,
-        &mut |gpa| {
-            out.push(gpa.unwrap_or(0));
-            true
-        },
-    );
+    visit_task_gva_pages(host, tasks, task_id, gva, span, page_shift, 1, &mut |gpa| {
+        out.push(gpa.unwrap_or(0));
+        true
+    });
     out
 }
 

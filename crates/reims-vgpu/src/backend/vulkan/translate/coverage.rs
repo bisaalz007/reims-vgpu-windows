@@ -856,7 +856,7 @@ const EVENT_COMMANDS: &[FieldCoverage] = decoded_fields! {
     ];
 };
 
-/// Guest resource-validity commands consumed by the FIFO drain.
+/// Guest resource-validity and physical-page commands consumed by the FIFO drain.
 const FIFO_RESOURCE_COMMANDS: &[FieldCoverage] = decoded_fields! {
     honored "runtime/drain/mod.rs:clear_host_valid" => [
         "fifo::InvalidateValidityOps.clear_host_valid",
@@ -872,6 +872,16 @@ const FIFO_RESOURCE_COMMANDS: &[FieldCoverage] = decoded_fields! {
         "fifo::SynchronizeResourcesCommand.task_id",
         "fifo::SynchronizeResourcesCommand.count",
         "fifo::SynchronizeResourcesCommand.object_ids",
+    ];
+    honored "runtime/drain/mod.rs:CHILD_OP_REPLACE_PHYSICAL" => [
+        "fifo::ReplacePhysicalCommand.task_id",
+        "fifo::ReplacePhysicalCommand.object_id",
+    ];
+    honored "runtime/objects.rs:retain_submission_resources" => [
+        "fifo::ExecResourceDesc.object_id",
+    ];
+    declined "exec_res_table_ops_unapplied" at "runtime/exec.rs:process_exec_indirect2" => [
+        "fifo::ExecResourceDesc.ops",
     ];
 };
 
@@ -1161,6 +1171,8 @@ pub const MANIFEST: &[DescriptorFamily] = &[
             "fifo::InvalidateValidityOps",
             "fifo::InvalidateResourceRecord",
             "fifo::InvalidateResourcesCommand",
+            "fifo::ExecResourceDesc",
+            "fifo::ReplacePhysicalCommand",
             "fifo::SynchronizeResourcesCommand",
         ],
         fields: FIFO_RESOURCE_COMMANDS,
@@ -1226,7 +1238,7 @@ pub const MANIFEST: &[DescriptorFamily] = &[
 /// Whole decode structs that are transport envelopes rather than guest GPU
 /// state.
 ///
-/// `runtime/decode/` holds 43 public structs and 21 public enums. Every struct
+/// `runtime/decode/` holds 45 public structs and 21 public enums. Every struct
 /// not named here is field-exhaustive in [`MANIFEST`].
 pub const DECODE_STRUCT_EXCLUSIONS: &[(&str, &str)] = &[
     (
@@ -1320,6 +1332,10 @@ pub const DECODE_FIELD_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "PipelineColorAttachment.has_pixel_format",
         "presence flag for pixel_format — wire framing",
+    ),
+    (
+        "fifo::ExecResourceDesc.tail",
+        "undecoded trailing record bytes retained for tracing (`tail_nonzero_bytes` in the gated draw log)",
     ),
     (
         "blit::Command.command_length",
@@ -1624,8 +1640,8 @@ mod tests {
         );
         assert_eq!(
             (structs.len(), actual_enums.len()),
-            (43, 21),
-            "the public decode type census moved; keep the 43-struct field \
+            (45, 21),
+            "the public decode type census moved; keep the 45-struct field \
              manifest and 21-enum inventory exhaustive, then update this pin"
         );
     }
@@ -1888,10 +1904,13 @@ mod tests {
         }
         assert_eq!(
             (honored, declined, dropped, absent),
-            // Moved 2026-07-30: `colorAttachments[n].writeMask` went
-            // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
-            // rose by one. It is on the wire after all, as tag 0x09.
-            (251, 60, 23, 24),
+            // Moved 2026-08-05: CmdReplacePhysical's two ids are consumed by
+            // the FIFO page-repoint handler (+2 honored), the EXEC resource
+            // table's object ids feed the submission snapshot (+1 honored),
+            // and its validity ops decline by name when a packet actually
+            // requests one (+1 declined; the undecoded tail is a traced
+            // exclusion, not state).
+            (254, 61, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

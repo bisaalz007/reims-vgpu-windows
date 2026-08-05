@@ -1219,7 +1219,9 @@ mod tests {
     fn guest_write_gen_is_idempotent() {
         let mut h = FakeHost::new();
         let p = GUEST_PAGE_SIZE as u64;
-        let token = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE).unwrap();
+        let token = h
+            .track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE)
+            .unwrap();
         let first = h.guest_write_gen(token).unwrap();
         assert_eq!(h.guest_write_gen(token), Some(first));
         assert_eq!(h.guest_write_gen(token), Some(first));
@@ -1232,7 +1234,9 @@ mod tests {
     fn guest_write_gen_moves_only_for_tracked_pages() {
         let mut h = FakeHost::new();
         let p = GUEST_PAGE_SIZE as u64;
-        let a = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE).unwrap();
+        let a = h
+            .track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE)
+            .unwrap();
         let b = h.track_guest_writes(&[7 * p], GUEST_PAGE_SIZE).unwrap();
         let (a0, b0) = (h.guest_write_gen(a).unwrap(), h.guest_write_gen(b).unwrap());
 
@@ -1240,7 +1244,11 @@ mod tests {
         // the page counts.
         h.guest_wrote_page(9 * p + 17);
         assert_ne!(h.guest_write_gen(a), Some(a0), "tracked page must move a");
-        assert_eq!(h.guest_write_gen(b), Some(b0), "untracked page must not move b");
+        assert_eq!(
+            h.guest_write_gen(b),
+            Some(b0),
+            "untracked page must not move b"
+        );
 
         let a1 = h.guest_write_gen(a).unwrap();
         h.guest_wrote_page(7 * p);

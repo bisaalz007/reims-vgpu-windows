@@ -1,4 +1,99 @@
 impl ResourcePools {
+    /// Record that `identity`'s live registry entry was removed by `why`.
+    ///
+    /// Bounded FIFO ([`RECLAIM_HISTORY`]); nothing reads it to make a decision —
+    /// its one consumer is the sampled-resident-missing decline's `prior=`.
+    fn note_resident_reclaimed(&mut self, identity: &TargetIdentity, why: ResidentReclaim) {
+        if self.reclaim_history.len() >= RECLAIM_HISTORY {
+            self.reclaim_history.pop_front();
+        }
+        self.reclaim_history.push_back((identity.clone(), why));
+        match why {
+            ResidentReclaim::IdleDrained => self.reclaims_idle += 1,
+            ResidentReclaim::CapEvicted => self.reclaims_cap += 1,
+            ResidentReclaim::Recreated => self.reclaims_recreated += 1,
+        }
+    }
+
+    /// Cumulative registry removals by path, for `engine::counter_snapshot`.
+    pub(crate) fn reclaim_stats(&self) -> (u64, u64, u64) {
+        (self.reclaims_idle, self.reclaims_cap, self.reclaims_recreated)
+    }
+
+    /// The most recent recorded reclaim of `identity`, or `None`.
+    ///
+    /// `None` deliberately merges "never held a resident" with "reclaimed
+    /// further back than the window reaches" rather than guessing between them.
+    pub(crate) fn prior_reclaim(&self, identity: &TargetIdentity) -> Option<ResidentReclaim> {
+        self.reclaim_history
+            .iter()
+            .rev()
+            .find(|(k, _)| k == identity)
+            .map(|(_, why)| *why)
+    }
+
+    /// Forget the resident registered under `identity`, recording `why`, and
+    /// hand back the slot that was removed.
+    ///
+    /// Split out from [`Self::retire_resident`] because retiring needs a live
+    /// `DeviceContext` to dispose what it removes, and the bookkeeping — the
+    /// part that was diverging across the copies — is worth testing without a
+    /// GPU. `registry_order` is pruned whether or not the map held the entry
+    /// (what every caller did around its own copy); nothing is recorded for an
+    /// identity that held no resident, because [`Self::prior_reclaim`] must not
+    /// report a removal that did not happen.
+    fn unregister_resident(
+        &mut self,
+        identity: &TargetIdentity,
+        why: ResidentReclaim,
+    ) -> Option<ResidentTargetSlot> {
+        let old = self.registry.remove(identity);
+        self.registry_order.retain(|k| k != identity);
+        let old = old?;
+        self.note_resident_reclaimed(identity, why);
+        Some(old)
+    }
+
+    /// Drop the resident registered under `identity`, recording `why`, returning
+    /// its image/memory/view to `target_free` and its framebuffer to the
+    /// graveyard. Returns the slot that was removed, or `None` when nothing was
+    /// registered.
+    ///
+    /// The single recycle exit for a live registry entry: both `registry_ensure*`
+    /// recreate arms and [`Self::evict_registry_to_cap`] were copies of one
+    /// another, and copies diverge — the primary arm disposed `old.framebuffer`
+    /// without a null check, spending a graveyard entry on a slot created by
+    /// `registry_ensure_color` (which carries none). The idle drain does **not**
+    /// come through here: it terminally destroys the image rather than recycling
+    /// it, and uses [`Self::unregister_resident`] directly for the bookkeeping.
+    unsafe fn retire_resident(
+        &mut self,
+        ctx: &DeviceContext,
+        identity: &TargetIdentity,
+        why: ResidentReclaim,
+        counters: &EngineCounters,
+    ) -> Option<ResidentTargetSlot> {
+        let old = self.unregister_resident(identity, why)?;
+        if old.framebuffer != vk::Framebuffer::null() {
+            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
+        }
+        self.dispose(
+            &ctx.device,
+            DeferredHandle::RecycleTarget(FreeTargetImage {
+                image: old.image,
+                memory: old.memory,
+                view: old.view,
+                width: old.width,
+                height: old.height,
+                format: old.color_format,
+            }),
+        );
+        counters
+            .target_evicts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(old)
+    }
+
     pub(crate) unsafe fn acquire_storage_image(
         &mut self,
         ctx: &DeviceContext,
@@ -347,7 +442,7 @@ impl ResourcePools {
         height: u32,
         render_pass: vk::RenderPass,
         generation: u64,
-        bgra: bool,
+        format: vk::Format,
         protect: Option<&TargetIdentity>,
         counters: &EngineCounters,
     ) -> Result<&ResidentTargetSlot, DrawError> {
@@ -358,7 +453,7 @@ impl ResourcePools {
             if slot.width == width
                 && slot.height == height
                 && slot.generation == generation
-                && slot.bgra == bgra
+                && slot.color_format == format
             {
                 if slot.render_pass == render_pass {
                     counters
@@ -398,29 +493,15 @@ impl ResourcePools {
                 return Ok(self.registry.get(&identity).unwrap());
             }
             // Geometry/gen mismatch → destroy and recreate.
-            if let Some(old) = self.registry.remove(&identity) {
-                self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::RecycleTarget(FreeTargetImage {
-                        image: old.image,
-                        memory: old.memory,
-                        view: old.view,
-                        width: old.width,
-                        height: old.height,
-                        format: old.color_format,
-                    }),
-                );
-                counters
-                    .target_evicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(old) =
+                self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters)
+            {
                 if old.generation != generation {
                     counters
                         .gen_mismatch
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            self.registry_order.retain(|k| k != &identity);
         }
         // Cap the *non-pinned* (evictable) population at REGISTRY_CAP, shielding
         // the just-resolved `protect` identity from its own eviction.
@@ -430,7 +511,6 @@ impl ResourcePools {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::SAMPLED;
-        let format = translate::pixel::resident_color(bgra);
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating a fresh one — the usage set is identical across all
         // registry targets, so a recycled image of the same geometry/format is
@@ -543,7 +623,7 @@ impl ResourcePools {
                 content_ready: false,
                 content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
-                bgra,
+                bgra: format == translate::pixel::SCANOUT_FORMAT,
                 color_format: format,
                 pin_count: 0,
                 last_touch_ms: touch_ms,
@@ -582,26 +662,7 @@ impl ResourcePools {
                 return Ok((slot.image, slot.view));
             }
             // Geometry / gen / format mismatch → destroy and recreate.
-            if let Some(old) = self.registry.remove(&identity) {
-                if old.framebuffer != vk::Framebuffer::null() {
-                    self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
-                }
-                self.dispose(
-                    &ctx.device,
-                    DeferredHandle::RecycleTarget(FreeTargetImage {
-                        image: old.image,
-                        memory: old.memory,
-                        view: old.view,
-                        width: old.width,
-                        height: old.height,
-                        format: old.color_format,
-                    }),
-                );
-                counters
-                    .target_evicts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.registry_order.retain(|k| k != &identity);
+            self.retire_resident(ctx, &identity, ResidentReclaim::Recreated, counters);
         }
         // Cap the *non-pinned* population (skip pinned slots), same LRU
         // discipline as the primary `registry_ensure` — pinned deferred windows
@@ -1311,6 +1372,172 @@ mod pin_count_tests {
             pools.registry.get(&surf(4)).unwrap().last_touch_ms,
             now,
             "the touched target is stamped at the touch time"
+        );
+    }
+
+    /// A resident that a draw only ever *samples* survives the idle drain.
+    ///
+    /// This is the compositor-backdrop case: the desktop behind a translucent
+    /// panel is rendered once and then read by every vibrancy draw over it.
+    /// Before [`ResourcePools::registry_note_sampled_use`] existed, reading a
+    /// resident refreshed nothing — only `registry_ensure` (render *into*) and
+    /// the present touch wrote `last_touch_ms` — so the backdrop aged exactly
+    /// as if abandoned, the drain terminally destroyed it, and every later
+    /// draw sampling it refused with `vk_draw_exec_sampled_resident_missing`
+    /// for the rest of the boot (nothing recreates a resident except a draw
+    /// rendering into it).
+    #[test]
+    fn a_sampled_only_resident_is_not_aged_out() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 10, 0); // sampled every frame, never drawn into
+        admit(&mut pools, surf(2), 10, 0); // genuinely abandoned peer
+        let now = 10 + IDLE_TARGET_AGE_MS + 1;
+        pools.idle_clock_ms = now;
+        pools.registry_note_sampled_use(&surf(1));
+        let victims = pools.plan_idle_drain(now, None).expect("pass due");
+        assert_eq!(
+            victims,
+            vec![surf(2)],
+            "the sampled resident is in use; its untouched peer is still \
+             reclaimed, so reclamation itself is not disabled"
+        );
+    }
+
+    /// The capacity walk evicts the least-recently-*used* resident, not the
+    /// oldest-*created* one. `registry_order` is insertion order — nothing
+    /// promotes an entry on reuse — so popping its front evicted a session-long
+    /// backdrop (created first, read every frame) on every burst. Choosing by
+    /// `last_touch_ms` separates "created first" from "not being used", and it
+    /// keeps the cap hard: a walk that merely skipped recent entries would let
+    /// a burst touching more than `REGISTRY_CAP` targets inside the age window
+    /// evict nothing at all.
+    #[test]
+    fn the_cap_walk_evicts_the_least_recently_used_not_the_oldest_created() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 100, 0); // created first, in active use
+        admit(&mut pools, surf(2), 1, 0); //   least recently used -> victim
+        admit(&mut pools, surf(3), 2, 0);
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(2)),
+            "the least-recently-used resident is the victim, not the first created"
+        );
+        assert_eq!(
+            pools.cap_eviction_victim(Some(&surf(2))),
+            Some(surf(3)),
+            "a protected identity is passed over for the next-oldest use"
+        );
+    }
+
+    /// Equal stamps fall to the oldest-created entry — the deterministic
+    /// tie-break `registry_order` still provides, and what the walk chose for
+    /// every entry before it consulted recency at all.
+    #[test]
+    fn the_cap_walk_breaks_touch_ties_by_creation_order() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(7), 5, 0);
+        admit(&mut pools, surf(8), 5, 0);
+        assert_eq!(pools.cap_eviction_victim(None), Some(surf(7)));
+    }
+
+    /// A pinned resident is never the victim, and a registry with nothing else
+    /// left reports no victim rather than dropping content whose only copy is
+    /// on the GPU — the soft-exceed the walk has always traded for.
+    #[test]
+    fn the_cap_walk_never_evicts_a_pinned_resident() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 1);
+        admit(&mut pools, surf(2), 0, 2);
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            None,
+            "every entry is pinned, so the cap soft-exceeds rather than evicting"
+        );
+        admit(&mut pools, surf(3), 10, 0);
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(3)),
+            "the one unpinned resident is the only candidate"
+        );
+    }
+
+    /// Marking a resident as sampled at the current clock takes it out of the
+    /// cap walk's victim seat while an older candidate exists — the mechanism
+    /// the pre-target mark in `execute_draw_inner` relies on so a draw cannot
+    /// evict its own sampled source while resolving its render target.
+    #[test]
+    fn a_just_marked_source_is_not_the_cap_victim() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 1, 0); // this draw's sampled source
+        admit(&mut pools, surf(2), 2, 0);
+        pools.idle_clock_ms = 50;
+        pools.registry_note_sampled_use(&surf(1));
+        assert_eq!(
+            pools.cap_eviction_victim(None),
+            Some(surf(2)),
+            "the just-marked source is no longer the least recently used"
+        );
+    }
+
+    /// Every removal of a live registry entry leaves a record naming the path,
+    /// and an identity that held no resident records nothing —
+    /// [`ResourcePools::prior_reclaim`] must not report a removal that did not
+    /// happen.
+    #[test]
+    fn every_registry_removal_records_its_path() {
+        let mut pools = ResourcePools::new();
+        admit(&mut pools, surf(1), 0, 0);
+        admit(&mut pools, surf(2), 0, 0);
+        assert_eq!(pools.prior_reclaim(&surf(1)), None, "nothing removed yet");
+        assert!(pools
+            .unregister_resident(&surf(1), ResidentReclaim::IdleDrained)
+            .is_some());
+        assert!(pools
+            .unregister_resident(&surf(2), ResidentReclaim::Recreated)
+            .is_some());
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            Some(ResidentReclaim::IdleDrained)
+        );
+        assert_eq!(
+            pools.prior_reclaim(&surf(2)),
+            Some(ResidentReclaim::Recreated)
+        );
+        assert!(
+            pools
+                .unregister_resident(&surf(3), ResidentReclaim::CapEvicted)
+                .is_none(),
+            "no resident under this identity"
+        );
+        assert_eq!(
+            pools.prior_reclaim(&surf(3)),
+            None,
+            "a removal that did not happen leaves no record"
+        );
+        assert!(
+            !pools.registry_order.iter().any(|k| k == &surf(1)),
+            "unregister prunes the order deque"
+        );
+    }
+
+    /// The reclaim history is bounded: a boot cannot grow the diagnostic
+    /// without limit, and the oldest records are the ones that fall off.
+    #[test]
+    fn the_reclaim_history_is_bounded() {
+        let mut pools = ResourcePools::new();
+        for i in 0..(RECLAIM_HISTORY as u32 + 40) {
+            admit(&mut pools, surf(i + 1), 0, 0);
+            pools.unregister_resident(&surf(i + 1), ResidentReclaim::CapEvicted);
+        }
+        assert_eq!(pools.reclaim_history.len(), RECLAIM_HISTORY);
+        assert_eq!(
+            pools.prior_reclaim(&surf(1)),
+            None,
+            "the oldest record fell off the bounded window"
+        );
+        assert_eq!(
+            pools.prior_reclaim(&surf(RECLAIM_HISTORY as u32 + 40)),
+            Some(ResidentReclaim::CapEvicted)
         );
     }
 }

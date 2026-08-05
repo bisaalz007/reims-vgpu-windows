@@ -115,6 +115,10 @@ pub(crate) struct PassKey {
     /// Slot-0 attachment format: true = B8G8R8A8_UNORM (guest scanout order for
     /// zero-copy import-present), false = R8G8B8A8_UNORM.
     pub bgra: bool,
+    /// Exact slot-0 attachment format. `bgra` remains the physical channel-order
+    /// witness used by the 8-bit present path; this field carries formats that
+    /// cannot be represented by that boolean, such as RGBA16Float.
+    pub primary_format: vk::Format,
     /// Secondary color attachments (slot 1..). `secondary_count == 0` ⇒ the
     /// classic single-attachment pass, byte-identical to the pre-MRT engine.
     pub secondary: [SecondaryAttachKey; MAX_SECONDARY_ATTACH],
@@ -149,11 +153,11 @@ impl PassKey {
         1 + u32::from(self.secondary_count) + u32::from(self.depth.is_some())
     }
 
-    /// Single-color-attachment pass (the pre-MRT constructor).
-    pub(crate) fn single(load_seed: bool, bgra: bool) -> Self {
+    pub(crate) fn single_format(load_seed: bool, format: vk::Format) -> Self {
         Self {
             load_seed,
-            bgra,
+            bgra: format == translate::pixel::SCANOUT_FORMAT,
+            primary_format: format,
             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
             secondary_count: 0,
             depth: None,
@@ -166,6 +170,7 @@ impl PassKey {
 pub(crate) struct PipelineKey {
     pub vert: Digest128,
     pub frag: Digest128,
+    pub fragment_disabled: bool,
     pub attrs: Vec<AttrKey>,
     pub topology: PrimitiveTopology,
     pub blend: Option<BlendKey>,
@@ -225,6 +230,29 @@ pub(crate) fn metal_cull_flags(mode: CullMode) -> vk::CullModeFlags {
         CullMode::None => vk::CullModeFlags::NONE,
         CullMode::Front => vk::CullModeFlags::FRONT,
         CullMode::Back => vk::CullModeFlags::BACK,
+    }
+}
+
+/// Whether the Vulkan input assembly must recognize Metal's strip separator.
+///
+/// Captured Metal indexed strip draws use the fixed all-ones index value to
+/// terminate one strip and begin the next. Vulkan only gives that value its
+/// restart meaning when `primitiveRestartEnable` is set; otherwise it reaches
+/// the vertex shader as an ordinary index and can connect unrelated strips.
+/// Fixed-index restart is core for strip topologies, while enabling it for list
+/// topologies would require a separate optional capability.
+pub(crate) fn primitive_restart_enabled(topology: PrimitiveTopology) -> bool {
+    matches!(
+        topology,
+        PrimitiveTopology::LineStrip | PrimitiveTopology::TriangleStrip
+    )
+}
+
+fn color_write_flags(fragment_disabled: bool, mask: ColorWriteMask) -> vk::ColorComponentFlags {
+    if fragment_disabled {
+        vk::ColorComponentFlags::empty()
+    } else {
+        translate::blend::vk_color_write_mask(mask)
     }
 }
 
@@ -528,7 +556,7 @@ impl ObjectCaches {
             return Ok(rp);
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
-        let target_format = translate::pixel::resident_color(key.bgra);
+        let target_format = key.primary_format;
         let (load_op, initial) = if key.load_seed {
             (
                 vk::AttachmentLoadOp::LOAD,
@@ -835,7 +863,7 @@ impl ObjectCaches {
         ctx: &DeviceContext,
         key: &PipelineKey,
         vert_module: vk::ShaderModule,
-        frag_module: vk::ShaderModule,
+        frag_module: Option<vk::ShaderModule>,
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
         counters: &EngineCounters,
@@ -924,16 +952,18 @@ impl ObjectCaches {
         }
 
         let main_c = super::context::main_entry();
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vert_module)
-                .name(&main_c),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(frag_module)
-                .name(&main_c),
-        ];
+        let mut stages = vec![vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(&main_c)];
+        if let Some(frag_module) = frag_module {
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(frag_module)
+                    .name(&main_c),
+            );
+        }
         let vertex_binding_descs: Vec<_> = key
             .attrs
             .iter()
@@ -989,8 +1019,9 @@ impl ObjectCaches {
         if !vertex_binding_divisors.is_empty() {
             vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
         }
-        let input_asm =
-            vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
+        let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(key.topology.vk())
+            .primitive_restart_enable(primitive_restart_enabled(key.topology));
         // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
         // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
         // command distinct from the state object) so distinct references reuse
@@ -1042,7 +1073,11 @@ impl ObjectCaches {
         // are red-first, so the exchange goes through `vk_color_write_mask`
         // rather than a cast.
         let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
-            let write = translate::blend::vk_color_write_mask(mask);
+            // With no Metal fragment function there are no color writes. Vulkan
+            // permits an omitted fragment stage, but calls its color outputs
+            // undefined; an explicit zero mask is what preserves Metal's
+            // stronger no-write contract while depth/stencil still executes.
+            let write = color_write_flags(key.fragment_disabled, mask);
             match blend {
                 Some(b) => vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(write)
@@ -1058,10 +1093,31 @@ impl ObjectCaches {
                     .blend_enable(false),
             }
         };
-        let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
+        // Blending on an integer attachment is forbidden by both APIs (Metal
+        // never offers it, Vulkan requires BLEND format support), so a decoded
+        // blend arriving against one is a misdecode — degrade it to a raw
+        // store and say so, rather than record invalid pipeline state the
+        // validation layer would reject on every draw of the pass.
+        let guard_integer = |blend: Option<BlendKey>,
+                             format: ash::vk::Format|
+         -> Option<BlendKey> {
+            if blend.is_some() && translate::pixel::is_integer_color(format) {
+                if crate::observe::first_sight("blend_on_integer_attachment", 0) {
+                    crate::observe::fail(format!(
+                            "vk_pipeline blend_dropped reason=blend_on_integer_attachment format={format:?}"
+                        ));
+                }
+                return None;
+            }
+            blend
+        };
+        let mut blend_att = vec![attachment_blend(
+            guard_integer(key.blend, key.pass.primary_format),
+            key.color_write_mask[0],
+        )];
         for slot in 0..key.pass.secondary_count as usize {
             blend_att.push(attachment_blend(
-                key.secondary_blend[slot],
+                guard_integer(key.secondary_blend[slot], key.pass.secondary[slot].format),
                 key.color_write_mask[slot + 1],
             ));
         }
@@ -1335,6 +1391,39 @@ mod cull_mapping_tests {
 }
 
 #[cfg(test)]
+mod primitive_restart_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_index_restart_is_enabled_only_for_strip_topologies() {
+        assert!(primitive_restart_enabled(PrimitiveTopology::LineStrip));
+        assert!(primitive_restart_enabled(PrimitiveTopology::TriangleStrip));
+        assert!(!primitive_restart_enabled(PrimitiveTopology::Point));
+        assert!(!primitive_restart_enabled(PrimitiveTopology::Line));
+        assert!(!primitive_restart_enabled(PrimitiveTopology::Triangle));
+    }
+}
+
+#[cfg(test)]
+mod fragmentless_pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn fragmentless_pipeline_cannot_write_any_color_channel() {
+        assert_eq!(
+            color_write_flags(true, ColorWriteMask::default()),
+            vk::ColorComponentFlags::empty(),
+            "Metal fragmentFunction=nil means no color writes"
+        );
+        assert_eq!(
+            color_write_flags(false, ColorWriteMask::default()),
+            vk::ColorComponentFlags::RGBA,
+            "a bound fragment stage keeps the decoded Metal write mask"
+        );
+    }
+}
+
+#[cfg(test)]
 mod pass_shape_tests {
     use super::*;
 
@@ -1356,14 +1445,14 @@ mod pass_shape_tests {
         });
 
         // Colour only: no depth index, one attachment.
-        let plain = PassKey::single(false, true);
+        let plain = PassKey::single_format(false, translate::pixel::SCANOUT_FORMAT);
         assert_eq!(plain.depth_attachment_index(), None);
         assert_eq!(plain.attachment_count(), 1);
 
         // Colour + depth: depth is attachment 1.
         let with_depth = PassKey {
             depth,
-            ..PassKey::single(false, true)
+            ..PassKey::single_format(false, translate::pixel::SCANOUT_FORMAT)
         };
         assert_eq!(with_depth.depth_attachment_index(), Some(1));
         assert_eq!(with_depth.attachment_count(), 2);
@@ -1371,7 +1460,7 @@ mod pass_shape_tests {
         // MRT, no depth: the secondaries occupy 1..=n and nothing follows.
         let mrt = PassKey {
             secondary_count: 2,
-            ..PassKey::single(false, true)
+            ..PassKey::single_format(false, translate::pixel::SCANOUT_FORMAT)
         };
         assert_eq!(mrt.depth_attachment_index(), None);
         assert_eq!(mrt.attachment_count(), 3);
@@ -1383,7 +1472,7 @@ mod pass_shape_tests {
             let both = PassKey {
                 secondary_count,
                 depth,
-                ..PassKey::single(false, true)
+                ..PassKey::single_format(false, translate::pixel::SCANOUT_FORMAT)
             };
             assert_eq!(
                 both.depth_attachment_index(),

@@ -118,11 +118,25 @@ pub(crate) struct ResourcePools {
     compute_storage_order: VecDeque<ComputeStorageResidencyKey>,
     /// Identity-keyed resident target registry (workstream D).
     registry: HashMap<TargetIdentity, ResidentTargetSlot>,
-    /// LRU order for [`Self::registry`], oldest at the front. A `VecDeque` so the
-    /// cap-eviction sweep's front pop / rotate-to-back is O(1) — the sweep is
-    /// then O(n), not the O(n²) a `Vec` front-`remove(0)` would make it under a
-    /// large pinned population (measured `reg=512` under multi-4K load).
+    /// Insertion order for [`Self::registry`], oldest-created at the front.
+    /// Nothing promotes an entry on reuse, so this is **not** use order — the
+    /// capacity walk chooses its victim by `last_touch_ms`
+    /// ([`ResourcePools::cap_eviction_victim`]) and only uses this deque for a
+    /// deterministic tie-break (first minimum = oldest created).
     registry_order: VecDeque<TargetIdentity>,
+    /// The last [`RECLAIM_HISTORY`] registry removals, most recent at the back,
+    /// each naming the path that took the resident. Written by every site that
+    /// removes a live entry; read only by the sampled-resident-missing decline
+    /// so it can say `prior=` — a resident taken from under an active reader
+    /// and a target the guest never rendered into present identically as an
+    /// absent entry, and they are different defects with different repairs.
+    reclaim_history: VecDeque<(TargetIdentity, ResidentReclaim)>,
+    /// Cumulative registry removals by path, surfaced through
+    /// `engine::counter_snapshot` / the per-second `engine_delta` line. Plain
+    /// u64 — `ResourcePools` is only ever touched under the engine lock.
+    reclaims_idle: u64,
+    reclaims_cap: u64,
+    reclaims_recreated: u64,
     /// Monotonic wall-clock milliseconds for the resident-target idle drain, fed
     /// from the poll heartbeat and each publish ([`Self::advance_registry_touch_and_drain`]).
     /// Each admit/hit/present stamps its slot's `last_touch_ms` with this value;
@@ -213,7 +227,7 @@ pub(crate) struct OpenBatch {
     identity: TargetIdentity,
     width: u32,
     height: u32,
-    bgra: bool,
+    color_format: vk::Format,
     draws: u64,
     /// Per-draw descriptor sets paired with the arena block they were allocated
     /// from, so the flush-time free routes each set to its owning pool.
@@ -565,6 +579,34 @@ pub(crate) struct ResidentTargetSlot {
     pub last_touch_ms: u64,
 }
 
+/// Which path removed a live registry entry.
+///
+/// `vk_draw_exec_sampled_resident_missing` reports that a draw sampled a
+/// resident the registry does not hold. That single line covers two different
+/// defects with two different repairs — a resident reclaimed out from under an
+/// active reader, and a target the guest never rendered into — because both
+/// present as an absent entry. Recording which path took an entry lets the
+/// decline carry `prior=`, separating the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentReclaim {
+    /// The idle drain took it (`advance_registry_touch_and_drain`).
+    IdleDrained,
+    /// The capacity walk took it (`evict_registry_to_cap`).
+    CapEvicted,
+    /// `registry_ensure*` replaced it at a new geometry/generation/format.
+    Recreated,
+}
+
+impl ResidentReclaim {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::IdleDrained => "idle_drained",
+            Self::CapEvicted => "cap_evicted",
+            Self::Recreated => "recreated",
+        }
+    }
+}
+
 /// Geometry+format key for the resident-target recycle pool (`target_free`).
 /// The registry keys targets by [`TargetIdentity`], which folds `generation`
 /// into Hash/Eq — a per-frame content-changing target (video output, a live
@@ -653,6 +695,11 @@ const IDLE_TARGET_DRAIN_MAX_PER_CALL: usize = 4;
 /// have their own pin lifecycle and working-set profile, and were never part of
 /// the deferred-present pin-burst class that motivated the target-cap change.
 const COMPUTE_STORAGE_REGISTRY_CAP: usize = 64;
+/// Entries kept in [`ResourcePools::reclaim_history`]. Bounds a diagnostic so
+/// it cannot grow with the boot; 256 identities comfortably outlasts the gap
+/// between a reclaim and the draw that then misses it (the walk removes at most
+/// a handful per pass, and the miss follows within a frame or two).
+const RECLAIM_HISTORY: usize = 256;
 const SAMPLED_CACHE_CAP: usize = 64;
 const SAMPLED_CACHE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// Max recycled sampled slots retained per geometry key in `sampled_free`. A

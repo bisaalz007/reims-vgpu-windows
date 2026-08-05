@@ -19,13 +19,17 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT,
     PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{
+    DeviceState, MappingEntry, SubmissionObjectSnapshot, SubmissionResourceSnapshot, MAX_MAPPINGS,
+    MAX_TASKS,
+};
+use crate::runtime::decode::fifo::ExecResourceDesc;
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
 };
 use crate::runtime::gva_mem;
-use crate::runtime::host::HostMemory;
+use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::texture;
 
 /// Fail-visible, de-duplicated per `(task_id, ref)`, for the type-11 resolve
@@ -594,6 +598,18 @@ pub fn lookup_list_entry<M: HostMemory>(
     task_id: u32,
     ref_: u32,
 ) -> Option<ListObjectEntry> {
+    if let Some(snapshot) = active_submission_object(state, task_id, ref_) {
+        return Some(snapshot.entry);
+    }
+    lookup_live_list_entry(state, host, task_id, ref_)
+}
+
+fn lookup_live_list_entry<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ref_: u32,
+) -> Option<ListObjectEntry> {
     if task_id as usize >= MAX_TASKS {
         return None;
     }
@@ -653,6 +669,24 @@ pub fn read_descriptor<M: HostMemory>(
     task_id: u32,
     entry: &ListObjectEntry,
 ) -> Option<Vec<u8>> {
+    if let Some(snapshot) = active_submission_snapshot(state, task_id) {
+        if let Some(object) = snapshot
+            .objects
+            .values()
+            .find(|object| object.entry == *entry)
+        {
+            return Some(object.descriptor.to_vec());
+        }
+    }
+    read_live_descriptor(state, host, task_id, entry)
+}
+
+fn read_live_descriptor<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &ListObjectEntry,
+) -> Option<Vec<u8>> {
     // Guest descriptor_length is authoritative — no product 4 KiB read clamp.
     let len = crate::runtime::metal_draw::host_alloc_len(entry.descriptor_length as u64)
         .filter(|&n| n > 0)?;
@@ -667,6 +701,338 @@ pub fn read_descriptor<M: HostMemory>(
     )
     .ok()?;
     Some(buf)
+}
+
+fn active_submission_snapshot(
+    state: &DeviceState,
+    task_id: u32,
+) -> Option<&SubmissionResourceSnapshot> {
+    let channel = state.active_submission_channel?;
+    let snapshot = state.submission_resource_snapshots.get(&channel)?;
+    (snapshot.task_id == task_id).then_some(snapshot)
+}
+
+fn active_submission_object(
+    state: &DeviceState,
+    task_id: u32,
+    ref_: u32,
+) -> Option<&SubmissionObjectSnapshot> {
+    active_submission_snapshot(state, task_id)?
+        .objects
+        .get(&ref_)
+}
+
+/// Snapshot every populated entry in the MapMemory2-declared part of a task's
+/// object list before the guest can recycle it.
+///
+/// Tahoe publishes the descriptors for several consecutive EXEC packets into
+/// one arena, publishes the packets, and is then free to clear list slots while
+/// the host is translating an earlier packet's AIR. Capturing only the current
+/// packet's resource table therefore cannot recover the later packet. We scan
+/// only ranges the guest explicitly declared and only once per arena
+/// incarnation; this is not a probe over the list's sparse maximum count.
+/// Retain the live, MapMemory2-declared object-list allocation for later EXEC
+/// packets. `via` identifies whether capture happened at the publish boundary
+/// or as the EXEC fallback used by fixtures and packets observed out of order.
+pub fn retain_mapped_object_list<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    via: &'static str,
+) {
+    let spans: Vec<_> = state
+        .task_map_spans
+        .iter()
+        .copied()
+        .filter(|span| span.task_id == task_id)
+        .collect();
+    retain_object_list_spans(state, host, task_id, spans, via);
+}
+
+/// Observe one published MapMemory2 range without consuming its FIFO packet.
+/// Only immutable object-list bytes are copied; the map registry, FIFO head,
+/// completion stamp, and host-view lifetime remain untouched.
+pub fn retain_object_list_map_range<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    via: &'static str,
+) {
+    retain_object_list_spans(
+        state,
+        host,
+        task_id,
+        [crate::model::TaskMapSpan {
+            task_id,
+            gva,
+            length,
+        }],
+        via,
+    );
+}
+
+fn retain_object_list_spans<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    spans: impl IntoIterator<Item = crate::model::TaskMapSpan>,
+    via: &'static str,
+) {
+    let Some(task) = state.tasks.get(task_id as usize) else {
+        return;
+    };
+    if !task.active || task.object_list_count == 0 {
+        return;
+    }
+    let list_start = (u64::from(task.object_list_pfn)) << state.page_shift;
+    let list_len = u64::from(task.object_list_count) * OBJECT_LIST_ENTRY_LEN as u64;
+    let list_end = list_start.saturating_add(list_len);
+    let spans: Vec<_> = spans
+        .into_iter()
+        .filter(|span| {
+            let span_end = span.gva.saturating_add(span.length);
+            // The object list is a sparse maximum range, not an allocation:
+            // ordinary descriptor/buffer MapMemory2 spans also fall numerically
+            // inside it. Only the declared allocation that starts at (or
+            // contains) the list base owns list entries. Treating every later
+            // span as more list bytes parses texture pixels as descriptors and
+            // can hold the device lock for seconds.
+            span.gva <= list_start && list_start < span_end
+        })
+        .collect();
+
+    // 12-byte entries do not divide either supported guest page size. Three
+    // pages are the least common multiple, so every full chunk starts and ends
+    // on both page and object-entry boundaries without an invented byte cap.
+    let chunk_len = (1usize << state.page_shift)
+        .checked_mul(3)
+        .expect("supported page geometry");
+    for span in spans {
+        let scan_key = (task_id, span.gva, span.length);
+        if state.task_object_list_scans.contains(&scan_key) {
+            continue;
+        }
+        let span_end = span.gva.saturating_add(span.length);
+        let overlap_start = span.gva.max(list_start);
+        let overlap_end = span_end.min(list_end);
+        let first_ref = overlap_start
+            .saturating_sub(list_start)
+            .div_ceil(OBJECT_LIST_ENTRY_LEN as u64);
+        let end_ref = overlap_end.saturating_sub(list_start) / OBJECT_LIST_ENTRY_LEN as u64;
+        if first_ref >= end_ref {
+            state.task_object_list_scans.insert(scan_key);
+            continue;
+        }
+
+        let mut next_ref = first_ref;
+        let mut complete = true;
+        let before = state.task_object_snapshots.len();
+        let mut populated = 0usize;
+        let mut descriptor_misses = 0usize;
+        while next_ref < end_ref {
+            let remaining_entries = usize::try_from(end_ref - next_ref).unwrap_or(usize::MAX);
+            let entries_per_chunk = chunk_len / OBJECT_LIST_ENTRY_LEN;
+            let entries = remaining_entries.min(entries_per_chunk);
+            let bytes_len = entries * OBJECT_LIST_ENTRY_LEN;
+            let gva = list_start + next_ref * OBJECT_LIST_ENTRY_LEN as u64;
+            let mut bytes = vec![0u8; bytes_len];
+            if gva_mem::read_task_gva_by_id(
+                host,
+                &state.tasks,
+                task_id,
+                gva,
+                &mut bytes,
+                state.page_shift,
+            )
+            .is_err()
+            {
+                complete = false;
+                break;
+            }
+            for (index, raw) in bytes.chunks_exact(OBJECT_LIST_ENTRY_LEN).enumerate() {
+                let Ok(entry) = decode_list_object_entry(raw) else {
+                    continue;
+                };
+                if !matches!(
+                    entry.object_type,
+                    crate::runtime::decode::resource::OBJECT_TYPE_BUFFER
+                        | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE
+                        | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VARIANT
+                        | OBJECT_TYPE_SURFACE
+                        | OBJECT_TYPE_REF_TEXTURE
+                        | crate::runtime::decode::resource::OBJECT_TYPE_FUNCTION
+                        | crate::runtime::decode::resource::OBJECT_TYPE_TYPE7
+                        | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW
+                        | OBJECT_TYPE_IOSURFACE
+                ) || entry.descriptor_length == 0
+                    || entry.descriptor_gva == 0
+                {
+                    continue;
+                }
+                populated += 1;
+                let Ok(ref_) = u32::try_from(next_ref + index as u64) else {
+                    continue;
+                };
+                let Some(descriptor) = read_live_descriptor(state, host, task_id, &entry) else {
+                    descriptor_misses += 1;
+                    continue;
+                };
+                state.task_object_snapshots.insert(
+                    (task_id, ref_),
+                    SubmissionObjectSnapshot {
+                        entry,
+                        descriptor: descriptor.into(),
+                    },
+                );
+            }
+            next_ref += entries as u64;
+        }
+        if complete {
+            state.task_object_list_scans.insert(scan_key);
+        }
+        if crate::observe::draw_log_enabled() {
+            let added = state.task_object_snapshots.len().saturating_sub(before);
+            crate::observe::line(format!(
+                "object_list_snapshot task={task_id} gva={:#x} len={:#x} populated={populated} added={added} desc_misses={descriptor_misses} complete={} via={via}",
+                span.gva,
+                span.length,
+                u8::from(complete)
+            ));
+        }
+    }
+}
+
+/// Capture every readable object descriptor named by a submission before AIR
+/// translation is allowed to defer it.
+///
+/// EXEC resource ids also name mappings and other non-list state, so an id that
+/// has no readable object-list entry is expected and merely omitted. Consumers
+/// still use the live resolver for such ids. Once captured, the descriptor is
+/// immutable until this channel consumes its FIFO head.
+pub fn retain_submission_resources<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    channel_id: u32,
+    task_id: u32,
+    records: &[ExecResourceDesc],
+    extra_refs: &[u32],
+) {
+    let mut resource_ids: Vec<u32> = records.iter().map(|record| record.object_id).collect();
+    for &ref_ in extra_refs {
+        if ref_ != 0 && !resource_ids.contains(&ref_) {
+            resource_ids.push(ref_);
+        }
+    }
+    let previous = state.submission_resource_snapshots.remove(&channel_id);
+    let (mut objects, first_capture) = match previous {
+        Some(snapshot)
+            if snapshot.task_id == task_id
+                && snapshot.resource_ids.as_ref() == resource_ids.as_slice() =>
+        {
+            (snapshot.objects, false)
+        }
+        Some(snapshot) => {
+            crate::observe::fail(format!(
+                "submission_snapshot replaced channel={channel_id} old_task={} new_task={task_id} old_ids={:?} new_ids={resource_ids:?}",
+                snapshot.task_id, snapshot.resource_ids
+            ));
+            (std::collections::BTreeMap::new(), true)
+        }
+        None => (std::collections::BTreeMap::new(), true),
+    };
+    let mut live_objects = std::collections::BTreeMap::new();
+    for &ref_ in &resource_ids {
+        if objects.contains_key(&ref_) {
+            continue;
+        }
+        let Some(entry) = lookup_live_list_entry(state, host, task_id, ref_) else {
+            continue;
+        };
+        let Some(descriptor) = read_live_descriptor(state, host, task_id, &entry) else {
+            continue;
+        };
+        let object = SubmissionObjectSnapshot {
+            entry,
+            descriptor: descriptor.into(),
+        };
+        state
+            .task_object_snapshots
+            .insert((task_id, ref_), object.clone());
+        live_objects.insert(ref_, object);
+    }
+    // The MapMemory2 span is the arena generation signal. Scan it once; exact
+    // refs above still refresh on every new FIFO head, but a long-lived task
+    // must not reread a megabyte of sparse list for every draw submission.
+    retain_mapped_object_list(state, host, task_id, "exec_fallback");
+    let before = objects.len();
+    let mut type5_surface_ids = Vec::new();
+    for &ref_ in &resource_ids {
+        if objects.contains_key(&ref_) {
+            continue;
+        }
+        let Some(object) = live_objects
+            .remove(&ref_)
+            .or_else(|| state.task_object_snapshots.get(&(task_id, ref_)).cloned())
+        else {
+            continue;
+        };
+        let entry = object.entry;
+        let descriptor = object.descriptor;
+        if entry.object_type == OBJECT_TYPE_REF_TEXTURE && descriptor.len() >= TYPE5_MIN_LEN {
+            let surface_id = ld32(&descriptor[TYPE5_SURFACE_ID..]);
+            if surface_id != 0 {
+                type5_surface_ids.push(surface_id);
+            }
+        }
+        objects.insert(ref_, SubmissionObjectSnapshot { entry, descriptor });
+    }
+    let added = objects.len().saturating_sub(before);
+    if crate::observe::draw_log_enabled() && (first_capture || added != 0) {
+        crate::observe::line(format!(
+            "submission_snapshot captured channel={channel_id} task={task_id} resources={} objects={} added={added}",
+            resource_ids.len(),
+            objects.len()
+        ));
+    }
+    state.submission_resource_snapshots.insert(
+        channel_id,
+        SubmissionResourceSnapshot {
+            task_id,
+            resource_ids: resource_ids.into(),
+            objects,
+        },
+    );
+
+    // A type-5 RefTexture descriptor owns only the Metal view; its IOSurface
+    // backing lives in the task-0 type-4 object named by surface_id. Resolve
+    // that dependency while the submission is first observed. AIR translation
+    // may yield for hundreds of milliseconds, after which the task-0 list slot
+    // can already be retired even though this FIFO head still owns the draw.
+    type5_surface_ids.sort_unstable();
+    type5_surface_ids.dedup();
+    for surface_id in type5_surface_ids {
+        let resolved = ensure_surface_for_present(state, host, surface_id);
+        if crate::observe::draw_log_enabled() {
+            let mapping = state.mappings.get(&surface_id);
+            crate::observe::line(format!(
+                "submission_snapshot surface channel={channel_id} task={task_id} sid={surface_id} resolved={} geom={}x{} fmt={:#x} pages={}",
+                u8::from(resolved),
+                mapping.map(|entry| entry.width).unwrap_or(0),
+                mapping.map(|entry| entry.height).unwrap_or(0),
+                mapping.map(|entry| entry.format).unwrap_or(0),
+                mapping.map(|entry| entry.page_entries.len()).unwrap_or(0)
+            ));
+        }
+    }
+}
+
+pub fn release_submission_resources(state: &mut DeviceState, channel_id: u32) {
+    state.submission_resource_snapshots.remove(&channel_id);
+    if state.active_submission_channel == Some(channel_id) {
+        state.active_submission_channel = None;
+    }
 }
 
 /// Resolve object ref and, if type-11, latch mapping geometry + cache the entry.
@@ -1273,6 +1639,111 @@ mod tests {
         st32(&mut desc[0x18..], 64);
         st32(&mut desc[0x1c..], 32);
         let _ = host.write_gpa(data_gpa + 0x40, &desc);
+    }
+
+    #[test]
+    fn submission_snapshot_survives_guest_object_list_retirement() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_task_with_list(&mut host, &mut state);
+
+        let records = [ExecResourceDesc {
+            object_id: 1,
+            ..Default::default()
+        }];
+        retain_submission_resources(&mut state, &host, 7, 1, &records, &[]);
+        assert_eq!(state.submission_resource_snapshots[&7].objects.len(), 1);
+
+        // The guest may clear the list slot and recycle its descriptor storage
+        // while the host is translating AIR. The submission still owns the
+        // bytes captured before it yielded.
+        let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+        let _ = host.write_gpa(data_gpa + 12, &[0u8; OBJECT_LIST_ENTRY_LEN]);
+        let _ = host.write_gpa(data_gpa + 0x40, &[0u8; 0x20]);
+        state.active_submission_channel = Some(7);
+
+        let entry = lookup_list_entry(&state, &host, 1, 1).expect("retained entry");
+        assert_eq!(entry.object_type, 11);
+        let descriptor = read_descriptor(&state, &host, 1, &entry).expect("retained descriptor");
+        assert_eq!(ld32(&descriptor), 9);
+
+        release_submission_resources(&mut state, 7);
+        assert!(lookup_list_entry(&state, &host, 1, 1).is_none());
+        assert!(state.submission_resource_snapshots.is_empty());
+        assert_eq!(state.active_submission_channel, None);
+    }
+
+    #[test]
+    fn mapped_object_list_snapshot_owns_later_submission_descriptors() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_task_with_list(&mut host, &mut state);
+
+        // Give this case a non-zero list PFN so its MapMemory2 declaration can
+        // name the allocation base (zero-GVA notifications are invalid). Map
+        // GVA page 1 to data PFN 5 and publish both entries there.
+        let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+        let data_gpa = 5u64 << PAGE_SHIFT_ARM64E;
+        host.map_range(data_gpa, 0x200, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 5);
+        let _ = host.write_gpa(root_gpa + 4, &pte);
+        assert!(state.set_object_list(1, 1, 8));
+        let list_gva = 1u64 << PAGE_SHIFT_ARM64E;
+
+        // The guest has already published the object used by its next EXEC,
+        // although the first packet names only ref 1.
+        let mut first_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut first_entry[0..], 11u32 | (0x20u32 << 8));
+        first_entry[4..12].copy_from_slice(&(list_gva + 0x40).to_le_bytes());
+        let _ = host.write_gpa(data_gpa + OBJECT_LIST_ENTRY_LEN as u64, &first_entry);
+        let mut first_desc = [0u8; 0x20];
+        st32(&mut first_desc[0..], 9);
+        st16(&mut first_desc[0x16..], 0x50);
+        st32(&mut first_desc[0x18..], 64);
+        st32(&mut first_desc[0x1c..], 32);
+        let _ = host.write_gpa(data_gpa + 0x40, &first_desc);
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut entry[0..], 11u32 | (0x20u32 << 8));
+        entry[4..12].copy_from_slice(&(list_gva + 0x80).to_le_bytes());
+        let _ = host.write_gpa(data_gpa + 2 * OBJECT_LIST_ENTRY_LEN as u64, &entry);
+        let mut desc = [0u8; 0x20];
+        st32(&mut desc[0..], 10);
+        st16(&mut desc[0x16..], 0x50);
+        st32(&mut desc[0x18..], 32);
+        st32(&mut desc[0x1c..], 16);
+        let _ = host.write_gpa(data_gpa + 0x80, &desc);
+
+        state.note_task_map(1, list_gva, 0x200);
+        let first = [ExecResourceDesc {
+            object_id: 1,
+            ..Default::default()
+        }];
+        retain_submission_resources(&mut state, &host, 7, 1, &first, &[]);
+        assert!(state.task_object_snapshots.contains_key(&(1, 2)));
+        release_submission_resources(&mut state, 7);
+
+        // Both slots and descriptor bodies are retired before the host reaches
+        // the next FIFO head. Its exact resource capture must fall back to the
+        // live mapped-arena incarnation, not to an unrelated task/global ref.
+        let _ = host.write_gpa(data_gpa + 12, &[0u8; 2 * OBJECT_LIST_ENTRY_LEN]);
+        let _ = host.write_gpa(data_gpa + 0x40, &[0u8; 0x60]);
+        let second = [ExecResourceDesc {
+            object_id: 2,
+            ..Default::default()
+        }];
+        retain_submission_resources(&mut state, &host, 7, 1, &second, &[]);
+        state.active_submission_channel = Some(7);
+        let retained = lookup_list_entry(&state, &host, 1, 2).expect("later retained entry");
+        let retained_desc =
+            read_descriptor(&state, &host, 1, &retained).expect("later retained descriptor");
+        assert_eq!(ld32(&retained_desc), 10);
+
+        // Unmapping the object-list arena ends the cache incarnation without
+        // invalidating bytes already owned by an active channel packet.
+        state.note_task_unmap(1, list_gva, 0x200);
+        assert!(state.task_object_snapshots.is_empty());
+        assert_eq!(ld32(&retained_desc), 10);
     }
 
     #[test]

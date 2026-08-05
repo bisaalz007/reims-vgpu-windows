@@ -218,6 +218,14 @@ pub struct DrawRequest {
     /// module words; `Arc` avoids a full-module copy per draw.
     pub vert_spirv: std::sync::Arc<Vec<u32>>,
     pub frag_spirv: std::sync::Arc<Vec<u32>>,
+    /// The Metal render pipeline has no fragment function.
+    ///
+    /// Metal permits `fragmentFunction == nil`: rasterization and depth/stencil
+    /// operations still run, but no color attachment is written. Vulkan models
+    /// that contract by omitting the fragment shader stage and disabling every
+    /// color write mask. An empty `frag_spirv` without this flag remains an
+    /// invalid translated shader rather than being mistaken for that contract.
+    pub fragment_disabled: bool,
     pub width: u32,
     pub height: u32,
     pub vertex_count: u32,
@@ -271,6 +279,14 @@ pub struct DrawRequest {
     /// import-present (no CPU RGBA→BGRA swizzle). Honored only with
     /// `target_identity` (the pooled path stays RGBA).
     pub output_bgra: bool,
+    /// Concrete Vulkan format for color attachment 0.
+    ///
+    /// `None` preserves the historical RGBA8/BGRA8 selection. Metal render
+    /// targets whose contract requires more precision (notably Tahoe's
+    /// RGBA16Float icon and glass intermediates) set this explicitly so the
+    /// render pass, resident image, seed upload, and readback all use the same
+    /// texel footprint.
+    pub primary_format: Option<vk::Format>,
     /// Present-boundary GPU seed: copy this READY resident target's content
     /// into the draw target before the pass (which then runs with LOAD),
     /// eliding the CPU front-frame read + full-frame seed upload. Requires
@@ -1427,15 +1443,13 @@ mod tests {
     /// flipping either silently exchanges R and B on a whole rail.
     #[test]
     fn only_a_surface_identity_carries_guest_scanout_order() {
-        assert!(
-            TargetIdentity::Surface {
-                id: 1,
-                width: 8,
-                height: 8,
-                generation: 0,
-            }
-            .is_bgra()
-        );
+        assert!(TargetIdentity::Surface {
+            id: 1,
+            width: 8,
+            height: 8,
+            generation: 0,
+        }
+        .is_bgra());
         for other in [
             TargetIdentity::Gva {
                 gva: 0x1000,

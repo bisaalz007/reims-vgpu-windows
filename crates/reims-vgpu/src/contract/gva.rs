@@ -42,7 +42,6 @@ pub fn page_index(address: u64, page_shift: u32) -> u64 {
     address >> page_shift
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

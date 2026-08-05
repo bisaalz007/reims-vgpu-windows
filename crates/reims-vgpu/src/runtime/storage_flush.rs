@@ -97,6 +97,100 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
     ok
 }
 
+/// Land every deferred writeback before publishing a completion stamp.
+///
+/// The stamp is the guest-visible lifetime boundary for the work it completes.
+/// Once it moves, the guest may read a rendered IOSurface, repaint it on the
+/// CPU, or recycle the same pages without changing their mapping. A writeback
+/// left armed beyond that point can therefore return stale pixels or overwrite
+/// the next use of the allocation. Page identity and dirty bits cannot recover
+/// the ordering after the stamp; the bytes have to land before it.
+///
+/// Both child stamps and the root stamp call this helper. Keeping the binding at
+/// the completion sites also covers all three deferred rails instead of relying
+/// on a later read to happen through one of this device's interceptable paths.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_all_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    // Address-keyed render windows first, oldest Store first. A flush can also
+    // consume aliasing windows from the other rails, so every later loop checks
+    // that its snapshotted entry is still armed.
+    let mut gva_windows: Vec<(u64, u64)> = state
+        .gva_deferred_flush
+        .iter()
+        .map(|(&gva, entry)| (entry.armed_seq, gva))
+        .collect();
+    gva_windows.sort_unstable_by_key(|(seq, _)| *seq);
+    for (_, gva) in gva_windows {
+        if state.gva_deferred_flush.contains_key(&gva) {
+            let _ = flush_gva_exact(state, host, gva, true, "completion_fence");
+        }
+    }
+
+    // Linear compute windows name a task GVA rather than a mapping. Their map
+    // iteration order is stable, and disarming one may consume an alias from a
+    // sibling rail through the shared page index.
+    let linear_windows: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = state
+        .linear_deferred_flush
+        .iter()
+        .map(|(key, (generation, _))| (*key, *generation))
+        .collect();
+    for (key, generation) in linear_windows {
+        if state.linear_deferred_flush.contains_key(&key) {
+            let _ = flush_linear_one(state, host, &key, generation);
+        }
+    }
+
+    // Mapping-keyed render windows carry an arm sequence; storage windows do
+    // not. Land render Stores in guest order, then the remaining storage keys.
+    // `flush_intersecting` owns overlap closure and deliberately holds a
+    // condemned backing until mapper resolution can decide its incarnation.
+    for key in mapping_windows_fence_order(state) {
+        if !state.compute_deferred_flush.contains_key(&key) {
+            continue;
+        }
+        let _ = flush_intersecting(
+            state,
+            host,
+            key.mapping_id,
+            key.surface_offset,
+            key.span_end,
+        );
+    }
+}
+
+/// Metal-direct builds do not arm Vulkan deferred writeback windows.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_all_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn mapping_windows_fence_order(
+    state: &DeviceState,
+) -> Vec<crate::model::ComputeStorageResidencyKey> {
+    let mut render = Vec::new();
+    let mut storage = Vec::new();
+    for (key, owner) in &state.compute_deferred_flush {
+        match owner {
+            crate::model::DeferredOwner::Render { armed_seq, .. } => {
+                render.push((*armed_seq, *key));
+            }
+            crate::model::DeferredOwner::Storage { .. } => storage.push(*key),
+        }
+    }
+    render.sort_unstable_by_key(|(seq, _)| *seq);
+    render
+        .into_iter()
+        .map(|(_, key)| key)
+        .chain(storage)
+        .collect()
+}
+
 /// Flush deferred windows whose **physical pages** alias a raw task-GVA span.
 ///
 /// The linear-sample fallback (`load_linear_texture_rgba_host`) reads texture
@@ -550,7 +644,17 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // semantic RGBA and the readback states its own order. Asserting the order
     // here instead would be the caller writing a fact it did not read.
     let rgba = match crate::backend::vulkan::engine::read_target(&identity) {
-        Ok(rb) => rb.into_rgba8(),
+        Ok(rb) => match rb.try_into_rgba8() {
+            Ok(pixels) => pixels,
+            Err(e) => {
+                crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                crate::observe::fail(format!(
+                    "deferred_flush_lost kind=gva gva={gva:#x} {}x{} fmt={:#x} trigger={trigger} err={e}",
+                    entry.width, entry.height, entry.format
+                ));
+                return false;
+            }
+        },
         Err(e) => {
             crate::backend::vulkan::engine::unpin_resident_target(&identity);
             crate::observe::fail(format!(
@@ -1030,9 +1134,9 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // Set when the frame below came *out of* a resident image, so the write can
     // hand the currency witness back to it. See the re-stamp after the write.
     let mut flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
-    let frame: std::borrow::Cow<'_, [u8]> = match source {
+    let (frame, native_format): (std::borrow::Cow<'_, [u8]>, Option<u16>) = match source {
         crate::model::RenderWindowSource::Owned(bytes) => {
-            std::borrow::Cow::Borrowed(bytes.as_slice())
+            (std::borrow::Cow::Borrowed(bytes.as_slice()), None)
         }
         crate::model::RenderWindowSource::Resident { epoch } => {
             let identity = render_window_identity(key);
@@ -1050,12 +1154,29 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 Ok(rb) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
                     flushed_from_resident = Some(identity);
-                    // `into_bgra8`, not the raw bytes: a `Surface` resident is BGRA
-                    // so this is a no-op, and the writer below is declared in
-                    // scanout order. Reading the reported order rather than
-                    // asserting one is what keeps a future format change from
-                    // landing R and B exchanged in guest memory.
-                    std::borrow::Cow::Owned(rb.into_bgra8())
+                    let expected = crate::backend::vulkan::translate::pixel::color_attachment(
+                        key.pixel_format,
+                    )
+                    .ok()
+                    .map(|(format, _)| format);
+                    if expected == Some(rb.format) {
+                        (std::borrow::Cow::Owned(rb.pixels), Some(key.pixel_format))
+                    } else {
+                        match rb.try_into_bgra8() {
+                            Ok(pixels) => (std::borrow::Cow::Owned(pixels), None),
+                            Err(e) => {
+                                crate::observe::fail(format!(
+                                "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=resident_convert err={e}",
+                                key.mapping_id,
+                                key.width,
+                                key.height,
+                                key.pixel_format,
+                                key.map_generation
+                            ));
+                                return false;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
@@ -1069,21 +1190,33 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     };
-    let bgra: &[u8] = frame.as_ref();
+    let pixels: &[u8] = frame.as_ref();
     // Probe: the one thing the sink cannot say is what a surface actually
     // contains. A blank icon and a missing material look identical from the
     // decline side once nothing declines, and they separate here — an all-zero
     // frame means the render produced nothing, a non-zero one means the loss is
     // downstream of this read.
     if crate::observe::dump_flush_surfaces() {
-        let nonzero = bgra.iter().filter(|b| **b != 0).count();
+        let nonzero = pixels.iter().filter(|b| **b != 0).count();
+        let nonfinite_halves =
+            if native_format == Some(crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT) {
+                pixels
+                    .chunks_exact(2)
+                    .filter(|word| {
+                        let bits = u16::from_le_bytes([word[0], word[1]]);
+                        bits & 0x7c00 == 0x7c00
+                    })
+                    .count()
+            } else {
+                0
+            };
         crate::observe::fail(format!(
-            "flush_surface_census mapping={} {}x{} fmt={:#x} bytes={} nonzero={nonzero}",
+            "flush_surface_census mapping={} {}x{} fmt={:#x} bytes={} nonzero={nonzero} nonfinite_halves={nonfinite_halves}",
             key.mapping_id,
             key.width,
             key.height,
             key.pixel_format,
-            bgra.len()
+            pixels.len()
         ));
         // The count says how much was drawn; only the pixels say what. Small
         // surfaces are the ones in question (icons, glass material) and cost
@@ -1096,20 +1229,35 @@ fn flush_render_one<M: HostMemory + HostOps>(
                     "flush-mid{}-{}x{}-fmt{:x}.bgra",
                     key.mapping_id, key.width, key.height, key.pixel_format
                 )),
-                bgra,
+                pixels,
             );
         }
     }
-    let ok = crate::runtime::mapping_write::write_bgra8_skipping(
-        state,
-        host,
-        key.mapping_id,
-        bgra,
-        key.width.saturating_mul(4),
-        key.width,
-        key.height,
-        &skip_gpas,
-    );
+    let ok = if let Some(format) = native_format {
+        let stride = crate::contract::pixel_format::tight_row_bytes(key.width, format).unwrap_or(0);
+        crate::runtime::mapping_write::write_native_image_skipping(
+            state,
+            host,
+            key.mapping_id,
+            pixels,
+            stride,
+            key.width,
+            key.height,
+            format,
+            &skip_gpas,
+        )
+    } else {
+        crate::runtime::mapping_write::write_bgra8_skipping(
+            state,
+            host,
+            key.mapping_id,
+            pixels,
+            key.width.saturating_mul(4),
+            key.width,
+            key.height,
+            &skip_gpas,
+        )
+    };
     if !ok {
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
@@ -1157,7 +1305,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.height,
         key.pixel_format,
         ok as u8,
-        bgra.len(),
+        pixels.len(),
         started.elapsed().as_micros()
     ));
     ok
@@ -2875,7 +3023,11 @@ mod tests {
             ),
             "an unmoved window's resident is the draw's own prior content"
         );
-        assert_eq!(tail(at), "", "an unmoved window must be quiet on both sides");
+        assert_eq!(
+            tail(at),
+            "",
+            "an unmoved window must be quiet on both sides"
+        );
 
         // The guest handed this address to a different allocation. The resident
         // still exists, still has the geometry, and still reports content_ready

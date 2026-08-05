@@ -2920,6 +2920,471 @@ fn mrt_rg16float_secondary_builds_and_renders() {
     );
 }
 
+/// A Metal pass may read an MRT coverage texture while replacing that same
+/// attachment. Vulkan's ordinary sampled-image layout cannot alias a color
+/// attachment, so the engine must sample a same-format snapshot of the prior
+/// RG16Float content. This is the Tahoe vibrancy pipe=12 resource shape.
+#[test]
+fn mrt_rg16float_secondary_feedback_samples_a_snapshot() {
+    use reims_vgpu::runtime::decode::resource::ColorWriteMask;
+
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let primary = TargetIdentity::Surface {
+        id: 0x65,
+        width: 26,
+        height: 26,
+        generation: 1,
+    };
+    let mask = TargetIdentity::Gva {
+        gva: 0x3cf6000,
+        width: 26,
+        height: 26,
+        generation: 0,
+    };
+
+    let secondary = |load| SecondaryColorTarget {
+        identity: mask.clone(),
+        width: 26,
+        height: 26,
+        format: ash::vk::Format::R16G16_SFLOAT,
+        clear: [0.25, 0.5, 0.0, 0.0],
+        load,
+        blend: None,
+        // The test shader has no location-1 output. Preserve the clear/load
+        // value so the assertion isolates the feedback copy and transitions.
+        color_write_mask: ColorWriteMask::new(0).unwrap(),
+    };
+
+    let mut initialize = engine_req(&v, &f, 26, 26);
+    initialize.target_identity = Some(primary.clone());
+    initialize.secondary_targets.push(secondary(false));
+    match engine::execute_draw_request(&initialize) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP mrt_secondary_feedback: {e}");
+            return;
+        }
+        Err(e) => panic!("initialize RG16Float feedback source: {e}"),
+    }
+
+    let mut feedback = engine_req(&v, &f, 26, 26);
+    feedback.target_identity = Some(primary);
+    feedback.secondary_targets.push(secondary(true));
+    feedback.sampled_images.push(SampledImageResource {
+        binding: 37,
+        width: 26,
+        height: 26,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        source: SampledSource::Target(mask.clone()),
+        format: ash::vk::Format::R16G16_SFLOAT,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    engine::execute_draw_request(&feedback).expect("snapshot secondary feedback source");
+
+    let readback = engine::read_target(&mask).expect("read RG16Float feedback target");
+    assert_eq!(readback.format, ash::vk::Format::R16G16_SFLOAT);
+    assert_eq!(readback.pixels.len(), 26 * 26 * 4);
+    for pixel in readback.pixels.chunks_exact(4) {
+        assert_eq!(u16::from_le_bytes([pixel[0], pixel[1]]), 0x3400);
+        assert_eq!(u16::from_le_bytes([pixel[2], pixel[3]]), 0x3800);
+    }
+}
+
+/// Local replay of Tahoe's first coverage-mask draw. The private translated
+/// shaders and guest constants remain outside the repository; unset paths make
+/// this a no-op in the normal suite.
+#[test]
+fn external_tahoe_coverage_draw_writes_finite_secondary() {
+    use reims_vgpu::runtime::decode::resource::ColorWriteMask;
+    use std::io::BufRead;
+
+    let Ok(vertex_path) = std::env::var("REIMS_TAHOE_COVERAGE_VERTEX_AIR") else {
+        return;
+    };
+    let fragment_path = std::env::var("REIMS_TAHOE_COVERAGE_FRAGMENT_AIR")
+        .expect("fragment AIR path accompanies vertex path");
+    let draw_log = std::env::var("REIMS_TAHOE_COVERAGE_DRAW_LOG")
+        .expect("draw log path accompanies vertex path");
+    let size = std::env::var("REIMS_TAHOE_COVERAGE_SIZE")
+        .ok()
+        .map(|value| value.parse::<u32>().expect("coverage size is a u32"))
+        .unwrap_or(14);
+
+    let decode_hex = |hex: &str| {
+        assert!(hex.len().is_multiple_of(2), "hex byte alignment");
+        (0..hex.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let field = |line: &str, name: &str| {
+        let start = line
+            .find(name)
+            .unwrap_or_else(|| panic!("capture field {name}"))
+            + name.len();
+        let tail = &line[start..];
+        let end = tail.find(' ').unwrap_or(tail.len());
+        decode_hex(&tail[..end])
+    };
+    let file = std::fs::File::open(draw_log).expect("open external draw log");
+    let line = std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find(|line| {
+            line.contains(&format!("linux_m2v_resources pipe=9 {size}x{size}"))
+                && line.contains("rt_n=2")
+                && line.contains("frag0hex=")
+        })
+        .expect("captured Tahoe coverage draw");
+    let globals = field(&line, "frag0hex=");
+    let captured_indices = field(&line, "idxhex=");
+    assert!(captured_indices.len() >= 8, "four captured u16 indices");
+    let mut indices = Vec::with_capacity(64 * 2);
+    for quad in 0..13u16 {
+        let base = quad * 4;
+        for index in [base + 1, base, base + 2, base + 3] {
+            indices.extend_from_slice(&index.to_le_bytes());
+        }
+        if quad != 12 {
+            indices.extend_from_slice(&u16::MAX.to_le_bytes());
+        }
+    }
+    assert_eq!(indices.len(), 64 * 2);
+
+    let _guard = engine_test_session();
+    let primary = TargetIdentity::Surface {
+        id: 9,
+        width: size,
+        height: size,
+        generation: 3,
+    };
+    let coverage = TargetIdentity::Gva {
+        gva: 0x12_9000,
+        width: size,
+        height: size,
+        generation: 0,
+    };
+    let vertex_air = std::fs::read(vertex_path).expect("read external vertex AIR");
+    let fragment_air = std::fs::read(fragment_path).expect("read external fragment AIR");
+    let vertex_shader =
+        reims_vgpu::runtime::m2v_cache::translate_cached_reflected(&vertex_air, Stage::Vertex, 9)
+            .expect("translate and repair captured vertex AIR");
+    let fragment_shader = reims_vgpu::runtime::m2v_cache::translate_cached_reflected(
+        &fragment_air,
+        Stage::Fragment,
+        9,
+    )
+    .expect("translate and repair captured fragment AIR");
+    let fragment_words = fragment_shader.fragment_words(true, true);
+    let mut req = engine_req(&vertex_shader.words, &fragment_words, size, size);
+    req.vertex_count = 64;
+    req.instance_count = Some(2);
+    req.primitive_topology = PrimitiveTopology::TriangleStrip;
+    req.indexed = Some(IndexedDrawResource {
+        index_type: IndexType::U16,
+        index_count: 64,
+        vertex_offset: 0,
+        indices,
+    });
+    let mut guest_bytes = vec![0u8; 65_280];
+    guest_bytes[..globals.len()].copy_from_slice(&globals);
+    let guest_content = || {
+        reims_vgpu::backend::vulkan::engine::BufferContent::GuestRuns(
+            reims_vgpu::backend::vulkan::engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![reims_vgpu::backend::vulkan::engine::GuestRun {
+                    host_ptr: guest_bytes.as_ptr() as usize,
+                    len: guest_bytes.len() as u64,
+                }]),
+                total_len: guest_bytes.len() as u64,
+                row_length_texels: 0,
+            },
+        )
+    };
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: guest_content(),
+    });
+    let mut vertex_aux_bytes = vec![0u8; 65_536];
+    vertex_aux_bytes[..16].copy_from_slice(&[
+        0x04, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x7f, 0x00, 0x00, 0x80,
+        0x7f,
+    ]);
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: reims_vgpu::backend::vulkan::engine::BufferContent::GuestRuns(
+            reims_vgpu::backend::vulkan::engine::GuestRunSource {
+                runs: std::sync::Arc::new(vec![reims_vgpu::backend::vulkan::engine::GuestRun {
+                    host_ptr: vertex_aux_bytes.as_ptr() as usize,
+                    len: vertex_aux_bytes.len() as u64,
+                }]),
+                total_len: vertex_aux_bytes.len() as u64,
+                row_length_texels: 0,
+            },
+        ),
+    });
+    req.storage_buffers.push(StorageBufferResource {
+        binding: reims_vgpu::runtime::spirv_bind::FRAG_BUFFER_BINDING_OFFSET,
+        content: guest_content(),
+    });
+    req.primary_format = Some(ash::vk::Format::R16G16B16A16_SFLOAT);
+    req.target_identity = Some(primary.clone());
+    req.load_op = None;
+    req.target_rgba8 = Some(std::sync::Arc::new(vec![
+        0u8;
+        size as usize * size as usize * 4
+    ]));
+    req.skip_readback = true;
+    req.color_write_mask = ColorWriteMask::new(0).unwrap();
+    req.secondary_targets.push(SecondaryColorTarget {
+        identity: coverage.clone(),
+        width: size,
+        height: size,
+        format: ash::vk::Format::R16G16_SFLOAT,
+        clear: [0.0; 4],
+        load: false,
+        blend: Some(BlendStateResource {
+            src_color: BlendFactor::One,
+            dst_color: BlendFactor::One,
+            color_op: BlendOp::Add,
+            src_alpha: BlendFactor::One,
+            dst_alpha: BlendFactor::One,
+            alpha_op: BlendOp::Add,
+            constants: [0.0; 4],
+        }),
+        color_write_mask: ColorWriteMask::new(4).unwrap(),
+    });
+
+    if std::env::var_os("REIMS_TAHOE_COVERAGE_STRESS_REGISTRY").is_some() {
+        for index in 0..engine::registry_cap() + 16 {
+            req.target_identity = Some(TargetIdentity::Gva {
+                gva: 0x7200_0000 + index as u64 * 0x20_000,
+                width: size,
+                height: size,
+                generation: 1,
+            });
+            req.secondary_targets[0].identity = TargetIdentity::Gva {
+                gva: 0x8200_0000 + index as u64 * 0x20_000,
+                width: size,
+                height: size,
+                generation: 1,
+            };
+            engine::execute_draw_request(&req).expect("stress resident registry reuse");
+        }
+        req.target_identity = Some(primary);
+        req.secondary_targets[0].identity = coverage.clone();
+    }
+
+    engine::execute_draw_request(&req).expect("replay captured coverage draw");
+    let native = engine::read_target(&coverage).expect("read RG16Float coverage target");
+    assert_eq!(native.format, ash::vk::Format::R16G16_SFLOAT);
+    let nonfinite = native
+        .pixels
+        .chunks_exact(2)
+        .filter(|word| u16::from_le_bytes([word[0], word[1]]) & 0x7c00 == 0x7c00)
+        .count();
+    assert_eq!(
+        nonfinite, 0,
+        "finite fragment output produced {nonfinite} non-finite half words"
+    );
+}
+
+/// Local Tahoe capture replay. The private AIR/SPIR-V and guest bytes stay
+/// outside the repository; unset paths make this a no-op in the normal suite.
+#[test]
+fn external_tahoe_gradient_capture_has_finite_primary_output() {
+    use reims_vgpu::runtime::decode::resource::ColorWriteMask;
+    use std::io::BufRead;
+
+    let Ok(vertex_path) = std::env::var("REIMS_TAHOE_GRADIENT_VERTEX_SPV") else {
+        return;
+    };
+    let fragment_path = std::env::var("REIMS_TAHOE_GRADIENT_FRAGMENT_SPV")
+        .expect("fragment SPIR-V path accompanies vertex path");
+    let draw_log = std::env::var("REIMS_TAHOE_GRADIENT_DRAW_LOG")
+        .expect("draw log path accompanies vertex path");
+    let size = std::env::var("REIMS_TAHOE_GRADIENT_SIZE")
+        .ok()
+        .map(|value| value.parse::<u32>().expect("gradient size is a u32"))
+        .unwrap_or(14);
+
+    let read_spirv = |path: &str| {
+        let bytes = std::fs::read(path).expect("read external SPIR-V");
+        assert!(bytes.len().is_multiple_of(4), "SPIR-V word alignment");
+        bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let decode_hex = |hex: &str| {
+        assert!(hex.len().is_multiple_of(2), "hex byte alignment");
+        (0..hex.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let field = |line: &str, name: &str| {
+        let start = line
+            .find(name)
+            .unwrap_or_else(|| panic!("capture field {name}"))
+            + name.len();
+        let tail = &line[start..];
+        let end = tail.find(' ').unwrap_or(tail.len());
+        decode_hex(&tail[..end])
+    };
+    let file = std::fs::File::open(draw_log).expect("open external draw log");
+    let line = std::io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find(|line| {
+            line.contains(&format!("linux_m2v_resources pipe=15 {size}x{size}"))
+                && line.contains("fmt=0x73")
+                && line.contains("frag3hex=")
+        })
+        .expect("captured Tahoe gradient draw");
+    let globals = field(&line, "frag0hex=");
+    let coefficients = field(&line, "frag3hex=");
+    let indices = field(&line, "idxhex=");
+
+    let _guard = engine_test_session();
+    let primary = TargetIdentity::Gva {
+        gva: 0x7000_0000,
+        width: size,
+        height: size,
+        generation: 1,
+    };
+    let mask = TargetIdentity::Gva {
+        gva: 0x7001_0000,
+        width: size,
+        height: size,
+        generation: 1,
+    };
+    let mut req = engine_req(
+        &read_spirv(&vertex_path),
+        &read_spirv(&fragment_path),
+        size,
+        size,
+    );
+    req.vertex_count = 10;
+    req.primitive_topology = PrimitiveTopology::TriangleStrip;
+    req.indexed = Some(IndexedDrawResource {
+        index_type: IndexType::U16,
+        index_count: 10,
+        vertex_offset: 0,
+        indices,
+    });
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: globals.clone().into(),
+    });
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 3,
+        content: coefficients.into(),
+    });
+    let noise = std::env::var("REIMS_TAHOE_GRADIENT_NOISE")
+        .ok()
+        .map(|path| std::fs::read(path).expect("read captured noise"))
+        .unwrap_or_else(|| [128u8, 128, 128, 255].repeat(32 * 32));
+    req.sampled_images.push(SampledImageResource {
+        binding: 35,
+        width: 32,
+        height: 32,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(noise)),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    let mut coverage = std::env::var("REIMS_TAHOE_GRADIENT_COVERAGE")
+        .ok()
+        .map(|path| std::fs::read(path).expect("read captured coverage"))
+        .unwrap_or_else(|| {
+            let mut coverage = Vec::with_capacity(size as usize * size as usize * 4);
+            for _ in 0..size * size {
+                coverage.extend_from_slice(&0x3c00u16.to_le_bytes());
+                coverage.extend_from_slice(&0u16.to_le_bytes());
+            }
+            coverage
+        });
+    if let Ok(replacement) = std::env::var("REIMS_TAHOE_GRADIENT_NAN_REPLACEMENT") {
+        let replacement = u16::from_str_radix(replacement.trim_start_matches("0x"), 16)
+            .expect("NaN replacement is a hexadecimal half word");
+        for word in coverage.chunks_exact_mut(2) {
+            let bits = u16::from_le_bytes([word[0], word[1]]);
+            if bits & 0x7c00 == 0x7c00 {
+                word.copy_from_slice(&replacement.to_le_bytes());
+            }
+        }
+    }
+    req.sampled_images.push(SampledImageResource {
+        binding: 37,
+        width: size,
+        height: size,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(coverage)),
+        format: ash::vk::Format::R16G16_SFLOAT,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    let mut sampler = SamplerResource::normalized_default(64);
+    sampler.address_mode_u = reims_vgpu::backend::vulkan::engine::SamplerAddressMode::Repeat;
+    sampler.address_mode_v = reims_vgpu::backend::vulkan::engine::SamplerAddressMode::Repeat;
+    sampler.address_mode_w = reims_vgpu::backend::vulkan::engine::SamplerAddressMode::Repeat;
+    req.samplers.push(sampler);
+    req.primary_format = Some(ash::vk::Format::R16G16B16A16_SFLOAT);
+    req.target_identity = Some(primary.clone());
+    req.load_op = Some(LoadOp::Clear([0.0; 4]));
+    req.skip_readback = true;
+    req.blend = Some(BlendStateResource {
+        src_color: BlendFactor::One,
+        dst_color: BlendFactor::OneMinusSrcAlpha,
+        color_op: BlendOp::Add,
+        src_alpha: BlendFactor::One,
+        dst_alpha: BlendFactor::OneMinusSrcAlpha,
+        alpha_op: BlendOp::Add,
+        constants: [0.0; 4],
+    });
+    req.secondary_targets.push(SecondaryColorTarget {
+        identity: mask,
+        width: size,
+        height: size,
+        format: ash::vk::Format::R16G16_SFLOAT,
+        clear: [0.0; 4],
+        load: false,
+        blend: None,
+        color_write_mask: ColorWriteMask::new(0).unwrap(),
+    });
+
+    engine::execute_draw_request(&req).expect("replay captured gradient draw");
+    let native = engine::read_target(&primary).expect("read native RGBA16F target");
+    if let Ok(path) = std::env::var("REIMS_TAHOE_GRADIENT_OUTPUT") {
+        std::fs::write(path, &native.pixels).expect("write replay output");
+    }
+    assert_eq!(native.format, ash::vk::Format::R16G16B16A16_SFLOAT);
+    let nonfinite = native
+        .pixels
+        .chunks_exact(2)
+        .filter(|word| u16::from_le_bytes([word[0], word[1]]) & 0x7c00 == 0x7c00)
+        .count();
+    assert_eq!(
+        nonfinite, 0,
+        "synthetic finite inputs produced {nonfinite} non-finite half words"
+    );
+}
+
 /// Firewall: an empty `secondary_targets` leaves the classic single-attachment
 /// path untouched — same fragment color, zero MRT residents created.
 #[test]

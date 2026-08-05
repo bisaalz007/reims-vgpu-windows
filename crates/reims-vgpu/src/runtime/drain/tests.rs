@@ -116,6 +116,155 @@ fn sync_exec_stall_proxy_fires_at_watchdog_scale_only() {
 }
 use crate::runtime::host::{FakeHost, HostActionKind};
 
+#[cfg(feature = "backend-vulkan")]
+fn arm_owned_render_window(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    gpa: u64,
+    fill: u8,
+) -> Vec<u8> {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+
+    let page = 1usize << PAGE_SHIFT_X86;
+    host.map_range(gpa, page, 0);
+    state.map_surface(mapping_id);
+    {
+        let mapping = state.mappings.get_mut(&mapping_id).unwrap();
+        mapping.mapped = true;
+        mapping.map_generation = 1;
+        mapping.has_geom = true;
+        mapping.width = 4;
+        mapping.height = 4;
+        mapping.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        mapping.page_entries =
+            vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    let key = crate::model::ComputeStorageResidencyKey {
+        mapping_id,
+        map_generation: 1,
+        surface_offset: 0,
+        surface_bpr: 16,
+        span_end: 256,
+        width: 4,
+        height: 4,
+        pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        texture_ref: 0,
+    };
+    let frame = vec![fill; 4 * 4 * 4];
+    state.compute_deferred_flush.insert(
+        key,
+        crate::model::DeferredOwner::Render {
+            armed_seq: 1,
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+        },
+    );
+    frame
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn assert_render_window_landed(
+    state: &DeviceState,
+    host: &FakeHost,
+    mapping_id: u32,
+    gpa: u64,
+    frame: &[u8],
+) {
+    use crate::runtime::host::HostMemory;
+
+    assert!(
+        state.compute_deferred_flush.is_empty(),
+        "a mapping-keyed window must not survive its completion fence"
+    );
+    let (base_off, bpr, _) = {
+        let mapping = state.mappings.get(&mapping_id).unwrap();
+        crate::runtime::mapping_write::type11_sample_window(
+            mapping,
+            mapping_id,
+            4,
+            4,
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("the mapping has a type-11 sample window")
+    };
+    for y in 0..4u64 {
+        let mut row = [0u8; 16];
+        host.read_gpa(gpa + base_off + y * bpr as u64, &mut row)
+            .unwrap();
+        assert_eq!(
+            &row[..],
+            &frame[(y as usize) * 16..(y as usize + 1) * 16],
+            "row {y} must contain the deferred frame, not a dropped obligation"
+        );
+    }
+}
+
+/// A child completion stamp is not visible until every deferred Store it
+/// completes has reached the guest-owned IOSurface pages.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_child_completion_stamp_lands_a_type11_render_window() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = 1usize << PAGE_SHIFT_X86;
+    let fifo_pfn = 0x40u32;
+    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, page, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+
+    let surface_gpa = 0x4400_0000u64;
+    let frame = arm_owned_render_window(&mut state, &mut host, 9, surface_gpa, 0xA7);
+
+    write_stamp(&mut state, &mut host, 1, 7);
+
+    assert_render_window_landed(&state, &host, 9, surface_gpa, &frame);
+}
+
+/// Root packets publish slot 0 directly, so that path must enforce the same
+/// fence ordering instead of relying on the child-stamp helper.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_root_completion_stamp_lands_a_type11_render_window() {
+    use crate::runtime::host::HostMemory;
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = 1usize << PAGE_SHIFT_X86;
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page as u32;
+    state.gfx.fifo_length = (2 * page) as u32;
+
+    const ROOT_STAMP: u32 = 0x1234_5678;
+    let mut packet = [0u8; PACKET_HEADER_LEN as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 0);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], PACKET_HEADER_LEN);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    crate::runtime::gpa_map::write_bytes(&mut host, fifo_gpa + page as u64, &packet, page)
+        .expect("seed the root FIFO");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = PACKET_HEADER_LEN;
+
+    let surface_gpa = 0x4400_0000u64;
+    let frame = arm_owned_render_window(&mut state, &mut host, 9, surface_gpa, 0x5C);
+
+    drain_main_fifo(&mut state, &mut host);
+
+    let mut slot0 = [0u8; 4];
+    host.read_gpa(fifo_gpa, &mut slot0).unwrap();
+    assert_eq!(
+        ld32(&slot0),
+        ROOT_STAMP,
+        "the packet must complete or the fence assertion proves nothing"
+    );
+    assert_render_window_landed(&state, &host, 9, surface_gpa, &frame);
+}
+
 fn packet_bytes(opcode: u16, stamp_value: u32, payload: &[u8]) -> Vec<u8> {
     let total = PACKET_HEADER_LEN as usize + payload.len();
     let mut v = vec![0u8; total];
@@ -408,17 +557,44 @@ fn delete_task_root_clears_active_task() {
     );
 }
 
-/// CmdReplacePhysical (0x3c) is stamp-complete bookkeeping — not UnknownChildOpcode.
+/// CmdReplacePhysical (0x3c) says that a surface's cached page list is stale.
+/// The object id is the mapping id directly, not a task object-list ref from a
+/// separate id space that can happen to contain the same number.
 #[test]
-fn replace_physical_is_accepted_not_unknown() {
+fn replace_physical_condemns_only_the_named_mapping() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
+    let pfn = 0x44u32;
+    let gpa = u64::from(pfn) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 1usize << PAGE_SHIFT_ARM64E, 0x22);
+    state.map_surface(7);
+    {
+        let mapping = state.mappings.get_mut(&7).unwrap();
+        mapping.mapped = true;
+        mapping.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    let generation_before = state.mappings[&7].map_generation;
+
+    // Ref 7 deliberately collides with surface id 7 while naming mapping 99.
+    // Invalidating through texture_to_mapping would damage both mappings.
+    state.map_surface(99);
+    {
+        let mapping = state.mappings.get_mut(&99).unwrap();
+        mapping.mapped = true;
+        mapping.page_entries = vec![0xaa];
+    }
+    state.texture_to_mapping.insert((0, 7), 99);
+
+    let mut payload = vec![0u8; 8];
+    payload[4..8].copy_from_slice(&7u32.to_le_bytes());
     let pkt = Packet {
         opcode: CHILD_OP_REPLACE_PHYSICAL,
         stamp_count: 0,
         total_size: PACKET_HEADER_LEN + 8,
         completion_stamp: 0,
-        payload: vec![0u8; 8], // {taskID, objectID} placeholder
+        payload,
         next_head: 0,
     };
     process_child_packet(&mut state, &mut host, 2, &pkt);
@@ -429,6 +605,34 @@ fn replace_physical_is_accepted_not_unknown() {
             .any(|e| matches!(e, FailEvent::UnknownChildOpcode { opcode: 0x3c, .. })),
         "0x3c must not flood UnknownChildOpcode"
     );
+    assert!(state.mappings[&7].page_entries.is_empty());
+    assert_eq!(state.mappings[&7].map_generation, generation_before);
+    assert!(state.mapping_backing_condemned(7));
+    assert_eq!(state.mappings[&99].page_entries, vec![0xaa]);
+}
+
+#[test]
+fn a_short_replace_physical_is_reported_and_drops_nothing() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    state.map_surface(7);
+    state.mappings.get_mut(&7).unwrap().page_entries = vec![0x11];
+
+    process_child_packet(
+        &mut state,
+        &mut host,
+        2,
+        &Packet {
+            opcode: CHILD_OP_REPLACE_PHYSICAL,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: vec![0u8; 4],
+            next_head: 0,
+        },
+    );
+
+    assert_eq!(state.mappings[&7].page_entries, vec![0x11]);
 }
 
 #[test]
@@ -849,6 +1053,111 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     assert_eq!(host.get_u32(stamp_gpa + 4), 0x55);
     assert!(state.task_map_spans.is_empty());
     assert_eq!(state.translation_order_hold_mask, 0);
+}
+
+/// A deferred EXEC may depend on MapMemory2 packets already published at a
+/// sibling FIFO head. Observe a consecutive map prefix to retain immutable
+/// object-list bytes, while leaving the FIFO head, stamps, and map registry in
+/// their original ordered state until the EXEC boundary releases.
+#[test]
+fn translation_deferred_peeks_sibling_map_prefix_without_consuming_it() {
+    use crate::contract::endian::{st16, st32, st64};
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = state.page_size() as usize;
+    let channel = 2u32;
+    let producer_bit = 1u32 << 1;
+    let sibling_bit = 1u32 << channel;
+    let device_root_pfn = 0x10u32;
+    let list_pfn = 0x20u32;
+    let ring_pfn = 0x30u32;
+    let stamp_pfn = 0x40u32;
+    let task_dir_pfn = 0x50u32;
+    let task_root_pfn = 0x51u32;
+    let task_data_pfn = 0x52u32;
+    let device_root_gpa = state.pfn_gpa(device_root_pfn);
+    let list_gpa = state.pfn_gpa(list_pfn);
+    let ring_gpa = state.pfn_gpa(ring_pfn);
+    let stamp_gpa = state.pfn_gpa(stamp_pfn);
+    let task_dir_gpa = state.pfn_gpa(task_dir_pfn);
+    let task_root_gpa = state.pfn_gpa(task_root_pfn);
+    let task_data_gpa = state.pfn_gpa(task_data_pfn);
+    for gpa in [
+        device_root_gpa,
+        list_gpa,
+        ring_gpa,
+        stamp_gpa,
+        task_dir_gpa,
+        task_root_gpa,
+        task_data_gpa,
+    ] {
+        host.map_range(gpa, page_size, 0);
+    }
+
+    let mut directory = [0u8; 8];
+    st32(&mut directory[DIRECTORY_ROOT_PFN as usize..], task_root_pfn);
+    st32(&mut directory[DIRECTORY_DEPTH as usize..], 1);
+    host.write_gpa(task_dir_gpa, &directory).unwrap();
+    let mut pte = [0u8; 4];
+    st32(&mut pte, task_data_pfn);
+    host.write_gpa(task_root_gpa + 4, &pte).unwrap();
+
+    let task_id = 6u32;
+    let object_list_gva = 1u64 << PAGE_SHIFT_X86;
+    assert!(state.define_task(task_id, 0x1000, task_dir_pfn));
+    assert!(state.set_object_list(task_id, 1, 8));
+    let mut entry = [0u8; crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry, 11u32 | (0x20u32 << 8));
+    st64(&mut entry[4..], object_list_gva + 0x40);
+    host.write_gpa(task_data_gpa + 12, &entry).unwrap();
+    let mut descriptor = [0u8; 0x20];
+    st32(&mut descriptor, 9);
+    st16(&mut descriptor[0x16..], 0x50);
+    st32(&mut descriptor[0x18..], 2);
+    st32(&mut descriptor[0x1c..], 2);
+    host.write_gpa(task_data_gpa + 0x40, &descriptor).unwrap();
+
+    let packet = |opcode, stamp, gva, length| {
+        let mut payload = vec![0u8; 20];
+        st32(&mut payload[0..], task_id);
+        st64(&mut payload[4..], gva);
+        st64(&mut payload[12..], length);
+        packet_bytes(opcode, stamp, &payload)
+    };
+    let first_map = packet(CHILD_OP_MAP_MEMORY2, 0x65, 0x117000, 0x20000);
+    let list_map = packet(CHILD_OP_MAP_MEMORY2, 0x66, object_list_gva, 0x1000);
+    let list_unmap = packet(CHILD_OP_UNMAP_MEMORY, 0x77, object_list_gva, 0x1000);
+    let mut ring = first_map;
+    ring.extend_from_slice(&list_map);
+    ring.extend_from_slice(&list_unmap);
+    host.write_gpa(ring_gpa, &ring).unwrap();
+    host.put_u32(list_gpa, ring_pfn);
+
+    let regs_gpa = device_root_gpa + child_reg_block_offset(channel).unwrap();
+    host.put_u32(regs_gpa + CHILD_REG_TAIL, ring.len() as u32);
+    host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
+    host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
+    host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
+    state.gfx.root_page = device_root_pfn;
+    state.gfx.fifo_base_page = stamp_pfn;
+    state.active_child_mask = producer_bit | sibling_bit;
+    state.pending.child_mask = sibling_bit;
+    state.translation_deferred_mask = producer_bit;
+
+    drain_pending(&mut state, &mut host);
+    assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), 0);
+    assert_eq!(host.get_u32(stamp_gpa + 4), 0);
+    assert!(state.task_map_spans.is_empty());
+    assert!(state.task_object_snapshots.contains_key(&(task_id, 1)));
+
+    state.translation_deferred_mask = 0;
+    drain_pending(&mut state, &mut host);
+    assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), ring.len() as u32);
+    assert_eq!(host.get_u32(stamp_gpa + 4), 0x77);
+    assert!(state.task_object_snapshots.is_empty());
+    assert_eq!(state.task_map_spans.len(), 1);
 }
 
 /// FIFO redefine/free retires scheduler ownership so a removed producer
@@ -2396,7 +2705,7 @@ fn invalidate_resources_bumps_mapping_content_generation() {
 /// freelist PTE panic correlation). Helper still unit-tested in surface_cache.
 #[test]
 fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
-    use crate::contract::endian::{st32, st64};
+    use crate::contract::endian::{st16, st32, st64};
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::runtime::decode::fifo::CHILD_OP_MAP_MEMORY2;
     use crate::runtime::surface_cache;
@@ -2418,7 +2727,18 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
 
     let mut state = DeviceState::new(DeviceId(1), page_shift);
     assert!(state.define_task(1, 0x1000, 2));
+    assert!(state.set_object_list(1, 1, 8));
     let gva = 1u64 << page_shift;
+    let mut entry = [0u8; crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry, 11u32 | (0x20u32 << 8));
+    st64(&mut entry[4..], gva + 0x40);
+    let _ = host.write_gpa(data_gpa + 12, &entry);
+    let mut descriptor = [0u8; 0x20];
+    st32(&mut descriptor, 9);
+    st16(&mut descriptor[0x16..], 0x50);
+    st32(&mut descriptor[0x18..], 2);
+    st32(&mut descriptor[0x1c..], 2);
+    let _ = host.write_gpa(data_gpa + 0x40, &descriptor);
     let mut bgra = vec![0u8; 16];
     bgra[0] = 185;
     bgra[1] = 126;
@@ -2449,6 +2769,10 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
         probe,
         [0, 0, 0, 0],
         "product MapMemory2 must stay notify-only for GVA (no auto flush)"
+    );
+    assert!(
+        state.task_object_snapshots.contains_key(&(1, 1)),
+        "MapMemory2 must retain the object list while its PTEs are live"
     );
 }
 
@@ -2702,7 +3026,10 @@ fn an_unbacked_present_fails_unless_a_resident_positively_carries_it() {
     ];
     assert_eq!(words, ["resident", "nothing", "unknown"]);
     assert_eq!(
-        words.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        words
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         3,
         "each carrier state needs its own word"
     );
@@ -3113,4 +3440,43 @@ fn a_display_order_hold_gives_up_before_the_guest_calls_it_a_gpu_fault() {
     );
     assert!(present_order_hold_budget_spent(&mut state));
     assert_eq!(state.present_translation_hold_mask, 0);
+}
+
+/// Task teardown must not discard pending frames from numerically related but
+/// otherwise independent task slots.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn deleting_a_task_retires_only_its_own_deferred_windows() {
+    use crate::model::{DeviceId, GvaDeferredEntry};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let window = |task_id: u32| GvaDeferredEntry {
+        task_id,
+        texture_ref: 11,
+        producer_object_type: 0,
+        width: 8,
+        height: 8,
+        row_stride: 32,
+        format: 0x50,
+        armed_seq: u64::from(task_id),
+        pages: [0x9000u64 + u64::from(task_id) * 0x1000]
+            .into_iter()
+            .collect(),
+    };
+
+    for task_id in [2u32, 5, 10, 11] {
+        assert!(state.define_task(task_id, 0x1_0000, 2));
+        state.arm_gva_deferred_window(u64::from(task_id) << 16, window(task_id));
+    }
+
+    assert!(state.delete_task(5));
+
+    let remaining: Vec<u32> = state
+        .gva_deferred_flush
+        .values()
+        .map(|entry| entry.task_id)
+        .collect();
+    assert_eq!(remaining, vec![2, 10, 11]);
+    assert_eq!(state.retired_gva_windows.len(), 1);
+    assert_eq!(state.retired_gva_windows[0].1.task_id, 5);
 }
