@@ -58,3 +58,4 @@ Vulkan-Headers/
 .agents/crashes/
 # machine-local working notes (environment-specific; never publish)
 docs-local/
+/tmp/
