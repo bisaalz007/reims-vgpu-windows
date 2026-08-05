@@ -5114,7 +5114,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // What a draw samples decides what it can draw. For a small
                 // float target — an icon canvas — an empty source and an empty
                 // result are the same picture, and only this separates them.
-                if crate::observe::dump_flush_surfaces() && req.width <= 160 && req.height <= 160 {
+                if crate::observe::dump_draw_captures() && req.width <= 160 && req.height <= 160 {
                     let capture_dir =
                         crate::runtime::compute_exec::m2v_handoff_dir().join("draw-stage-captures");
                     let _ = std::fs::create_dir_all(&capture_dir);
@@ -6651,7 +6651,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        if crate::observe::dump_flush_surfaces() && w <= 160 && h <= 160 {
+        if crate::observe::dump_draw_captures() && w <= 160 && h <= 160 {
             if let Some(identity) = resources.target_identity.as_ref() {
                 if let Ok(readback) = crate::backend::vulkan::engine::read_target(identity) {
                     let capture_dir =
@@ -6676,7 +6676,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // flush saying "NaN" cannot identify which draw in a resident chain
         // introduced it; reading after every draw while the explicit census
         // gate is enabled does. The normal product path never pays this wait.
-        if crate::observe::dump_flush_surfaces() && w <= 160 && h <= 160 && resources.skip_readback
+        if crate::observe::dump_draw_captures() && w <= 160 && h <= 160 && resources.skip_readback
         {
             if let Some(identity) = resources.target_identity.as_ref() {
                 match crate::backend::vulkan::engine::read_target(identity) {

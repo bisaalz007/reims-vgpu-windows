@@ -76,6 +76,37 @@ pub fn dump_flush_surfaces() -> bool {
     CENSUS_ON.load(Ordering::Relaxed)
 }
 
+/// Whether the **per-draw** stage capture (`REIMS_VGPU_DRAW_CAPTURE=1`) is
+/// active.
+///
+/// Split from [`dump_flush_surfaces`] because the two cost wildly different
+/// amounts and were sharing one switch. The flush census scans bytes the flush
+/// already holds — near free. The draw capture reads the target *back off the
+/// GPU* before and after every small draw, plus once per secondary attachment:
+/// a device→host copy and a fence wait per draw.
+///
+/// Measured on the x86/Vulkan rail with the two on one switch: **813
+/// `read_target` calls and 492 MB/s per second**, the drain worker pinned at
+/// duty 1.000, and only 103 of the guest's draws getting through per second.
+/// With the per-draw half off — same build, same snapshot, same workload —
+/// **315 draws per second**, duty 0.57, 344 reads and 332 MB/s. The probe was
+/// costing three quarters of the device's throughput, which is the shape
+/// `AGENTS.md` warns about: an instrument paying a cost proportional to the
+/// traffic it measures, and one that silently invalidates any boot it is on
+/// for as a frame-rate or app-launch measurement.
+///
+/// Keep them separate. A boot that wants "what did this surface contain" pays
+/// almost nothing; a boot that wants "what did each draw stage produce" pays
+/// for it knowingly and must not be read for performance.
+pub fn dump_draw_captures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_DRAW_CAPTURE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 pub(crate) fn enabled() -> bool {
     if !INIT.swap(true, Ordering::Relaxed) {
         let on = std::env::var_os("REIMS_VGPU_DRAW_LOG")

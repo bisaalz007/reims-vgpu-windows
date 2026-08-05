@@ -58,9 +58,9 @@ pub use emit::{first_sight, state_changed, Emit};
 // for readers who want the machinery.
 pub use sink::{
     allow_control_collision_read, bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats,
-    content_probe_enabled, content_reuse_disabled, content_summary, dump_flush_surfaces, fail,
-    line, nonzero_stats, off, redirect_logs_for_tests, rgba_rgb_stats, sampled_cache_disabled,
-    store_defer_disabled, ContentReuseRail, StoreDeferRail,
+    content_probe_enabled, content_reuse_disabled, content_summary, dump_draw_captures,
+    dump_flush_surfaces, fail, line, nonzero_stats, off, redirect_logs_for_tests, rgba_rgb_stats,
+    sampled_cache_disabled, store_defer_disabled, ContentReuseRail, StoreDeferRail,
 };
 pub(crate) use sink::{draw_log_enabled, elapsed_ms};
 

@@ -354,6 +354,32 @@ build` fail with a confusing "Access is denied" on the executable rather than a 
 taskkill //F //IM 'reims_vgpu-*.exe' 2>/dev/null || true
 ```
 
+### A boot with `REIMS_VGPU_DRAW_CAPTURE=1` is not a performance measurement
+
+`REIMS_VGPU_DRAW_CAPTURE=1` reads every small draw target back off the GPU before
+and after the draw, plus once per secondary attachment — a device→host copy and a
+fence wait per draw. Measured on the x86/Vulkan rail (RTX 4070 SUPER, Tahoe
+guest, same snapshot and workload either way):
+
+| | capture on | capture off |
+|---|---|---|
+| guest draws through per second | 103 | **315** |
+| `read_target` calls per second | 813 | 344 |
+| GPU→host readback | 492 MB/s | 332 MB/s |
+| `drain_duty` | 1.000 | 0.571 |
+
+The probe was costing roughly three quarters of the device's throughput. At that
+duty the guest starves: presents fall to ~2 Hz, the desktop looks frozen, and
+apps fail to finish launching — all of which read exactly like device defects and
+are not. It used to share the `REIMS_VGPU_FLUSH_CENSUS` switch, so any boot that
+wanted "what did this surface contain" silently paid for "what did every draw
+stage produce" as well; they are separate variables now.
+
+`REIMS_VGPU_FLUSH_CENSUS=1` stays cheap — it scans bytes the flush already holds
+— and is safe to leave on. Turn the *draw capture* on only to answer a
+stage-by-stage content question, and never read that boot for frame rate, launch
+latency, or hang behaviour.
+
 ### Vulkan validation layers without root
 
 Sync validation (`SYNC-HAZARD-*`) names a read/write hazard at the command that causes
