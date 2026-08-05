@@ -1103,6 +1103,23 @@ pub struct GvaBacking {
     pub gpas: Vec<u64>,
 }
 
+/// A task's object-list pages, translated to guest physical addresses.
+///
+/// `declared` is the `(object_list_pfn, object_list_count, directory_pfn)` the
+/// translation was made for, so a task that republishes its list — or is
+/// redefined onto a new page table — recomputes rather than protecting pages
+/// that no longer hold anything.
+///
+/// `complete` is false when the span exceeded the walk bound: the check this
+/// feeds rejects a *provable* overlap, and a partially-enumerated list cannot
+/// prove one for the pages it did not reach.
+#[derive(Clone, Debug, Default)]
+pub struct ObjectListPages {
+    pub declared: (u32, u32, u32),
+    pub gpas: Vec<u64>,
+    pub complete: bool,
+}
+
 /// Host-owned BGRA8 frame for a surface_id (Linux/Vulkan render-cache, §8.5).
 #[derive(Clone, Debug, Default)]
 pub struct HostSurface {
@@ -1806,6 +1823,17 @@ pub struct DeviceState {
     /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
     /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
     /// authoritative content until `storage_flush::flush_gva_one` lands it.
+    /// Guest **physical** pages each task's object list occupies, translated
+    /// from its GVA span through that task's own page table.
+    ///
+    /// The control-page collision check compares a candidate surface's GPAs
+    /// against the pages this device knows are live transport or task-control
+    /// structures. The object list is named in GVA space, so the comparison is
+    /// only meaningful after translation — and translating a span that may
+    /// cover thousands of pages on every mapping resolve is not affordable, so
+    /// it is cached and refreshed when the declaration or the page table
+    /// changes.
+    pub object_list_gpa_pages: std::collections::BTreeMap<u32, ObjectListPages>,
     pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
@@ -1950,6 +1978,7 @@ impl DeviceState {
             retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             linear_deferred_flush: DeferredWindows::new(),
+            object_list_gpa_pages: std::collections::BTreeMap::new(),
             gva_deferred_flush: DeferredWindows::new(),
             mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,

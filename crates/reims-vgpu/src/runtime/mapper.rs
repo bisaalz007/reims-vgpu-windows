@@ -1293,6 +1293,7 @@ fn mapping_page_gpas_impl<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
     }
+    refresh_object_list_gpa_pages(state, host);
     if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
         // One detail line per (mapping, owner-class): which task claims the
         // colliding span and how it was declared. The refusal line alone
@@ -1336,6 +1337,90 @@ fn mapping_page_gpas_impl<H: HostMemory + HostOps>(
     Some(gpas)
 }
 
+/// Translate every active task's object-list GVA span to guest physical pages,
+/// so the control-page collision check can compare like with like.
+///
+/// Recomputed only when a task's declaration or page table changes, because the
+/// span may cover thousands of pages and this sits under every mapping resolve.
+/// A span that exceeds [`OBJECT_LIST_WALK_PAGE_CAP`] is marked incomplete and
+/// the pages beyond the cap are simply not claimed: the check exists to reject a
+/// *provable* overlap, and an unfinished enumeration proves nothing about what
+/// it did not reach.
+fn refresh_object_list_gpa_pages<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
+    let page_shift = state.page_shift;
+    let page = state.page_size();
+    let mut stale: Vec<u32> = Vec::new();
+    for (index, task) in state.tasks.iter().enumerate() {
+        let task_id = index as u32;
+        if !task.active || task.object_list_pfn == 0 || task.object_list_count == 0 {
+            stale.push(task_id);
+            continue;
+        }
+        let declared = (
+            task.object_list_pfn,
+            task.object_list_count,
+            task.directory_pfn,
+        );
+        if state
+            .object_list_gpa_pages
+            .get(&task_id)
+            .is_some_and(|cached| cached.declared == declared)
+        {
+            continue;
+        }
+        let gva = (task.object_list_pfn as u64) << page_shift;
+        let span = (task.object_list_count as u64).saturating_mul(OBJECT_LIST_ENTRY_BYTES);
+        let mut gpas: Vec<u64> = Vec::new();
+        let mut complete = true;
+        crate::runtime::gva_mem::visit_task_gva_page_gpas(
+            host,
+            &state.tasks,
+            task_id,
+            gva,
+            span,
+            page_shift,
+            1,
+            &mut |gpa| {
+                if gpas.len() >= OBJECT_LIST_WALK_PAGE_CAP {
+                    complete = false;
+                    return false;
+                }
+                gpas.push(gpa & !(page - 1));
+                true
+            },
+        );
+        gpas.sort_unstable();
+        gpas.dedup();
+        if !complete {
+            crate::observe::fail(format!(
+                "object_list_pages incomplete task={task_id} pfn={:#x} count={} walked={} cap={OBJECT_LIST_WALK_PAGE_CAP}                  (pages past the cap are not claimed as control pages)",
+                task.object_list_pfn,
+                task.object_list_count,
+                gpas.len()
+            ));
+        }
+        state.object_list_gpa_pages.insert(
+            task_id,
+            crate::model::ObjectListPages {
+                declared,
+                gpas,
+                complete,
+            },
+        );
+    }
+    for task_id in stale {
+        state.object_list_gpa_pages.remove(&task_id);
+    }
+}
+
+/// Bytes per object-list entry, the stride `objects` walks the list with.
+const OBJECT_LIST_ENTRY_BYTES: u64 = crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN as u64;
+
+/// Most object-list pages one refresh will translate for a single task. A task
+/// may advertise a million slots (4096 x86 pages); this bounds one refresh
+/// rather than the list.
+const OBJECT_LIST_WALK_PAGE_CAP: usize = 8192;
+
 /// A render surface must never alias pages that the device knows are live
 /// transport or task-control structures. `is_ram_gpa` alone cannot distinguish
 /// an IOSurface page from a FIFO/page-table page; reject the provable overlap
@@ -1355,13 +1440,6 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     let mut pages: Vec<u64> = gpas.iter().map(|&gpa| page_base(gpa)).collect();
     pages.sort_unstable();
     let holds = |gpa: u64| pages.binary_search(&page_base(gpa)).is_ok();
-    // The lowest surface page in `[start, end)`, if any. Both bounds and every
-    // entry are multiples of `page`, so a hit is exactly one of the pages the
-    // per-page form would have enumerated — same page, same reported gpa.
-    let holds_range = |start: u64, end: u64| -> Option<u64> {
-        let i = pages.partition_point(|&p| p < start);
-        pages.get(i).copied().filter(|&p| p < end)
-    };
 
     if state.gfx.root_page != 0 && holds((state.gfx.root_page as u64) << state.page_shift) {
         return Some(((state.gfx.root_page as u64) << state.page_shift, "gfx_root"));
@@ -1383,7 +1461,7 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             }
         }
     }
-    for task in &state.tasks {
+    for (task_id, task) in state.tasks.iter().enumerate() {
         if !task.active {
             continue;
         }
@@ -1393,13 +1471,25 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
                 return Some((gpa, "task_directory"));
             }
         }
-        if task.object_list_pfn != 0 {
-            let first = (task.object_list_pfn as u64) << state.page_shift;
-            let bytes = (task.object_list_count as u64).saturating_mul(16);
-            let count = bytes.saturating_add(page - 1) / page;
-            let end = first.saturating_add(count.saturating_mul(page));
-            if let Some(gpa) = holds_range(first, end) {
-                return Some((gpa, "task_object_list"));
+        // The object list is named in the task's **GVA** space
+        // (`objects`: `(object_list_pfn << PAGE_SHIFT) + ref * 12` is a task
+        // GVA), while `gpas` are guest *physical* pages. Comparing the two
+        // directly proves nothing — it rejects any surface whose physical
+        // pages happen to land in the numeric range of some task's virtual
+        // object-list address — and this check exists to reject a *provable*
+        // overlap. Measured on the live rail: 769 `control_page_collision`
+        // refusals in one log tail, taking whole windows off the screen with
+        // `scanout_paint_mapping reason=capture_multi_read_failed`, from
+        // surfaces that alias nothing at all.
+        //
+        // The translated pages are what can be compared, and they are cached
+        // per task because the span is large (a task may advertise a million
+        // slots) and this runs on every mapping resolve.
+        if let Some(list) = state.object_list_gpa_pages.get(&(task_id as u32)) {
+            for &gpa in &list.gpas {
+                if holds(gpa) {
+                    return Some((page_base(gpa), "task_object_list"));
+                }
             }
         }
     }
@@ -2619,13 +2709,100 @@ mod tests {
         );
     }
 
+    /// Give task 1 a one-level x86 page table whose GVA page `vpage` maps to
+    /// physical page `ppage`, and publish an object list of `count` entries at
+    /// that GVA. Returns the object list's guest *physical* page.
+    ///
+    /// The collision check compares physical pages, so a fixture that only sets
+    /// `set_object_list` declares an address the device cannot translate — and
+    /// after the address-space fix that correctly claims nothing. Building the
+    /// table is what makes the claim provable, and is what the guest does.
+    fn task1_object_list_at(
+        state: &mut DeviceState,
+        host: &mut FakeHost,
+        vpage: u32,
+        ppage: u32,
+        count: u32,
+    ) -> u64 {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let (dir_pfn, root_pfn) = (0x40u32, 0x41u32);
+        let dir_gpa = (dir_pfn as u64) << shift;
+        let root_gpa = (root_pfn as u64) << shift;
+        host.map_range(dir_gpa, 0x1000, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &d).is_ok());
+        host.map_range((ppage as u64) << shift, 0x1000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, ppage);
+        // One level of 4-byte entries in a single page: the GVA page number
+        // indexes it directly, so a fixture must keep `vpage` inside the page.
+        assert!(
+            (vpage as u64) * 4 < (1u64 << shift),
+            "vpage indexes past the root page"
+        );
+        assert!(host.write_gpa(root_gpa + (vpage as u64) * 4, &pte).is_ok());
+        assert!(state.define_task(1, 0x4000_0000, dir_pfn));
+        assert!(state.set_object_list(1, vpage, count));
+        refresh_object_list_gpa_pages(state, host);
+        (ppage as u64) << shift
+    }
+
+    /// [`task1_object_list_at`] for a list whose pages are scattered: maps GVA
+    /// pages `vpage..vpage+ppages.len()` onto the given physical pages and
+    /// returns the sorted physical pages the refresh recorded.
+    fn task1_object_list_multi(
+        state: &mut DeviceState,
+        host: &mut FakeHost,
+        vpage: u32,
+        ppages: &[u32],
+        count: u32,
+    ) -> Vec<u64> {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let (dir_pfn, root_pfn) = (0x40u32, 0x41u32);
+        let dir_gpa = (dir_pfn as u64) << shift;
+        let root_gpa = (root_pfn as u64) << shift;
+        host.map_range(dir_gpa, 0x1000, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        assert!(host.write_gpa(dir_gpa, &d).is_ok());
+        for (i, &ppage) in ppages.iter().enumerate() {
+            let v = vpage + i as u32;
+            assert!((v as u64) * 4 < (1u64 << shift));
+            host.map_range((ppage as u64) << shift, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, ppage);
+            assert!(host.write_gpa(root_gpa + (v as u64) * 4, &pte).is_ok());
+        }
+        assert!(state.define_task(1, 0x4000_0000, dir_pfn));
+        assert!(state.set_object_list(1, vpage, count));
+        refresh_object_list_gpa_pages(state, host);
+        state
+            .object_list_gpa_pages
+            .get(&1)
+            .map(|l| l.gpas.clone())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn render_pages_reject_known_device_and_task_control_pages() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
         state.gfx.root_page = 0x120;
         state.child_rings[2].page_gpas = vec![0x330_000];
-        assert!(state.define_task(1, 0x4000_0000, 0x440));
-        assert!(state.set_object_list(1, 0x550, 1024));
+        // The object list is declared at GVA page 0x550 and *lives* at physical
+        // page 0x551 — the two are different numbers on purpose, because the
+        // check must reject the physical page and ignore the virtual one.
+        let list_gpa = task1_object_list_at(&mut state, &mut host, 0x50, 0x551, 256);
+        assert_eq!(list_gpa, 0x551_000);
 
         assert_eq!(
             first_control_page_collision(&state, &[0x120_000]),
@@ -2636,13 +2813,21 @@ mod tests {
             Some((0x330_000, "child_fifo"))
         );
         assert_eq!(
-            first_control_page_collision(&state, &[0x440_000]),
-            Some((0x440_000, "task_directory"))
+            first_control_page_collision(&state, &[state.pfn_gpa(state.tasks[1].directory_pfn)]),
+            Some((
+                state.pfn_gpa(state.tasks[1].directory_pfn),
+                "task_directory"
+            ))
         );
         assert_eq!(
             first_control_page_collision(&state, &[0x551_000]),
             Some((0x551_000, "task_object_list"))
         );
+        // The *virtual* page the list is declared at is not a physical control
+        // page. Rejecting it is the address-space confusion this check had:
+        // it took whole windows off the screen with
+        // `scanout_paint_mapping reason=capture_multi_read_failed`.
+        assert_eq!(first_control_page_collision(&state, &[0x50_000]), None);
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
     }
 
@@ -2656,9 +2841,10 @@ mod tests {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        assert!(state.define_task(1, 0x4000_0000, 0x440));
-        assert!(state.set_object_list(1, 0x550, 1024));
-        // Mapping 7's single page sits inside task 1's object-list span.
+        // Task 1 publishes an object list that really lives at physical page
+        // 0x551, and mapping 7's single page is that same physical page.
+        let list_gpa = task1_object_list_at(&mut state, &mut host, 0x50, 0x551, 256);
+        assert_eq!(list_gpa, 0x551_000);
         assert!(state.attach_mapping_internal(7, KVA));
         {
             let m = state.mappings.get_mut(&7).unwrap();
@@ -2675,20 +2861,22 @@ mod tests {
             Some(vec![0x551_000]),
             "the read-through diagnostic serves the same pages"
         );
-        // A mapping with no collision resolves on both rails.
+        // A mapping over a page the list does not occupy resolves on both
+        // rails — including the *virtual* page the list is declared at, which
+        // is not a physical control page.
         assert!(state.attach_mapping_internal(8, KVA + 0x1000));
         {
             let m = state.mappings.get_mut(&8).unwrap();
             m.mapped = true;
-            m.page_entries = vec![(0x660 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.page_entries = vec![(0x50 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
         assert_eq!(
             mapping_page_gpas(&mut state, &mut host, 8),
-            Some(vec![0x660_000])
+            Some(vec![0x50_000])
         );
         assert_eq!(
             mapping_page_gpas_impl(&mut state, &mut host, 8, false),
-            Some(vec![0x660_000])
+            Some(vec![0x50_000])
         );
     }
 
@@ -2703,33 +2891,42 @@ mod tests {
     #[test]
     fn object_list_collision_reports_the_lowest_page_and_stops_at_the_span_end() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
-        assert!(state.define_task(1, 0x4000_0000, 0x440));
-        // 1024 slots x 16 bytes = 16 KiB = pages 0x550..0x554 at a 4 KiB shift.
-        assert!(state.set_object_list(1, 0x550, 1024));
+        let mut host = FakeHost::new();
+        // A four-page list: the entry stride is `OBJECT_LIST_ENTRY_LEN` (12),
+        // so 1365 slots is 16 380 bytes and spans four 4 KiB pages.
+        // The four *virtual* pages 0x50..0x53 are scattered across physical
+        // pages on purpose — a real guest allocation is not contiguous, and the
+        // check must claim the physical pages the walk reaches rather than a
+        // contiguous run starting at the declared address.
+        let list = task1_object_list_multi(
+            &mut state,
+            &mut host,
+            0x50,
+            &[0x551, 0x777, 0x552, 0x300],
+            1365,
+        );
+        assert_eq!(list, vec![0x300_000, 0x551_000, 0x552_000, 0x777_000]);
 
-        // Several surface pages inside the span, listed out of order: the answer
+        // Several surface pages inside the list, listed out of order: the answer
         // is the lowest, not whichever the surface happens to name first.
         assert_eq!(
-            first_control_page_collision(&state, &[0x553_000, 0x551_000, 0x552_000]),
+            first_control_page_collision(&state, &[0x777_000, 0x551_000, 0x552_000]),
             Some((0x551_000, "task_object_list"))
         );
-        // Both ends of the span are inside it.
+        // A scattered page is claimed just as much as a neighbouring one.
         assert_eq!(
-            first_control_page_collision(&state, &[0x550_000]),
-            Some((0x550_000, "task_object_list"))
+            first_control_page_collision(&state, &[0x300_000]),
+            Some((0x300_000, "task_object_list"))
         );
-        assert_eq!(
-            first_control_page_collision(&state, &[0x553_000]),
-            Some((0x553_000, "task_object_list"))
-        );
-        // The page immediately after the span is not part of it.
-        assert_eq!(first_control_page_collision(&state, &[0x554_000]), None);
-        // Nor is the page immediately before.
+        // Pages the list does not occupy are clean — including the ones a
+        // contiguous-span reading would have swept up between them.
+        assert_eq!(first_control_page_collision(&state, &[0x553_000]), None);
         assert_eq!(first_control_page_collision(&state, &[0x54f_000]), None);
-        // A surface that straddles the span without landing in it stays clean —
-        // the query must not report the neighbour it binary-searched past.
+        assert_eq!(first_control_page_collision(&state, &[0x776_000]), None);
+        // And the virtual addresses the list is declared at are not physical
+        // control pages at all.
         assert_eq!(
-            first_control_page_collision(&state, &[0x100_000, 0x554_000]),
+            first_control_page_collision(&state, &[0x50_000, 0x51_000, 0x52_000, 0x53_000]),
             None
         );
     }
@@ -2741,16 +2938,20 @@ mod tests {
     #[test]
     fn a_surface_colliding_with_several_control_structures_names_the_first() {
         let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
         state.gfx.root_page = 0x120;
         state.gfx.fifo_base_page = 0x220;
         state.iosfc.ring_base = 0x300_000;
         state.child_rings[2].page_gpas = vec![0x330_000];
-        assert!(state.define_task(1, 0x4000_0000, 0x440));
-        assert!(state.set_object_list(1, 0x550, 1024));
+        // Task 1's list is declared at GVA page 0x50 and lives at physical
+        // page 0x551; task 2 gets a directory of its own.
+        let list_gpa = task1_object_list_at(&mut state, &mut host, 0x50, 0x551, 256);
+        assert_eq!(list_gpa, 0x551_000);
         assert!(state.define_task(2, 0x4000_0000, 0x660));
+        let task1_dir = state.pfn_gpa(state.tasks[1].directory_pfn);
 
         let all = [
-            0x660_000, 0x551_000, 0x440_000, 0x330_000, 0x300_000, 0x220_000, 0x120_000,
+            0x660_000, 0x551_000, task1_dir, 0x330_000, 0x300_000, 0x220_000, 0x120_000,
         ];
         assert_eq!(
             first_control_page_collision(&state, &all),
@@ -2774,7 +2975,7 @@ mod tests {
         state.child_rings[2].page_gpas.clear();
         assert_eq!(
             first_control_page_collision(&state, &all),
-            Some((0x440_000, "task_directory"))
+            Some((task1_dir, "task_directory"))
         );
         // Task 1's object list outranks task 2's directory: the walk is per task.
         state.tasks[1].directory_pfn = 0;
@@ -2782,7 +2983,7 @@ mod tests {
             first_control_page_collision(&state, &all),
             Some((0x551_000, "task_object_list"))
         );
-        assert!(state.set_object_list(1, 0, 0));
+        state.object_list_gpa_pages.remove(&1);
         assert_eq!(
             first_control_page_collision(&state, &all),
             Some((0x660_000, "task_directory"))

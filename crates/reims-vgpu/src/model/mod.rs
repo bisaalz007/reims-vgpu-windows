@@ -14,10 +14,10 @@ pub use state::{
     DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
     GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView, HostLinearTexture,
     HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow,
-    PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState, RenderPipelineSnapshot,
-    RenderWindowSource, StampSlot, SubmissionObjectSnapshot, SubmissionResourceSnapshot,
-    SurfaceWriteKind, TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
-    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
+    ObjectListPages, PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState,
+    RenderPipelineSnapshot, RenderWindowSource, StampSlot, SubmissionObjectSnapshot,
+    SubmissionResourceSnapshot, SurfaceWriteKind, TaskEntry, TaskMapSpan, WriteGate,
+    FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;
