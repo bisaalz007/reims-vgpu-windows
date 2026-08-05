@@ -7568,7 +7568,11 @@ fn finish_surface_deferred_window(
     let resident = matches!(source, crate::model::RenderWindowSource::Resident { .. });
     state.compute_deferred_flush.insert(
         key,
-        crate::model::DeferredOwner::Render { armed_seq, source },
+        crate::model::DeferredOwner::Render {
+            armed_seq,
+            source,
+            drawn_rows: loaded_pass_drawn_rows(req, key.height),
+        },
     );
     // Raw task-GVA reads that alias these physical pages flush through
     // `flush_intersecting_task_gva`, which finds the mapping via this index.
@@ -8351,6 +8355,7 @@ mod vulkan_split_tests {
                     source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(
                         vec![0u8; 4 * 4 * 4],
                     )),
+                    drawn_rows: None,
                 },
             );
         };
@@ -8477,5 +8482,106 @@ mod vulkan_split_tests {
         // binding a 2D view under a cube sampler.
         assert!(sampled_image_shape(SampledImageKind::Cube).is_none());
         assert!(sampled_image_shape(SampledImageKind::CubeArray).is_none());
+    }
+}
+
+/// The rows a **LOAD** pass's scissor bounded, for the clobber-path writeback
+/// bound on [`crate::model::DeferredOwner::Render`].
+///
+/// `None` whenever the full extent is genuinely this Store's: a CLEAR pass
+/// produced every texel, and a draw with no scissor is unbounded. Returning
+/// `None` keeps the full-extent landing, which is the behaviour every
+/// non-clobbering flush wants.
+///
+/// Rows, not a rect: guest rows are contiguous, so a row range is a bound the
+/// writer already expresses, and the bands a compositor updates (a menu bar, a
+/// window, a sheet) are row-shaped. Narrowing the columns as well would need a
+/// second write vocabulary for a smaller share of the damage.
+#[cfg(feature = "backend-vulkan")]
+fn loaded_pass_drawn_rows(req: &DrawEncodeRequest, height: u32) -> Option<(u32, u32)> {
+    let color = req.colors.first()?;
+    if color.load_action != PASS_LOAD_ACTION_LOAD {
+        return None;
+    }
+    let (_, y, _, sh) = req.scissor?;
+    if sh == 0 || height == 0 {
+        return None;
+    }
+    let first = y.min(height.saturating_sub(1));
+    let count = sh.min(height - first);
+    // A scissor that already covers every row carries no information.
+    (count < height).then_some((first, count))
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod drawn_rows_tests {
+    use super::*;
+
+    fn req(load_action: u16, scissor: Option<(u32, u32, u32, u32)>) -> DrawEncodeRequest {
+        let mut r = DrawEncodeRequest {
+            width: 1920,
+            height: 1080,
+            scissor,
+            ..DrawEncodeRequest::default()
+        };
+        r.colors.push(crate::runtime::metal_draw::ColorRtRequest {
+            width: 1920,
+            height: 1080,
+            load_action,
+            ..Default::default()
+        });
+        r
+    }
+
+    /// A LOAD pass owns only the rows its scissor bounded. Everything outside
+    /// them is a copy of what the attachment already held, so the clobber path
+    /// must not write those rows back over the guest's newer bytes.
+    #[test]
+    fn a_loaded_pass_records_only_the_rows_its_scissor_bounded() {
+        assert_eq!(
+            loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_LOAD, Some((0, 40, 1920, 24))), 1080),
+            Some((40, 24))
+        );
+    }
+
+    /// A CLEAR pass produced every texel, so the full extent is genuinely its
+    /// own and the landing must stay unbounded.
+    #[test]
+    fn a_cleared_pass_keeps_the_full_extent() {
+        assert_eq!(
+            loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_CLEAR, Some((0, 40, 1920, 24))), 1080),
+            None
+        );
+    }
+
+    /// No scissor is an unbounded draw, and a scissor that already spans every
+    /// row carries no information — both keep the full-extent landing rather
+    /// than inventing a narrower claim than the draw made.
+    #[test]
+    fn an_unbounded_or_full_height_draw_records_nothing() {
+        assert_eq!(loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_LOAD, None), 1080), None);
+        assert_eq!(
+            loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_LOAD, Some((0, 0, 1920, 1080))), 1080),
+            None
+        );
+        assert_eq!(
+            loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_LOAD, Some((0, 0, 1920, 4000))), 1080),
+            None
+        );
+    }
+
+    /// A scissor running past the attachment is clamped rather than trusted:
+    /// the row range indexes both the readback and the guest surface, and a
+    /// count past the end would read or write outside either.
+    #[test]
+    fn a_scissor_past_the_attachment_is_clamped_to_it() {
+        assert_eq!(
+            loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_LOAD, Some((0, 1000, 1920, 500))), 1080),
+            Some((1000, 80))
+        );
+        assert_eq!(
+            loaded_pass_drawn_rows(&req(PASS_LOAD_ACTION_LOAD, Some((0, 5000, 1920, 8))), 1080),
+            Some((1079, 1))
+        );
     }
 }

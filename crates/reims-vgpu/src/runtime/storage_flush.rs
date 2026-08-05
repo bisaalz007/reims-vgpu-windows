@@ -1073,9 +1073,9 @@ fn flush_one<M: HostMemory + HostOps>(
         crate::model::DeferredOwner::Storage { generation } => {
             flush_storage_one(state, host, key, generation)
         }
-        crate::model::DeferredOwner::Render { source, .. } => {
-            flush_render_one(state, host, key, &source)
-        }
+        crate::model::DeferredOwner::Render {
+            source, drawn_rows, ..
+        } => flush_render_one(state, host, key, &source, drawn_rows),
     }
 }
 
@@ -1156,6 +1156,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
     source: &crate::model::RenderWindowSource,
+    drawn_rows: Option<(u32, u32)>,
 ) -> bool {
     let started = std::time::Instant::now();
     // Counted on the same one-line-per-second census as the Store routes, so a
@@ -1199,11 +1200,38 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // the loss keeps its name, and the reader that actually wants the guest's
     // newer bytes — sampled-texture staging — reads around the window instead
     // (see `sampled_reads_guest_directly`).
+    // Rows this landing may write. `None` is the whole extent, which is what
+    // every ordinary flush wants: the resident is the newest state of the
+    // surface and the guest has not touched it since.
+    //
+    // When the guest HAS written these pages since the Store was armed, a
+    // full-extent write puts our older render over the guest's newer bytes.
+    // Measured live as ten 1920x1080 clobbers in one session, and visible as a
+    // composited layer that never clears. Dropping the landing entirely was
+    // tried three times before and lost real frames each time (a black desktop,
+    // an all-pages skip, black window chrome), so this narrows instead: a LOAD
+    // pass owns only the rows it rendered, and outside them our resident is a
+    // copy of what was already there — so not writing those rows can only
+    // preserve the guest's newer content. A CLEAR pass, or a draw with no
+    // scissor, records `None` and still lands whole, because then every texel
+    // really is this Store's.
+    let mut write_rows = None;
     if guest_wrote_after_arm(state, host, key) {
         crate::runtime::drain::note_store_route("render_flush_over_guest_write");
+        write_rows = drawn_rows;
+        crate::runtime::drain::note_store_route(if write_rows.is_some() {
+            "render_flush_clobber_bounded"
+        } else {
+            "render_flush_clobber_full"
+        });
         crate::observe::fail(format!(
-            "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={}              (the guest wrote these pages after the Store this window defers;              the full-extent writeback replaces them)",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+            "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} rows={:?}              (the guest wrote these pages after the Store this window defers; the writeback              is bounded to the rows this pass rendered when it loaded, else full-extent)",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            key.map_generation,
+            write_rows
         ));
     }
     let skip_gpas: std::collections::BTreeSet<u64> = Default::default();
@@ -1328,8 +1356,37 @@ fn flush_render_one<M: HostMemory + HostOps>(
             );
         }
     }
-    let ok = if let Some(format) = native_format {
-        let stride = crate::contract::pixel_format::tight_row_bytes(key.width, format).unwrap_or(0);
+    // Source row geometry, shared by both arms: `pixels` is tight rows of the
+    // surface's own texel, so a row bound is a slice offset and a row count.
+    let (bpp, stride) = match native_format {
+        Some(format) => (
+            crate::contract::pixel_format::bytes_per_pixel(format).unwrap_or(0),
+            crate::contract::pixel_format::tight_row_bytes(key.width, format).unwrap_or(0),
+        ),
+        None => (4, key.width.saturating_mul(4)),
+    };
+    let ok = if let Some((first, count)) = write_rows.filter(|_| stride != 0 && bpp != 0) {
+        // Bounded landing (clobber path only): the same rect writer the partial
+        // Store rail uses, at the surface's own stride, so the rows outside the
+        // pass keep the guest's newer bytes.
+        let from = (first as usize).saturating_mul(stride as usize);
+        pixels.len() > from
+            && crate::runtime::mapping_write::write_rect_raw_at(
+                state,
+                host,
+                key.mapping_id,
+                key.surface_offset,
+                key.surface_bpr,
+                key.span_end,
+                0,
+                first,
+                key.width,
+                count,
+                bpp,
+                &pixels[from..],
+                stride,
+            )
+    } else if let Some(format) = native_format {
         crate::runtime::mapping_write::write_native_image_skipping(
             state,
             host,
@@ -1347,7 +1404,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
             host,
             key.mapping_id,
             pixels,
-            key.width.saturating_mul(4),
+            stride,
             key.width,
             key.height,
             &skip_gpas,
@@ -1712,6 +1769,7 @@ mod tests {
                 0u8;
                 4 * 4 * 4
             ])),
+            drawn_rows: None,
         }
     }
 
@@ -1968,6 +2026,7 @@ mod tests {
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
                 source: crate::model::RenderWindowSource::Resident { epoch: 7 },
+                drawn_rows: None,
             },
         );
         let cap = crate::observe::FailCapture::start();
@@ -2060,6 +2119,7 @@ mod tests {
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+                drawn_rows: None,
             },
         );
         // A later Store re-Stored this mapping at 8x8, replacing the one cache
@@ -2170,6 +2230,7 @@ mod tests {
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
                 source: crate::model::RenderWindowSource::Resident { epoch: 11 },
+                drawn_rows: None,
             },
         );
 

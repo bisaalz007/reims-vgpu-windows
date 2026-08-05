@@ -2185,6 +2185,7 @@ mod tests {
                             0u8;
                             (W * H * 4) as usize
                         ])),
+                        drawn_rows: None,
                     },
                 );
 
@@ -2284,6 +2285,7 @@ mod tests {
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+                drawn_rows: None,
             },
         );
 

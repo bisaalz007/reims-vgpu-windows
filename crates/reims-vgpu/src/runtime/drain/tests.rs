@@ -157,6 +157,7 @@ fn arm_owned_render_window(
         crate::model::DeferredOwner::Render {
             armed_seq: 1,
             source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+            drawn_rows: None,
         },
     );
     frame

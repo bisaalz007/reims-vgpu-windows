@@ -975,6 +975,25 @@ pub enum DeferredOwner {
     Render {
         armed_seq: u64,
         source: RenderWindowSource,
+        /// The rows this Store's pass actually rendered, as `(first, count)`,
+        /// when the pass **loaded** its attachment and the guest's scissor
+        /// bounded the draw.
+        ///
+        /// Only the clobber path reads it, and only that path is allowed to.
+        /// A deferred window normally lands its full extent, which is right:
+        /// the resident is the newest state of the whole surface. But when the
+        /// guest has written these pages *since* the Store was armed, the
+        /// full-extent write replaces the guest's newer bytes with our older
+        /// render — measured live as ten 1920x1080 clobbers in one session,
+        /// and visible as a composited layer that never clears.
+        ///
+        /// Outside the rendered rows of a LOAD pass our resident holds a copy
+        /// of what was already there, so declining to write those rows can
+        /// only preserve the guest's newer content; inside them the GPU
+        /// genuinely produced the pixels and they must land. `None` — a CLEAR
+        /// pass, or a draw with no scissor — keeps the full-extent behaviour,
+        /// because then every texel really is ours.
+        drawn_rows: Option<(u32, u32)>,
     },
 }
 
