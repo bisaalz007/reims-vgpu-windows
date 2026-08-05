@@ -50,6 +50,9 @@ fn draw_handoff_dedup_uses_shader_content_not_reused_pipeline_refs() {
     let first = draw_handoff_fingerprint(&stages);
     assert_eq!(first, draw_handoff_fingerprint(&stages));
 
+    // Each of the three hashed byte inputs discriminates on its own — a
+    // fingerprint that ignored one of them would collide a reused ref whose
+    // change happens to live only in that input.
     let changed_fragment_air = [9, 13];
     let reused_ref_content = [
         stages[0],
@@ -64,6 +67,49 @@ fn draw_handoff_dedup_uses_shader_content_not_reused_pipeline_refs() {
         first,
         draw_handoff_fingerprint(&reused_ref_content),
         "the later shader must not be suppressed because its guest pipe ref was reused"
+    );
+    let changed_mtlb = [7, 9];
+    let mtlb_only = [
+        stages[0],
+        (
+            "fragment",
+            changed_mtlb.as_slice(),
+            fragment_air.as_slice(),
+            fragment_spv.as_slice(),
+        ),
+    ];
+    assert_ne!(first, draw_handoff_fingerprint(&mtlb_only));
+    let changed_spv = [11, 13];
+    let spv_only = [
+        stages[0],
+        (
+            "fragment",
+            fragment_mtlb.as_slice(),
+            fragment_air.as_slice(),
+            changed_spv.as_slice(),
+        ),
+    ];
+    assert_ne!(first, draw_handoff_fingerprint(&spv_only));
+
+    // The length prefix is load-bearing: without it `[1] ++ [2, 3]` and
+    // `[1, 2] ++ [3]` hash the same byte stream, and a boundary shift between
+    // two inputs is exactly the collision a concatenating hash invites.
+    let split_a = [(
+        "vertex",
+        [1u8].as_slice(),
+        [2u8, 3].as_slice(),
+        [4u8].as_slice(),
+    )];
+    let split_b = [(
+        "vertex",
+        [1u8, 2].as_slice(),
+        [3u8].as_slice(),
+        [4u8].as_slice(),
+    )];
+    assert_ne!(
+        draw_handoff_fingerprint(&split_a),
+        draw_handoff_fingerprint(&split_b),
+        "the same bytes at a shifted input boundary are different shaders"
     );
 }
 
@@ -129,6 +175,92 @@ fn an_async_render_retry_uses_its_submission_pipeline_snapshot() {
     release_render_pipeline_snapshots(&mut state, 16, &[31]);
     assert!(state.render_pipeline_snapshots.is_empty());
     assert!(load_render_pipeline_snapshot(&mut state, &host, 16, 31).is_err());
+}
+
+/// The other half of the snapshot contract: "a live descriptor always wins".
+/// A guest that republishes a pipeline ref with a *different* descriptor must
+/// not be served the old snapshot's MTLBs — the cached bytes belong to a
+/// pipeline that no longer exists under this ref. With the new functions not
+/// yet readable the resolve declines rather than replaying stale shaders.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_republished_pipeline_ref_rejects_the_stale_snapshot() {
+    use crate::contract::endian::st32;
+    use crate::model::{SubmissionObjectSnapshot, SubmissionResourceSnapshot};
+    use crate::runtime::decode::resource::{
+        ListObjectEntry, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC, PIPELINE_TAG_VERTEX_FUNC,
+        TYPE7_OBJECT_RENDER_PIPELINE,
+    };
+
+    const TASK: u32 = 16;
+    const CHANNEL: u32 = 1;
+    const PIPE_REF: u32 = 31;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let host = FakeHost::new();
+
+    // The stale capture: a pipeline this ref used to name.
+    state.render_pipeline_snapshots.insert(
+        (TASK, PIPE_REF),
+        crate::model::RenderPipelineSnapshot {
+            descriptor: RenderPipelineDescriptor {
+                vertex_func_ref: 17,
+                fragment_func_ref: 19,
+                ..RenderPipelineDescriptor::default()
+            },
+            vertex_mtlb: std::sync::Arc::from([1u8, 2, 3, 4]),
+            fragment_mtlb: std::sync::Arc::from([5u8, 6, 7, 8]),
+        },
+    );
+
+    // The republished ref: a readable, *different* type-7 descriptor
+    // (vertex ref 2, fragment ref 1) whose function MTLBs are not readable.
+    let mut descriptor = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = descriptor.len() as u32;
+    st32(&mut descriptor[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut descriptor[4..], blen);
+    st32(&mut descriptor[8..], 9);
+    descriptor[16] = 2;
+    descriptor[17] = PIPELINE_TAG_VERTEX_FUNC;
+    descriptor[18] = 4;
+    st32(&mut descriptor[19..], 2);
+    descriptor[23] = PIPELINE_TAG_FRAGMENT_FUNC;
+    descriptor[24] = 4;
+    st32(&mut descriptor[25..], 1);
+    let mut objects_by_ref = std::collections::BTreeMap::new();
+    objects_by_ref.insert(
+        PIPE_REF,
+        SubmissionObjectSnapshot {
+            entry: ListObjectEntry {
+                object_type: OBJECT_TYPE_TYPE7,
+                descriptor_length: descriptor.len() as u32,
+                descriptor_gva: 0x1000,
+            },
+            descriptor: descriptor.into(),
+        },
+    );
+    state.submission_resource_snapshots.insert(
+        CHANNEL,
+        SubmissionResourceSnapshot {
+            task_id: TASK,
+            resource_ids: std::sync::Arc::from([PIPE_REF]),
+            objects: objects_by_ref,
+        },
+    );
+    state.active_submission_channel = Some(CHANNEL);
+
+    let err = load_render_pipeline_snapshot(&mut state, &host, TASK, PIPE_REF)
+        .expect_err("a different live descriptor must not replay the stale snapshot's MTLBs");
+    assert!(
+        matches!(
+            err,
+            DrawPreparationDecline::VertexMtlbMissing {
+                function_ref: 2,
+                ..
+            }
+        ),
+        "the decline names the republished pipeline's own vertex function: {err:?}"
+    );
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -218,7 +350,11 @@ fn type5_submission_view_is_an_exact_render_target() {
     assert_eq!(mapping, SURFACE_ID);
     assert_eq!(gva, 0);
     assert_eq!((width, height, format), (130, 130, MTL_FORMAT_RGBA16_FLOAT));
-    assert!(bpr >= 130 * 8);
+    // Exact, not a floor: `align_up(130 * 8, ROW_BYTES_ALIGN=128)` = 1152.
+    // A `>=` here would also accept the base-geometry bug this test exists to
+    // forbid — 320-wide BGRA8 gives `align_up(1280, 128)` = 1280, which
+    // satisfies any lower bound the view's own row could set.
+    assert_eq!(bpr, 1152);
 }
 
 /// One reflection binding of `kind` at `metal_index` for the

@@ -633,6 +633,14 @@ fn a_short_replace_physical_is_reported_and_drops_nothing() {
     );
 
     assert_eq!(state.mappings[&7].page_entries, vec![0x11]);
+    // The *reported* half of the name: the short payload must reach the sink
+    // by its own slug. Without this, deleting the whole 0x3c arm (the packet
+    // then falls into UnknownChildOpcode) would keep this test green.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert!(
+        log.contains("child_packet_short reason=replace_physical_short ch=2 plen=4"),
+        "a short CmdReplacePhysical must say so in the sink"
+    );
 }
 
 #[test]

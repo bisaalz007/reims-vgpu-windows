@@ -2996,6 +2996,54 @@ fn mrt_rg16float_secondary_feedback_samples_a_snapshot() {
     }
 }
 
+/// The native RGBA16Float *primary* rail, in the default suite: every Tahoe
+/// icon and Liquid Glass material renders into this format, and until now
+/// `req.primary_format` was exercised only inside the env-gated external
+/// replays. One draw covers the whole chain the rail is made of — the
+/// `PassKey::single_format` render pass, the format-keyed resident image, the
+/// half-float-sized readback, and the explicit 8-bit exit.
+#[test]
+fn rgba16float_primary_renders_native_halves_and_converts_at_the_exit() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let identity = TargetIdentity::Gva {
+        gva: 0x9a0000,
+        width: 16,
+        height: 16,
+        generation: 0,
+    };
+    let mut req = engine_req(&v, &f, 16, 16);
+    req.target_identity = Some(identity.clone());
+    req.skip_readback = true;
+    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
+    req.primary_format = Some(ash::vk::Format::R16G16B16A16_SFLOAT);
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP rgba16f_primary: {e}");
+            return;
+        }
+        Err(e) => panic!("rgba16f primary draw: {e}"),
+    }
+
+    let rb = engine::read_target(&identity).expect("read RGBA16Float primary");
+    assert_eq!(rb.format, ash::vk::Format::R16G16B16A16_SFLOAT);
+    assert_eq!(rb.pixels.len(), 16 * 16 * 8, "eight native bytes per texel");
+    // The fullscreen fragment writes float4(0.25, 0.5, 0.75, 1.0) — all four
+    // exactly representable as f16, so the native texels match bit-for-bit.
+    for texel in rb.pixels.chunks_exact(8) {
+        assert_eq!(u16::from_le_bytes([texel[0], texel[1]]), 0x3400);
+        assert_eq!(u16::from_le_bytes([texel[2], texel[3]]), 0x3800);
+        assert_eq!(u16::from_le_bytes([texel[4], texel[5]]), 0x3a00);
+        assert_eq!(u16::from_le_bytes([texel[6], texel[7]]), 0x3c00);
+    }
+    // The 8-bit exit is the one place a native frame becomes RGBA8, and its
+    // answer for these constants is pinned to the unorm values every 8-bit
+    // consumer of this frame would see.
+    let rgba = rb.try_into_rgba8().expect("explicit 8-bit exit");
+    assert_eq!(&rgba[..4], &[64, 128, 191, 255]);
+}
+
 /// Local replay of Tahoe's first coverage-mask draw. The private translated
 /// shaders and guest constants remain outside the repository; unset paths make
 /// this a no-op in the normal suite.
@@ -3045,6 +3093,13 @@ fn external_tahoe_coverage_draw_writes_finite_secondary() {
     let globals = field(&line, "frag0hex=");
     let captured_indices = field(&line, "idxhex=");
     assert!(captured_indices.len() >= 8, "four captured u16 indices");
+    // The capture logs a prefix of the index buffer, not all of it, so the
+    // full buffer is reconstructed from the draw's own arithmetic: 64 indices
+    // over a restart-separated strip is 13 quads of 4 indices with a restart
+    // between each (13 * 5 - 1 = 64), each quad's strip order being
+    // (base+1, base, base+2, base+3). The reconstruction is then held against
+    // every index byte the capture *does* carry — if the live draw's topology
+    // disagrees, this fails rather than silently replaying an invented draw.
     let mut indices = Vec::with_capacity(64 * 2);
     for quad in 0..13u16 {
         let base = quad * 4;
@@ -3056,6 +3111,12 @@ fn external_tahoe_coverage_draw_writes_finite_secondary() {
         }
     }
     assert_eq!(indices.len(), 64 * 2);
+    let overlap = captured_indices.len().min(indices.len());
+    assert_eq!(
+        &indices[..overlap],
+        &captured_indices[..overlap],
+        "reconstructed index topology must match the captured draw's own bytes"
+    );
 
     let _guard = engine_test_session();
     let primary = TargetIdentity::Surface {
@@ -3183,6 +3244,14 @@ fn external_tahoe_coverage_draw_writes_finite_secondary() {
     engine::execute_draw_request(&req).expect("replay captured coverage draw");
     let native = engine::read_target(&coverage).expect("read RG16Float coverage target");
     assert_eq!(native.format, ash::vk::Format::R16G16_SFLOAT);
+    // The target is cleared to zero, so a pipeline that silently dropped every
+    // draw would also read back all-finite. The finiteness claim only means
+    // something once the coverage pass demonstrably wrote texels.
+    let nonzero = native.pixels.iter().filter(|byte| **byte != 0).count();
+    assert!(
+        nonzero != 0,
+        "the coverage draw wrote nothing; the finiteness assertion below would be vacuous"
+    );
     let nonfinite = native
         .pixels
         .chunks_exact(2)
@@ -3374,6 +3443,13 @@ fn external_tahoe_gradient_capture_has_finite_primary_output() {
         std::fs::write(path, &native.pixels).expect("write replay output");
     }
     assert_eq!(native.format, ash::vk::Format::R16G16B16A16_SFLOAT);
+    // Cleared to zero, so all-finite is also what a fully-declined pass reads
+    // back; require the gradient to have actually landed texels first.
+    let nonzero = native.pixels.iter().filter(|byte| **byte != 0).count();
+    assert!(
+        nonzero != 0,
+        "the gradient draw wrote nothing; the finiteness assertion below would be vacuous"
+    );
     let nonfinite = native
         .pixels
         .chunks_exact(2)
