@@ -26,6 +26,7 @@ pub mod init_decline;
 mod pools;
 pub mod reason;
 mod slab;
+mod spirv_declared;
 pub mod types;
 pub mod vk_call;
 #[cfg(feature = "host-window")]
@@ -1131,6 +1132,11 @@ pub fn counter_snapshot() -> CounterSnapshot {
     snap.evicts_idle_drained = idle;
     snap.evicts_cap = cap;
     snap.evicts_recreated = recreated;
+    // Process-global rather than pools-owned: the scan is a pure function of
+    // shader content and its cache outlives any one device.
+    let (scan_hits, scan_misses) = spirv_declared::scan_stats();
+    snap.declared_scan_hits = scan_hits;
+    snap.declared_scan_misses = scan_misses;
     snap
 }
 

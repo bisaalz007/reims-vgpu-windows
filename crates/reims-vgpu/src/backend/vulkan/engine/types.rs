@@ -823,7 +823,12 @@ impl SamplerResource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+/// `Default` is Metal's own unbound-sampler state, which is what an
+/// unprovided-but-declared sampler slot must answer with: nearest filtering, no
+/// mip selection, clamp-to-edge, opaque-black border, no compare. Not a
+/// convenience — `nullDescriptor` does not cover `VK_DESCRIPTOR_TYPE_SAMPLER`,
+/// so such a slot needs a real handle and this names the state it carries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub(crate) struct SamplerStateKey {
     pub min_filter: SamplerFilter,
     pub mag_filter: SamplerFilter,

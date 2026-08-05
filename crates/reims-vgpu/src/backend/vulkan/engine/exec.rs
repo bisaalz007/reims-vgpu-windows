@@ -972,6 +972,24 @@ pub(crate) unsafe fn execute_draw_inner(
             stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
         });
     }
+    // Slots the shaders declare but this request never provided. The shader
+    // indexes them either way — Metal answers an unbound slot with zeros, which
+    // is why the guest issues the draw at all — so leaving them out of the
+    // layout is what makes the read undefined, and on this device's NVIDIA ICD
+    // undefined means garbage pixels rather than zeros. Images are written null
+    // below (`nullDescriptor`); samplers get a default-state handle, which that
+    // feature does not cover.
+    //
+    // The image half is gated on `nullDescriptor`: without the feature a null
+    // write is itself invalid usage, so on such a device the slot is left out
+    // and the older behaviour stands rather than being traded for a validation
+    // error. Samplers need no feature — they take a real default handle.
+    let declared_unprovided = add_declared_bindings(
+        &mut layout_bindings,
+        &[&req.vert_spirv, &req.frag_spirv],
+        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+        ctx.caps.null_descriptor,
+    );
     layout_bindings.sort_by_key(|b| b.binding);
     let layout_key = LayoutKey {
         bindings: layout_bindings,
@@ -1137,6 +1155,21 @@ pub(crate) unsafe fn execute_draw_inner(
     for s in &req.samplers {
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
         sampler_handles.push((s.binding, h));
+    }
+    // A declared-but-unprovided sampler cannot be written null: `nullDescriptor`
+    // does not cover `VK_DESCRIPTOR_TYPE_SAMPLER`. Default state is what Metal
+    // gives an unbound sampler, and the cache makes it one handle for all of
+    // them rather than a create per draw.
+    for (binding, kind) in &declared_unprovided {
+        if *kind == super::spirv_declared::DeclaredKind::Sampler {
+            let h = caches.get_or_create_sampler(
+                ctx,
+                &super::types::SamplerStateKey::default(),
+                counters,
+                pools,
+            )?;
+            sampler_handles.push((*binding, h));
+        }
     }
 
     phase.enter(super::draw_phase::Phase::Stage);
@@ -1761,6 +1794,23 @@ pub(crate) unsafe fn execute_draw_inner(
                     .dst_binding(super::types::COLOR_INPUT_BINDING)
                     .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
                     .image_info(std::slice::from_ref(&color_input_info)),
+            );
+        }
+        // Null writes for the declared-but-unprovided image slots added to the
+        // layout above. A descriptor left merely *unwritten* stays undefined;
+        // written null under `nullDescriptor` it reads as zeros — which is what
+        // Metal gives the guest for the same draw.
+        let null_image_info = vk::DescriptorImageInfo::default();
+        for (binding, kind) in &declared_unprovided {
+            if *kind != super::spirv_declared::DeclaredKind::SampledImage {
+                continue;
+            }
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(dset)
+                    .dst_binding(*binding)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(std::slice::from_ref(&null_image_info)),
             );
         }
         ctx.device.update_descriptor_sets(&writes, &[]);
@@ -2780,6 +2830,50 @@ fn layout_source_scope(
             DrawExecutionDecline::UnsupportedTrackedLayout { layout: other },
         )),
     }
+}
+
+/// Adds a layout entry for every image/sampler slot the shaders declare that
+/// `layout_bindings` does not already carry, and returns what was added so the
+/// descriptor writes can satisfy each one by kind.
+///
+/// Set 0 only: the engine binds one set, and a decoration naming another set is
+/// not ours to satisfy. A binding the request already provided is left alone —
+/// the provided resource is the better answer, and re-declaring it would put
+/// two entries on one binding.
+pub(super) fn add_declared_bindings(
+    layout_bindings: &mut Vec<BindingSig>,
+    modules: &[&[u32]],
+    stages: vk::ShaderStageFlags,
+    null_descriptor: bool,
+) -> Vec<(u32, super::spirv_declared::DeclaredKind)> {
+    use super::spirv_declared::{declared_descriptors_cached, DeclaredKind};
+    let mut added: Vec<(u32, DeclaredKind)> = Vec::new();
+    for words in modules {
+        for (set, binding, kind) in declared_descriptors_cached(words).iter().copied() {
+            if set != 0 || layout_bindings.iter().any(|b| b.binding == binding) {
+                continue;
+            }
+            // An image slot is only worth declaring if something defined can be
+            // written to it; a sampler always can.
+            if kind == DeclaredKind::SampledImage && !null_descriptor {
+                continue;
+            }
+            if added.iter().any(|(b, _)| *b == binding) {
+                continue;
+            }
+            let ty = match kind {
+                DeclaredKind::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+                DeclaredKind::Sampler => vk::DescriptorType::SAMPLER,
+            };
+            layout_bindings.push(BindingSig {
+                binding,
+                ty: ty.as_raw() as u32,
+                stages: stages.as_raw(),
+            });
+            added.push((binding, kind));
+        }
+    }
+    added
 }
 
 #[cfg(test)]

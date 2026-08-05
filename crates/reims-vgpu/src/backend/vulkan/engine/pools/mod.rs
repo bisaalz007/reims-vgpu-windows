@@ -131,6 +131,9 @@ pub(crate) struct ResourcePools {
     /// and a target the guest never rendered into present identically as an
     /// absent entry, and they are different defects with different repairs.
     reclaim_history: VecDeque<(TargetIdentity, ResidentReclaim)>,
+    /// Source of [`ResidentTargetSlot::use_seq`]. Monotonic for the life of the
+    /// pools; at one bump per bind it cannot wrap in any realistic session.
+    use_clock: u64,
     /// Cumulative registry removals by path, surfaced through
     /// `engine::counter_snapshot` / the per-second `engine_delta` line. Plain
     /// u64 — `ResourcePools` is only ever touched under the engine lock.
@@ -577,6 +580,15 @@ pub(crate) struct ResidentTargetSlot {
     /// guest lifetime, while an actively-drawn target (touched every frame) never
     /// ages out.
     pub last_touch_ms: u64,
+    /// Total order over uses, from [`ResourcePools::use_clock`].
+    ///
+    /// [`Self::last_touch_ms`] comes from the ~244 Hz poll heartbeat, so every
+    /// use between two ticks carries the same millisecond — and with many draws
+    /// per tick the minimum is routinely a tie. The capacity walk's tie-break
+    /// is creation order, which is exactly the session-long backdrop it must
+    /// stop taking, so choosing on the clock alone reinstates the defect the
+    /// LRU walk exists to fix. This counter separates two uses inside one tick.
+    pub use_seq: u64,
 }
 
 /// Which path removed a live registry entry.

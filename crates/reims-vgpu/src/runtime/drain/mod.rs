@@ -3420,7 +3420,7 @@ fn emit_engine_delta() {
          sampled_cache_hits={} sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} evicts_idle={} evicts_cap={} \
-         evicts_recreated={} desc_pool_grow={} gen_mismatch={}",
+         evicts_recreated={} declared_scan_hits={} declared_scan_misses={}          desc_pool_grow={} gen_mismatch={}",
         d.creates,
         d.allocs,
         d.batch_opens,
@@ -3448,6 +3448,8 @@ fn emit_engine_delta() {
         d.evicts_idle_drained,
         d.evicts_cap,
         d.evicts_recreated,
+        d.declared_scan_hits,
+        d.declared_scan_misses,
         d.desc_pool_grow,
         d.gen_mismatch,
     ));

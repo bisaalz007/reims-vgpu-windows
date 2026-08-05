@@ -273,6 +273,12 @@ engine_counters! {
         evicts_idle_drained,
         evicts_cap,
         evicts_recreated,
+        /// Declared-descriptor scan cache (`spirv_declared`). Liquid Glass is a
+        /// chain of many small passes over a handful of modules, so a miss rate
+        /// that does not fall to ~zero after warm-up means the scan is on the
+        /// hot path — which is the thing the digest key exists to prevent.
+        declared_scan_hits,
+        declared_scan_misses,
     }
 }
 /// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at

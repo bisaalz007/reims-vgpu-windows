@@ -88,6 +88,15 @@ pub struct HostGpuCaps {
     /// Device `apiVersion` as reported, for the selection log line.
     pub device_api_version: u32,
     pub device_type: vk::PhysicalDeviceType,
+    /// `VK_EXT_robustness2`'s `nullDescriptor` was queried supported and
+    /// enabled at device creation.
+    ///
+    /// Gate for writing a *null* descriptor into a slot the shader declares and
+    /// the guest never bound. With the feature, such a read is defined as zeros
+    /// — the Metal behaviour the guest expects. Without it, writing null is
+    /// itself invalid usage, so the slot is left out and the older (undefined,
+    /// on NVIDIA garbage-valued) behaviour stands rather than being made worse.
+    pub null_descriptor: bool,
 }
 
 impl HostGpuCaps {
@@ -143,6 +152,7 @@ mod tests {
             portability_subset: false,
             device_api_version: api,
             device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
+            null_descriptor: false,
         }
     }
 

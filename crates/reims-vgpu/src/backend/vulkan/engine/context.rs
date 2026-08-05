@@ -522,6 +522,30 @@ impl DeviceContext {
         let mut en8 = features.enabled_8bit_storage();
         let mut enfi = features.enabled_float16_int8();
         let mut endemote = features.enabled_demote_to_helper();
+        // A guest draw may name fewer textures than its shader reads. Metal
+        // answers such a slot with zeros, which is why the guest issues the
+        // draw at all; Vulkan calls an unwritten descriptor undefined, and this
+        // rail's NVIDIA ICD returns garbage pixels for it. `nullDescriptor`
+        // makes a null-written descriptor read as zeros, i.e. the behaviour the
+        // guest already expects — so the layout completion in `exec` has
+        // something defined to write. Optional: a device without the extension
+        // simply keeps the older undefined behaviour rather than failing to
+        // start, and the census below says which it is.
+        // Gated on the *feature*, not the extension: robustness2's three
+        // features are independently optional, so a device may expose the
+        // extension and still refuse `nullDescriptor` — enabling it unqueried
+        // would fail device creation outright.
+        let null_descriptor = has_device_extension(vk::EXT_ROBUSTNESS2_NAME) && {
+            let mut probe = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut probe);
+            instance.get_physical_device_features2(pd, &mut features2);
+            probe.null_descriptor == vk::TRUE
+        };
+        if null_descriptor {
+            enabled_device_extensions.push(vk::EXT_ROBUSTNESS2_NAME.as_ptr());
+        }
+        let mut enabled_robustness2 =
+            vk::PhysicalDeviceRobustness2FeaturesEXT::default().null_descriptor(null_descriptor);
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_features(&enabled)
@@ -544,6 +568,14 @@ impl DeviceContext {
         if features.shader_demote_to_helper_invocation {
             dci = dci.push_next(&mut endemote);
         }
+        if null_descriptor {
+            dci = dci.push_next(&mut enabled_robustness2);
+        }
+        crate::observe::off(format!(
+            "vk_device_features null_descriptor={} (declared-but-unbound descriptor slots read \
+             as zeros when 1, undefined when 0)",
+            u8::from(null_descriptor)
+        ));
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
@@ -555,6 +587,7 @@ impl DeviceContext {
             portability_subset,
             device_api_version: props.api_version,
             device_type: props.device_type,
+            null_descriptor,
         };
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()

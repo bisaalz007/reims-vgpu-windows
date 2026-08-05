@@ -1376,6 +1376,10 @@ impl VkState {
             portability_subset: has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME),
             device_api_version: device_props.api_version,
             device_type: device_props.device_type,
+            // The window presenter binds no guest shader, so no descriptor slot
+            // here is ever completed from a SPIR-V scan; this summary of the
+            // *presenting* device does not need the engine's answer.
+            null_descriptor: false,
         };
         crate::observe::off(format!(
             "host_window_{}",

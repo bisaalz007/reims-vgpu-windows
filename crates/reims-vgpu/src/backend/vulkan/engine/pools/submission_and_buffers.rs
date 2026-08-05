@@ -39,6 +39,7 @@ impl ResourcePools {
             registry: HashMap::new(),
             registry_order: VecDeque::new(),
             reclaim_history: VecDeque::new(),
+            use_clock: 0,
             reclaims_idle: 0,
             reclaims_cap: 0,
             reclaims_recreated: 0,
@@ -514,18 +515,23 @@ impl ResourcePools {
     /// `DeviceContext` to dispose what it evicts, and the choice — the part
     /// with the policy in it — is worth testing without a GPU.
     ///
-    /// Iterates `registry_order` rather than the map so the result is
-    /// deterministic: `min_by_key` returns the first minimum, so equal stamps
-    /// fall to the oldest-created entry — which is what this walk chose for
-    /// every entry before it consulted recency at all. O(n) per eviction rather
-    /// than O(1) amortised, and evictions are rare next to binds — the cost
-    /// this avoids paying is a promotion on every sampled bind of every draw.
+    /// Ordered by [`ResidentTargetSlot::use_seq`], not by the wall clock. The
+    /// clock is fed from the ~244 Hz poll heartbeat, so every use between two
+    /// ticks carries the same millisecond and the minimum is routinely a tie;
+    /// `min_by_key` breaks a tie toward the first entry in insertion order,
+    /// which is the session-long backdrop this walk exists to stop taking. The
+    /// counter gives uses a total order, so a resident read this tick outranks
+    /// one last read several ticks ago even though the clock never moved.
+    ///
+    /// O(n) per eviction rather than O(1) amortised, and evictions are rare
+    /// next to binds — the cost this avoids paying is a deque promotion on
+    /// every sampled bind of every draw.
     fn cap_eviction_victim(&self, protect: Option<&TargetIdentity>) -> Option<TargetIdentity> {
         self.registry_order
             .iter()
             .filter_map(|k| self.registry.get(k).map(|slot| (k, slot)))
             .filter(|(k, slot)| slot.pin_count == 0 && protect != Some(k))
-            .min_by_key(|(_, slot)| slot.last_touch_ms)
+            .min_by_key(|(_, slot)| slot.use_seq)
             .map(|(k, _)| k.clone())
     }
 
@@ -545,8 +551,11 @@ impl ResourcePools {
     /// held for the life of the boot.
     pub(crate) fn registry_note_sampled_use(&mut self, identity: &TargetIdentity) {
         let touch = self.idle_clock_ms;
+        self.use_clock += 1;
+        let seq = self.use_clock;
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.last_touch_ms = touch;
+            slot.use_seq = seq;
         }
     }
 
