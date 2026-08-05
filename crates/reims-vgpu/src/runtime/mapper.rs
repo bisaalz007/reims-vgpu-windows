@@ -1294,26 +1294,44 @@ fn mapping_page_gpas_impl<H: HostMemory + HostOps>(
         return None;
     }
     refresh_object_list_gpa_pages(state, host);
+    // A candidate object-list hit is re-translated before it is believed. The
+    // cache is keyed on the task's *declaration*, and a guest re-points the
+    // pages under an unchanged declaration all the time (that is what
+    // MapMemory2 and ReplacePhysical do), so a cached page set can name pages
+    // the list no longer occupies — and refusing on those is how a live
+    // surface loses its scanout read. Collisions are meant to be rare, so
+    // paying a fresh walk only when one is claimed costs nothing on the
+    // ordinary path and removes staleness from the answer entirely.
     if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
-        // One detail line per (mapping, owner-class): which task claims the
-        // colliding span and how it was declared. The refusal line alone
-        // cannot separate "the guest really aliased a surface over its object
-        // list" from "our task entry still describes a span the guest has
-        // recycled", and that span's declaration is the evidence.
+        let owner = if owner == "task_object_list" {
+            match reverify_object_list_collision(state, host, &gpas) {
+                Some(fresh) => fresh,
+                None => {
+                    crate::runtime::drain::note_store_route("control_collision_stale_cleared");
+                    return Some(gpas);
+                }
+            }
+        } else {
+            (gpa, owner)
+        };
+        let (gpa, owner) = owner;
         if owner == "task_object_list"
             && crate::observe::first_sight("control_collision_list_detail", u64::from(mapping_id))
         {
-            for (tid, task) in state.tasks.iter().enumerate() {
-                if !task.active || task.object_list_pfn == 0 {
-                    continue;
-                }
-                let first = (task.object_list_pfn as u64) << state.page_shift;
-                let bytes = (task.object_list_count as u64).saturating_mul(16);
-                let end = first.saturating_add(bytes);
-                if gpa >= first && gpa < end.saturating_add(state.page_size() - 1) {
+            // Which task's list holds the page, and how many pages that list
+            // was translated to. The refusal alone cannot separate "the guest
+            // really put a surface over its own object list" from "this device
+            // is claiming pages the list no longer occupies", and the page
+            // count next to the declaration is what tells them apart.
+            for (tid, list) in &state.object_list_gpa_pages {
+                if list.gpas.binary_search(&gpa).is_ok() {
+                    let task = &state.tasks[*tid as usize];
                     crate::observe::fail(format!(
-                        "control_collision_detail mid={mapping_id} gpa={gpa:#x} task={tid} list_pfn={:#x} count={} span={first:#x}..{end:#x}",
-                        task.object_list_pfn, task.object_list_count
+                        "control_collision_detail mid={mapping_id} gpa={gpa:#x} task={tid}                          list_pfn={:#x} count={} pages={} complete={}",
+                        task.object_list_pfn,
+                        task.object_list_count,
+                        list.gpas.len(),
+                        u8::from(list.complete)
                     ));
                 }
             }
@@ -1335,6 +1353,32 @@ fn mapping_page_gpas_impl<H: HostMemory + HostOps>(
         return None;
     }
     Some(gpas)
+}
+
+/// Re-translate every active task's object list and re-test `gpas` against the
+/// freshly walked pages. `None` means nothing collides any more — the cached
+/// claim was stale — and the caller lets the surface through.
+///
+/// Returns the same `(gpa, owner)` shape the cached pass does so the refusal
+/// line is identical whichever pass produced it.
+fn reverify_object_list_collision<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    gpas: &[u64],
+) -> Option<(u64, &'static str)> {
+    state.object_list_gpa_pages.clear();
+    refresh_object_list_gpa_pages(state, host);
+    let page = state.page_size();
+    let mut pages: Vec<u64> = gpas.iter().map(|&gpa| gpa & !(page - 1)).collect();
+    pages.sort_unstable();
+    for list in state.object_list_gpa_pages.values() {
+        for &gpa in &list.gpas {
+            if pages.binary_search(&gpa).is_ok() {
+                return Some((gpa, "task_object_list"));
+            }
+        }
+    }
+    None
 }
 
 /// Translate every active task's object-list GVA span to guest physical pages,
@@ -2836,6 +2880,60 @@ mod tests {
     /// mapping's pages resolve (logged), while the strict form every write
     /// consumer uses keeps refusing the same mapping unconditionally — there
     /// is no parameter or variable that lets a write cross a collision.
+    /// A cached page set is not evidence. The guest re-points the pages under
+    /// an unchanged object-list declaration all the time — that is what
+    /// MapMemory2 and ReplacePhysical do — so a claim made from the cache is
+    /// re-translated before a surface is refused on it. Without that, a page
+    /// the list has *left* keeps taking the surface that now owns it off the
+    /// screen (`scanout_paint_mapping reason=capture_multi_read_failed`).
+    #[test]
+    fn a_stale_object_list_claim_is_re_translated_before_it_refuses() {
+        use crate::contract::endian::st32;
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let shift = crate::model::PAGE_SHIFT_X86;
+        // The list starts out on physical page 0x551.
+        assert_eq!(
+            task1_object_list_at(&mut state, &mut host, 0x50, 0x551, 256),
+            0x551_000
+        );
+        assert!(state.attach_mapping_internal(7, KVA));
+        {
+            let m = state.mappings.get_mut(&7).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![(0x551 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        // While the list is really there, the surface is refused.
+        assert_eq!(mapping_page_gpas(&mut state, &mut host, 7), None);
+
+        // The guest re-points GVA page 0x50 at a different physical page. The
+        // declaration — pfn, count, directory — has not changed, so the cache
+        // still names 0x551.
+        let root_gpa = (0x41u64) << shift;
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 0x999);
+        assert!(host.write_gpa(root_gpa + 0x50 * 4, &pte).is_ok());
+        host.map_range((0x999u64) << shift, 0x1000, 0);
+        assert_eq!(
+            state.object_list_gpa_pages.get(&1).map(|l| l.gpas.clone()),
+            Some(vec![0x551_000]),
+            "precondition: the cache still claims the page the list has left"
+        );
+
+        // The surface now owns 0x551 outright and must resolve.
+        assert_eq!(
+            mapping_page_gpas(&mut state, &mut host, 7),
+            Some(vec![0x551_000]),
+            "a claim the fresh walk does not support must not refuse the surface"
+        );
+        // …and the list's new page is claimed instead.
+        assert!(state
+            .object_list_gpa_pages
+            .get(&1)
+            .is_some_and(|l| l.gpas == vec![0x999_000]));
+    }
+
     #[test]
     fn a_collision_read_through_never_extends_to_the_write_rail() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
