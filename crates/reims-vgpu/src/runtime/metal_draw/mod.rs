@@ -3823,6 +3823,97 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
+    let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
+    let need = rgba_row.saturating_mul(height as usize);
+    if rgba.len() < need {
+        return Err(MemError::BadArgs);
+    }
+    write_gva_rows_within(
+        state,
+        host,
+        task_id,
+        gva,
+        width,
+        height,
+        bpr,
+        format,
+        allowed,
+        |y, row| {
+            pixel_format::convert_rgba8_to_row(
+                format,
+                &rgba[y * rgba_row..y * rgba_row + rgba_row],
+                width,
+                row,
+            )
+        },
+    )
+}
+
+/// [`write_gva_rgba8_within`] for a frame already in the target's native texel
+/// layout (tight rows) — the integer render targets, whose texels have no
+/// RGBA8 form at all. The bytes land verbatim; only geometry is checked.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the writer mirrors the target GVA and native row geometry"
+)]
+pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    native: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
+    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
+        return Err(MemError::BadArgs);
+    };
+    let tight = tight as usize;
+    if native.len() < tight.saturating_mul(height as usize) {
+        return Err(MemError::BadArgs);
+    }
+    write_gva_rows_within(
+        state,
+        host,
+        task_id,
+        gva,
+        width,
+        height,
+        bpr,
+        format,
+        allowed,
+        |y, row| {
+            row.copy_from_slice(&native[y * tight..(y + 1) * tight]);
+            true
+        },
+    )
+}
+
+/// Shared guest-write walk for the two row vocabularies above: `row_at` fills
+/// one tight native row for row `y`, and everything about *where* the bytes
+/// go — the fresh PT walk, the window bound, the fragmented fallback — is
+/// written once here rather than kept in two copies that drift.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the writer mirrors the target GVA and native row geometry"
+)]
+fn write_gva_rows_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+    mut row_at: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
     if gva == 0 || width == 0 || height == 0 || bpr == 0 {
         return Err(MemError::BadArgs);
     }
@@ -3830,11 +3921,6 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     };
     if bpr < tight {
-        return Err(MemError::BadArgs);
-    }
-    let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    let need = rgba_row.saturating_mul(height as usize);
-    if rgba.len() < need {
         return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
@@ -3849,8 +3935,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut res = Ok(());
         for y in 0..height as usize {
-            let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
-            if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
+            if !row_at(y, &mut row) {
                 res = Err(MemError::BadArgs);
                 break;
             }
@@ -3869,8 +3954,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     }
     // Fragmented GVA: multi-import each converted row via write_span.
     for y in 0..height as usize {
-        let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
-        if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
+        if !row_at(y, &mut row) {
             return Err(MemError::BadArgs);
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
@@ -3880,7 +3964,7 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
                 "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
-                 row={y} rowlen={:#x} (rgba8 multi)",
+                 row={y} rowlen={:#x} (rows multi)",
                 row.len()
             ));
             return Err(err);

@@ -36,6 +36,27 @@ fn encode_primary_seed<'a>(
     if direct {
         return Ok(Cow::Borrowed(source));
     }
+    if matches!(order, SeedOrder::Native) {
+        // Already in the attachment's texel layout (integer targets have no
+        // other form); only the byte count is checked, against the format's
+        // own texel width so no 8-bit vocabulary is consulted.
+        let texel = crate::backend::vulkan::translate::pixel::bytes_per_texel(format).ok_or({
+            DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported { format })
+        })?;
+        let need = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(texel as usize);
+        if source.len() < need {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::PrimaryColorConversionFailed {
+                    format,
+                    width,
+                    height,
+                },
+            ));
+        }
+        return Ok(Cow::Borrowed(&source[..need]));
+    }
     let mtl = crate::backend::vulkan::translate::pixel::color_mtl_for_vk(format).ok_or({
         DrawError::DrawExecution(DrawExecutionDecline::PrimaryColorFormatUnsupported { format })
     })?;
@@ -2832,11 +2853,11 @@ mod tests {
         assert_eq!(back, rgba);
     }
 
-    /// An RG16Uint primary target has no CPU seed rail on purpose: a 16-bit
-    /// integer coordinate does not survive an RGBA8 round trip, so the seed
-    /// declines by name rather than quietly clamping coordinate data. GPU
-    /// resident LOAD (`seed_from_target`) is the prior-content path for these
-    /// targets.
+    /// An RG16Uint primary target has no *8-bit* seed rail on purpose: a
+    /// 16-bit integer coordinate does not survive an RGBA8 round trip, so an
+    /// RGBA8-order seed declines by name rather than quietly clamping
+    /// coordinate data. The prior-content paths for these targets are GPU
+    /// resident LOAD (`seed_from_target`) and the native-order seed below.
     #[test]
     fn rg16uint_seed_declines_rather_than_degrading_integer_data() {
         let rgba = [40, 90, 200, 128];
@@ -2852,6 +2873,24 @@ mod tests {
                 .contains("vk_draw_exec_primary_color_format_unsupported"),
             "the decline names the rail: {err}"
         );
+    }
+
+    /// A native-order seed passes an integer target's texels through verbatim
+    /// — the rail the guest-page prior-content read and the integer clear tile
+    /// use — and a short buffer declines rather than uploading a truncated
+    /// frame.
+    #[test]
+    fn rg16uint_native_seed_passes_through_verbatim() {
+        let format = crate::backend::vulkan::translate::pixel::color_attachment(
+            crate::contract::pixel_format::MTL_FORMAT_RG16_UINT,
+        )
+        .expect("RG16Uint is color-attachable")
+        .0;
+        let native = [0x2c, 0x01, 0xff, 0xff, 7, 0, 0, 0];
+        let encoded = encode_primary_seed(&native, SeedOrder::Native, format, 2, 1)
+            .expect("native seed is a pass-through");
+        assert_eq!(encoded.as_ref(), &native[..]);
+        assert!(encode_primary_seed(&native[..6], SeedOrder::Native, format, 2, 1).is_err());
     }
 
     #[test]

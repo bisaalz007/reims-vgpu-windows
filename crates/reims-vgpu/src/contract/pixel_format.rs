@@ -74,13 +74,13 @@ pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
 /// operands only. So it needs no filtering, which matters because Vulkan does
 /// not guarantee linear filtering for integer formats.
 ///
-/// Deliberately absent from [`render_target_class`], [`texel_to_rgba8`] and
-/// [`rgba8_to_texel`]. Those rails carry colour through 8-bit unorm LUTs, and a
-/// coordinate stored in 16 unsigned bits does not survive that — it would come
-/// back quantized and reinterpreted as a normalized fraction. Declining a
-/// colour-target bind by name is the honest answer until the render rail can
-/// carry integer texels; producing wrong pixels would be worse than producing
-/// none.
+/// Renderable ([`render_target_class`] carries it as `Rg16Uint`) but
+/// deliberately absent from [`texel_to_rgba8`] and [`rgba8_to_texel`]: those
+/// rails carry colour through 8-bit unorm LUTs, and a coordinate stored in 16
+/// unsigned bits does not survive that — it would come back quantized and
+/// reinterpreted as a normalized fraction. Prior content and clears for these
+/// targets travel natively ([`render_target_is_integer`] /
+/// [`integer_clear_texel`]); the 8-bit conversions keep declining by name.
 pub const MTL_FORMAT_RG16_UINT: u16 = 0x3f;
 pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
 pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
@@ -764,6 +764,38 @@ pub fn render_target_class(format: u16) -> Option<(RenderTargetClass, u32)> {
 
 pub fn render_target_bpp(format: u16) -> Option<u32> {
     render_target_class(format).map(|(_, bpp)| bpp)
+}
+
+/// Whether a renderable format carries *integer* channels — the formats whose
+/// texels deliberately have no 8-bit CPU conversion (`texel_to_rgba8` /
+/// `rgba8_to_texel` decline them): a 16-bit coordinate does not survive an
+/// RGBA8 round trip. Prior content for such a target must travel natively.
+pub fn render_target_is_integer(format: u16) -> bool {
+    matches!(format, MTL_FORMAT_RG16_UINT)
+}
+
+/// One native texel for an integer render target cleared to `clear`.
+///
+/// `MTLClearColor` carries doubles for every format; on an integer attachment
+/// each channel is the integer value itself, saturated to the channel's range
+/// (a coordinate map cleared to 0 stays 0, not "0.0 as unorm"). Returns false
+/// for a format this vocabulary does not cover.
+pub fn integer_clear_texel(format: u16, clear: &[f64; 4], dst: &mut [u8]) -> bool {
+    match format {
+        MTL_FORMAT_RG16_UINT if dst.len() >= 4 => {
+            let ch = |v: f64| -> u16 {
+                if v.is_finite() {
+                    v.clamp(0.0, f64::from(u16::MAX)) as u16
+                } else {
+                    0
+                }
+            };
+            st16(&mut dst[0..2], ch(clear[0]));
+            st16(&mut dst[2..4], ch(clear[1]));
+            true
+        }
+        _ => false,
+    }
 }
 
 pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
@@ -1614,6 +1646,32 @@ mod tests {
         assert_eq!(back[1], 90);
         assert_eq!(back[2], 0);
         assert_eq!(back[3], 255);
+    }
+
+    /// An integer render target's clear color is the integer value itself,
+    /// saturated to the channel range — not a unorm mapping — and formats
+    /// outside the integer set refuse rather than guessing.
+    #[test]
+    fn integer_clear_texel_carries_saturated_channel_values() {
+        assert!(render_target_is_integer(MTL_FORMAT_RG16_UINT));
+        assert!(!render_target_is_integer(MTL_FORMAT_RGBA16_FLOAT));
+        let mut texel = [0u8; 4];
+        assert!(integer_clear_texel(
+            MTL_FORMAT_RG16_UINT,
+            &[300.0, 70000.0, 5.0, 1.0],
+            &mut texel
+        ));
+        assert_eq!(&texel[0..2], &300u16.to_le_bytes());
+        assert_eq!(
+            &texel[2..4],
+            &u16::MAX.to_le_bytes(),
+            "saturates, not wraps"
+        );
+        assert!(!integer_clear_texel(
+            MTL_FORMAT_RGBA8_UNORM,
+            &[0.0; 4],
+            &mut texel
+        ));
     }
 
     /// Metal color-renderable 8-bit + f16 set used as Reims VGPU pass attachments.

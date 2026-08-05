@@ -639,22 +639,8 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         height: entry.height,
         generation: 0,
     };
-    // `into_rgba8` rather than the raw bytes: a GVA resident is RGBA today, so
-    // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
-    // semantic RGBA and the readback states its own order. Asserting the order
-    // here instead would be the caller writing a fact it did not read.
-    let rgba = match crate::backend::vulkan::engine::read_target(&identity) {
-        Ok(rb) => match rb.try_into_rgba8() {
-            Ok(pixels) => pixels,
-            Err(e) => {
-                crate::backend::vulkan::engine::unpin_resident_target(&identity);
-                crate::observe::fail(format!(
-                    "deferred_flush_lost kind=gva gva={gva:#x} {}x{} fmt={:#x} trigger={trigger} err={e}",
-                    entry.width, entry.height, entry.format
-                ));
-                return false;
-            }
-        },
+    let rb = match crate::backend::vulkan::engine::read_target(&identity) {
+        Ok(rb) => rb,
         Err(e) => {
             crate::backend::vulkan::engine::unpin_resident_target(&identity);
             crate::observe::fail(format!(
@@ -665,6 +651,29 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         }
     };
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
+    // An integer window's texels have no RGBA8 form (`try_into_rgba8` declines
+    // them by name); the frame lands in the guest's own layout instead, and
+    // the 8-bit caches — which could only hold a clamped picture of a
+    // coordinate map — are deliberately not fed. The LOAD seed for these
+    // targets reads the guest pages natively, so nothing consults those
+    // caches for them either.
+    if crate::contract::pixel_format::render_target_is_integer(entry.format) {
+        return flush_gva_one_native(state, host, gva, entry, guest_write, trigger, rb, started);
+    }
+    // `into_rgba8` rather than the raw bytes: a GVA resident is RGBA today, so
+    // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
+    // semantic RGBA and the readback states its own order. Asserting the order
+    // here instead would be the caller writing a fact it did not read.
+    let rgba = match rb.try_into_rgba8() {
+        Ok(pixels) => pixels,
+        Err(e) => {
+            crate::observe::fail(format!(
+                "deferred_flush_lost kind=gva gva={gva:#x} {}x{} fmt={:#x} trigger={trigger} err={e}",
+                entry.width, entry.height, entry.format
+            ));
+            return false;
+        }
+    };
     let mut guest = "skip";
     if guest_write {
         // Reported, not skipped. This used to be `skip_uncovered`, which dropped
@@ -750,6 +759,77 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         entry.height,
         entry.format,
         rgba.len(),
+        started.elapsed().as_micros()
+    ));
+    guest != "write_fail"
+}
+
+/// [`flush_gva_one`]'s landing for an integer-format window: the readback is
+/// already in the guest's texel layout and goes to the guest rows verbatim.
+/// Same page-drift guard and write bound as the RGBA8 arm; no 8-bit cache
+/// store, because a clamped copy of a coordinate map is worse than no entry
+/// (the LOAD seed for these targets reads the guest pages natively instead).
+#[cfg(feature = "backend-vulkan")]
+#[allow(clippy::too_many_arguments)]
+fn flush_gva_one_native<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+    guest_write: bool,
+    trigger: &str,
+    rb: crate::backend::vulkan::engine::TargetReadback,
+    started: std::time::Instant,
+) -> bool {
+    let native = rb.pixels;
+    let mut guest = "skip";
+    if guest_write {
+        crate::runtime::gva_mem::report_undeclared_write(
+            state,
+            host,
+            entry.task_id,
+            gva,
+            entry.span(),
+            "gva_deferred_flush",
+        );
+    }
+    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger, "guest=refused") {
+        guest = "skip_drift";
+    } else if guest_write {
+        guest = match crate::runtime::metal_draw::write_gva_native_within(
+            state,
+            host,
+            entry.task_id,
+            gva,
+            entry.width,
+            entry.height,
+            entry.row_stride,
+            entry.format,
+            &native,
+            Some(&entry.pages),
+        ) {
+            Ok(()) => "written",
+            Err(err) if err.is_guest_teardown() => "unmapped",
+            Err(err) => {
+                crate::observe::Emit::decline("deferred_flush_lost", &err)
+                    .field("kind", "gva_native")
+                    .field("gva", format!("{gva:#x}"))
+                    .field("dims", format!("{}x{}", entry.width, entry.height))
+                    .field("bpr", entry.row_stride)
+                    .field("fmt", format!("{:#x}", entry.format))
+                    .field("trigger", trigger)
+                    .fail();
+                "write_fail"
+            }
+        };
+    }
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::observe::line(format!(
+        "gva_deferred_flush gva={gva:#x} {}x{} fmt={:#x} guest={guest} trigger={trigger} bytes={} us={} native=1",
+        entry.width,
+        entry.height,
+        entry.format,
+        native.len(),
         started.elapsed().as_micros()
     ));
     guest != "write_fail"

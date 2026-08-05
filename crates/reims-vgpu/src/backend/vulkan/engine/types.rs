@@ -1221,6 +1221,13 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
+    /// The attachment's own native texel layout, tight rows — no conversion.
+    ///
+    /// Integer attachments (RG16Uint) have no 8-bit form at all: their prior
+    /// content is read out of guest memory in the layout the pass will render
+    /// over, and `encode_primary_seed` passes it through after checking only
+    /// the byte count against the format's texel width.
+    Native,
 }
 
 /// Color attachment load action for resident targets.

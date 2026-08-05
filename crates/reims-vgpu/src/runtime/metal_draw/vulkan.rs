@@ -5630,8 +5630,92 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // Resident target carries the chain; no CPU seed bytes.
                 }
                 x if x == PASS_LOAD_ACTION_CLEAR => {
-                    target_rgba8 =
-                        Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
+                    if crate::contract::pixel_format::render_target_is_integer(c0.format) {
+                        // The RGBA8 solid below cannot express an integer
+                        // clear (and `encode_primary_seed` would decline it
+                        // by name); tile the native texel instead.
+                        let bpp = crate::contract::pixel_format::bytes_per_pixel(c0.format)
+                            .unwrap_or(0) as usize;
+                        let mut texel = [0u8; 16];
+                        if bpp != 0
+                            && bpp <= texel.len()
+                            && crate::contract::pixel_format::integer_clear_texel(
+                                c0.format,
+                                &c0.clear_color,
+                                &mut texel[..bpp],
+                            )
+                        {
+                            let mut native = vec![0u8; (w as usize) * (h as usize) * bpp];
+                            for px in native.chunks_exact_mut(bpp) {
+                                px.copy_from_slice(&texel[..bpp]);
+                            }
+                            target_rgba8 = Some(std::sync::Arc::new(native));
+                            seed_order = crate::backend::vulkan::engine::SeedOrder::Native;
+                        }
+                    } else {
+                        target_rgba8 =
+                            Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
+                    }
+                }
+                x if x == PASS_LOAD_ACTION_LOAD
+                    && crate::contract::pixel_format::render_target_is_integer(c0.format) =>
+                {
+                    // An integer attachment's prior content has no 8-bit form
+                    // (`texel_to_rgba8` declines it — a 16-bit coordinate does
+                    // not survive an RGBA8 round trip), so none of the RGBA8/
+                    // BGRA8 doors below may answer. The only faithful seed is
+                    // the guest pages' own native texels, read in the layout
+                    // the pass renders over. A failed read leaves the seed
+                    // empty and the outcome census says so, rather than a
+                    // clamped picture arming the next frame to load garbage.
+                    let mut seed_door = "native_guest_unread";
+                    if c0.target_gva != 0 && w != 0 && h != 0 {
+                        // Land any deferred Store over this address first, so
+                        // the read observes the deferred frame's bytes.
+                        if state.gva_deferred_flush.contains_key(&c0.target_gva) {
+                            crate::runtime::storage_flush::flush_gva_exact(
+                                state,
+                                host,
+                                c0.target_gva,
+                                true,
+                                "load_seed_native",
+                            );
+                        }
+                        let tight = crate::contract::pixel_format::tight_row_bytes(w, c0.format)
+                            .unwrap_or(0) as usize;
+                        let stride = if c0.row_stride != 0 {
+                            c0.row_stride as u64
+                        } else {
+                            tight as u64
+                        };
+                        if tight != 0 && stride >= tight as u64 {
+                            let mut native = vec![0u8; tight * h as usize];
+                            let page_shift = state.page_shift;
+                            let mut ok = true;
+                            for y in 0..h as usize {
+                                let row_gva = c0.target_gva + (y as u64) * stride;
+                                if crate::runtime::gva_mem::read_task_gva_by_id(
+                                    host,
+                                    &state.tasks,
+                                    req.task_id,
+                                    row_gva,
+                                    &mut native[y * tight..(y + 1) * tight],
+                                    page_shift,
+                                )
+                                .is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                seed_door = "native_guest";
+                                target_rgba8 = Some(std::sync::Arc::new(native));
+                                seed_order = crate::backend::vulkan::engine::SeedOrder::Native;
+                            }
+                        }
+                    }
+                    note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
                 }
                 x if x == PASS_LOAD_ACTION_LOAD => {
                     // Which door this pass took, so a pass that ends with no
