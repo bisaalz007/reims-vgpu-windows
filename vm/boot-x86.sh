@@ -562,8 +562,36 @@ if [ -z "${CPU_PARAVIRT:-}" ]; then
   esac
 fi
 
+# Suspend-to-RAM is a one-way trip under WHPX, so on that accelerator the guest
+# is not offered it.
+#
+# Measured on this host: macOS idles into S3, QEMU reports `VM status: paused
+# (suspended)`, and the VM never comes back. `system_wakeup` is accepted — the
+# status drops to plain `paused` — but the vCPUs then stop with
+# `WHPX: Unexpected VP exit code 4` (`InvalidVpRegisterValue`) at the resume
+# vector, and `cont` cannot restart them. So a single idle timeout ends the
+# session, and it reads as a device hang: the host window keeps its last frame
+# and nothing revives it.
+#
+# `disable_s3` reaches the guest through fw_cfg, which is how the firmware
+# decides whether to publish `_S3` at all, so the guest never attempts the
+# transition rather than attempting it and dying. AGENTS.md records an earlier
+# reading where taking S3 away appeared to make exit-4 *more* likely during AP
+# startup; that is a different trigger from this one, and it is not a reason to
+# leave a guaranteed unrecoverable stop in the default path. Set
+# `REIMS_VGPU_ALLOW_S3=1` to restore the old behaviour and A/B it.
+#
+# KVM resumes from S3 correctly, so the Linux rail is left alone.
+S3_ARGS=()
+if [ "$ACCEL" = "whpx" ] && [ -z "${REIMS_VGPU_ALLOW_S3:-}" ]; then
+  S3_ARGS=(-global ICH9-LPC.disable_s3=1)
+  echo "boot-x86.sh: S3 disabled (WHPX cannot resume a vCPU from suspend-to-RAM;" \
+       "set REIMS_VGPU_ALLOW_S3=1 to re-offer it)" >&2
+fi
+
 QEMU_ARGS=(
   -accel "$ACCEL"
+  "${S3_ARGS[@]}"
   -m "$RAM"
   -cpu "${CPU_MODEL},-hle,-rtm,${CPU_PARAVIRT},vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
   -machine q35

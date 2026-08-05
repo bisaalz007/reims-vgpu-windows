@@ -114,6 +114,21 @@ pub fn flush_all_windows_before_fence<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
 ) {
+    // How much this helper actually lands, per stamp and per second.
+    //
+    // The flush rail measured 344 `read_target` calls and 332 MB/s of GPU→host
+    // readback per second on a driven boot — 41% of the drain worker — and the
+    // count of *flushes* alone cannot say whether that is one landing per stamp
+    // or a whole armed set re-landed at every stamp. Those want opposite fixes:
+    // the first is the deferral working as designed and the cost is inherent,
+    // the second is the deferral having been turned back into a synchronous
+    // writeback with bookkeeping added. Counting the stamps and the windows
+    // they land separates them.
+    crate::runtime::drain::note_store_route("fence_flush_stamps");
+    let armed_before = state.gva_deferred_flush.len()
+        + state.linear_deferred_flush.len()
+        + state.compute_deferred_flush.len();
+    crate::runtime::drain::note_store_route_n("fence_flush_armed", armed_before as u64);
     // Address-keyed render windows first, oldest Store first. A flush can also
     // consume aliasing windows from the other rails, so every later loop checks
     // that its snapshotted entry is still armed.
