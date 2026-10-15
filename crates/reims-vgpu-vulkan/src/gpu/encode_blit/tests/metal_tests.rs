@@ -1,0 +1,3020 @@
+//! The tests of `encode_blit` that compare with Metal on this host: macOS only.
+
+use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize, NsRange};
+
+use super::*;
+
+/// The two-plane XR10 formats: `MTLPixelFormatRGB10A8_2P_XR10` and its sRGB twin.
+const TWO_PLANE_XR10: [u64; 2] = [550, 551];
+
+/// The 4 by 4 BGRA8Unorm texture a copy of 64 bytes from a no-copy buffer of 63 over a page
+/// of `0..=255` fills on platform `P`, read back.
+fn copied_past_a_no_copy_buffer_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+) -> Vec<u8> {
+    use std::alloc::{Layout, alloc, dealloc};
+
+    use reims_vgpu_core::host::HostPtr;
+    use reims_vgpu_core::platform::HostRange;
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    let layout = Layout::from_size_align(16384, 16384).unwrap();
+    // SAFETY: a nonzero size.
+    let page = unsafe { alloc(layout) };
+    for i in 0..16384 {
+        // SAFETY: inside the page just allocated.
+        unsafe { *page.add(i) = i as u8 };
+    }
+    // SAFETY: the page outlives the buffer, which is dropped before it is freed.
+    let bytes = unsafe { HostRange::new(HostPtr::from_ptr(page), 63) };
+    let short = d
+        .new_buffer_over_host_memory(OnFault::Return, bytes, 0, None)
+        .unwrap()
+        .unwrap();
+    let t = d
+        .new_texture(
+            OnFault::Return,
+            &desc(&TextureDesc {
+                pixel_format: 80,
+                width: 4,
+                height: 4,
+                usage: 0x13,
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let down = d
+        .new_buffer_of_length(OnFault::Return, 64, 0)
+        .unwrap()
+        .unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    let cmds = [
+        BlitCmd::CopyBufferToTexture {
+            source_buffer: &short,
+            source_offset: 0,
+            source_bytes_per_row: 16,
+            source_bytes_per_image: 64,
+            source_size: MtlSize::new(4, 4, 1),
+            destination_texture: &t,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+        },
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &t,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(4, 4, 1),
+            destination_buffer: &down,
+            destination_offset: 0,
+            destination_bytes_per_row: 16,
+            destination_bytes_per_image: 64,
+        },
+        BlitCmd::EndEncoding,
+    ];
+    for cmd in cmds {
+        e.encode(OnFault::Return, cmd).unwrap();
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    // SAFETY: a Shared buffer's 64 bytes, read after the GPU's writes completed.
+    let read = unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), 64) };
+    let read = read.to_vec();
+    drop((cb, short));
+    // SAFETY: allocated above with `layout`; the buffer over it is gone.
+    unsafe { dealloc(page, layout) };
+    read
+}
+
+/// The 16 by 16 `PVRTC_RGBA_4BPP` texture of `ShaderRead` usage the PVRTC copies are made
+/// with: at the descriptor's storage and `allowGPUOptimizedContents` (on), or, `suites`, at
+/// `Private` with `allowGPUOptimizedContents` off, the shape of the texture `textures_formats`
+/// makes. `newTextureWithDescriptor:` of either dies, as no model gives Metal's size of it in
+/// Metal's space ([`unmeasured_pvrtc_texture_dies`]); `newSharedTextureWithDescriptor:` of
+/// either is made, its range sized by Apple's layout, as `textures_gap_pvrtc_shared_backing`
+/// makes one.
+fn pvrtc_copy_texture(suites: bool) -> TextureDesc {
+    let t = TextureDesc {
+        pixel_format: 166,
+        width: 16,
+        height: 16,
+        usage: 0x1,
+        ..TextureDesc::default()
+    };
+    match suites {
+        true => TextureDesc {
+            resource_options: Some(0x20),
+            allow_gpu_optimized_contents: Some(false),
+            ..t
+        },
+        false => t,
+    }
+}
+
+/// The bytes of [`pvrtc_copy_texture`]'s texture of the suite's shape on platform `P`, a
+/// shareable one (`newSharedTextureWithDescriptor:`), filled from 128 bytes of `0..128` row by
+/// row (`MTLBlitOptionRowLinearPVRTC`), read back row by row with rows 32 and 48 bytes apart.
+fn pvrtc_copies_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+) -> [Vec<u8>; 2] {
+    let t = d
+        .new_shared_texture(&desc(&pvrtc_copy_texture(true)))
+        .unwrap()
+        .unwrap();
+    let up = d
+        .new_buffer_of_length(OnFault::Return, 128, 0)
+        .unwrap()
+        .unwrap();
+    for i in 0..128u8 {
+        // SAFETY: inside a Shared buffer of 128 bytes the GPU does not use yet.
+        unsafe { *up.contents().as_ptr::<u8>().add(usize::from(i)) = i };
+    }
+    let (rows, padded) = (
+        d.new_buffer_of_length(OnFault::Return, 128, 0)
+            .unwrap()
+            .unwrap(),
+        d.new_buffer_of_length(OnFault::Return, 192, 0)
+            .unwrap()
+            .unwrap(),
+    );
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    let down = |buffer, bytes_per_row, options| BlitCmd::CopyTextureToBufferOptions {
+        source_texture: Some(&t),
+        source_slice: 0,
+        source_level: 0,
+        source_origin: MtlOrigin::new(0, 0, 0),
+        source_size: MtlSize::new(16, 16, 1),
+        destination_buffer: Some(buffer),
+        destination_offset: 0,
+        destination_bytes_per_row: bytes_per_row,
+        destination_bytes_per_image: 0,
+        options,
+    };
+    let cmds = [
+        BlitCmd::CopyBufferToTextureOptions {
+            source_buffer: Some(&up),
+            source_offset: 0,
+            source_bytes_per_row: 32,
+            source_bytes_per_image: 128,
+            source_size: MtlSize::new(16, 16, 1),
+            destination_texture: Some(&t),
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+            options: 4,
+        },
+        down(&rows, 32, 4),
+        down(&padded, 48, 4),
+        BlitCmd::EndEncoding,
+    ];
+    for cmd in cmds {
+        e.encode(OnFault::Return, cmd).unwrap();
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    [(&rows, 128), (&padded, 192)].map(|(b, n)| {
+        // SAFETY: a Shared buffer's `n` bytes, read after the GPU's writes completed.
+        unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
+    })
+}
+
+/// A PVRTC texture's copies with MTLBlitOptionRowLinearPVRTC move its blocks row by row, as
+/// the Metal platform's do on this host, at the suite's shape ([`pvrtc_copy_texture`]), of a
+/// shareable texture
+#[test]
+fn pvrtc_row_linear_copies_are_the_metal_platforms() {
+    let d = dev();
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let vulkan = pvrtc_copies_on::<VulkanPlatform>(&d, &vulkan_desc);
+    assert_eq!(vulkan[0], (0..128).collect::<Vec<u8>>());
+    if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
+        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+        assert_eq!(
+            pvrtc_copies_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc),
+            vulkan
+        );
+    }
+}
+
+/// A texture of a PVRTC format, whose size in Metal's heaps no model gives, dies at
+/// `newTextureWithDescriptor:`, its line naming `unmeasured-heap-texture-size` and its format,
+/// where Metal makes one on this host: the runtime would size it as its device's image, and
+/// that size places what the guest makes next in Metal's space ([`crate::answer::HEARD`]).
+fn unmeasured_pvrtc_texture_dies(t: &TextureDesc) {
+    let what = format!("format {}, {}x{}", t.pixel_format, t.width, t.height);
+    if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
+        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+        let made = metal.new_texture(OnFault::Return, &desc).unwrap();
+        assert!(made.is_some(), "Metal's: {what}");
+    }
+    let desc = crate::platform::tests::platform().texture_descriptor(t);
+    *crate::answer::LAST_LINE.lock() = None;
+    let site = catch_death(|| drop(dev().new_texture(OnFault::Return, &desc))).unwrap_err();
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    assert_eq!(
+        (site.kind, site.file),
+        (
+            reims_vgpu_core::raise::death::DeathKind::Abort,
+            "newTextureWithDescriptor:"
+        ),
+        "{what}: {line}"
+    );
+    assert!(
+        line.contains("unmeasured-heap-texture-size"),
+        "{what}: {line}"
+    );
+    let format = format!("pixel format {},", t.pixel_format);
+    assert!(line.contains(&format), "{what}: {line}");
+}
+
+/// The PVRTC textures the row-linear copies are measured with ([`pvrtc_copy_texture`]), at the
+/// descriptor's storage and `allowGPUOptimizedContents` and at the suite's shape, die where
+/// `newTextureWithDescriptor:` makes them, as [`unmeasured_pvrtc_texture_dies`] says: the
+/// copies' bytes match Metal's, but no model gives Metal's size of them
+#[test]
+fn pvrtc_copy_textures_die_where_made() {
+    unmeasured_pvrtc_texture_dies(&pvrtc_copy_texture(false));
+    unmeasured_pvrtc_texture_dies(&pvrtc_copy_texture(true));
+}
+
+/// `n` bytes of a fixed pseudo-random sequence that `seed` picks, every bit of a word set in
+/// some of them.
+fn noise(seed: u32, n: u64) -> Vec<u8> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            x.to_le_bytes()[3]
+        })
+        .collect()
+}
+
+/// The width and height of the two-plane XR10 textures the copies below make.
+const TWO_PLANE_SIZE: (u64, u64) = (48, 20);
+
+/// The bytes copies of a 48 by 20 texture of `format` (550 or 551) give on platform `P`: its
+/// texels written by `replaceRegion:` from `noise(1, ..)`, 4 bytes a texel, then copied into a
+/// buffer with rows 4 bytes a texel apart and into one with rows 5 bytes a texel apart (its
+/// other bytes 0xaa), then, after a copy of a 17 by 9 region to (13, 11) from a buffer at
+/// offset 256 with rows 8 bytes a texel apart, the whole texture again.
+fn two_plane_copies_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    format: u64,
+) -> [Vec<u8>; 3] {
+    use reims_vgpu_core::num::ToU64 as _;
+    use reims_vgpu_core::platform::HostRange;
+    use reims_vgpu_core::platform::resource::Texture as _;
+    let (w, h) = TWO_PLANE_SIZE;
+    let t = d
+        .new_texture(
+            OnFault::Return,
+            &desc(&TextureDesc {
+                pixel_format: format,
+                width: w,
+                height: h,
+                usage: 0x3,
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let all = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(w, h, 1));
+    let texels = noise(1, w * h * 4);
+    t.replace_region(all, 0, 0, HostRange::of_slice(&texels), w * 4, 0)
+        .unwrap();
+    let filled = |bytes: &[u8]| {
+        let b = d
+            .new_buffer_of_length(OnFault::Return, bytes.len().to_u64(), 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: inside a Shared buffer of `bytes.len()` bytes the GPU does not use yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr(), bytes.len());
+        }
+        b
+    };
+    let (row, region_row) = (w * 4, 17 * 8);
+    let tight = filled(&vec![0x55; usize::try_from(row * h).unwrap()]);
+    let padded = filled(&vec![0xaa; usize::try_from(w * 5 * h).unwrap()]);
+    let region = filled(&noise(2, 256 + region_row * 9));
+    let after = filled(&vec![0x55; usize::try_from(row * h).unwrap()]);
+    let down = |buffer, bytes_per_row| BlitCmd::CopyTextureToBuffer {
+        source_texture: &t,
+        source_slice: 0,
+        source_level: 0,
+        source_origin: MtlOrigin::new(0, 0, 0),
+        source_size: MtlSize::new(w, h, 1),
+        destination_buffer: buffer,
+        destination_offset: 0,
+        destination_bytes_per_row: bytes_per_row,
+        destination_bytes_per_image: bytes_per_row * h,
+    };
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    let cmds = [
+        down(&tight, row),
+        down(&padded, w * 5),
+        BlitCmd::CopyBufferToTexture {
+            source_buffer: &region,
+            source_offset: 256,
+            source_bytes_per_row: region_row,
+            source_bytes_per_image: region_row * 9,
+            source_size: MtlSize::new(17, 9, 1),
+            destination_texture: &t,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(13, 11, 0),
+        },
+        down(&after, row),
+        BlitCmd::EndEncoding,
+    ];
+    for cmd in cmds {
+        e.encode(OnFault::Return, cmd).unwrap();
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    [&tight, &padded, &after].map(|b| {
+        let n = usize::try_from(b.length()).unwrap();
+        // SAFETY: a Shared buffer's `n` bytes, read after the GPU's writes completed.
+        unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
+    })
+}
+
+/// A texture of a two-plane XR10 format, 550 or 551, copies to and from a buffer as the Metal
+/// platform's does on this host: `replaceRegion:` and the blits move each texel's colour word,
+/// 4 bytes, at the caller's rows, and leave the bytes between the rows as they were
+#[test]
+fn two_plane_xr10_copies_are_the_metal_platforms() {
+    let d = dev();
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let (w, h) = TWO_PLANE_SIZE;
+    for format in TWO_PLANE_XR10 {
+        let vulkan = two_plane_copies_on::<VulkanPlatform>(&d, &vulkan_desc, format);
+        assert_eq!(vulkan[0], noise(1, w * h * 4), "{format}");
+        if let Some(metal) = &metal {
+            assert_eq!(
+                two_plane_copies_on::<reims_vgpu_metal::MetalPlatform>(metal, &metal_desc, format),
+                vulkan,
+                "{format}"
+            );
+        }
+    }
+}
+
+/// The size of the two-plane XR10 textures [`two_plane_blit_on`] copies between.
+const BLIT_SIZE: (u64, u64) = (16, 8);
+
+/// A region a blit copies: its origin, its size and the destination's origin.
+type BlitRegion = ((u64, u64), (u64, u64), (u64, u64));
+
+/// A blit between two two-plane XR10 textures of one level and slice: of a region
+/// (`CopyTextureRegion`), or of the whole level 0 and slice 0 (`CopyTextureSlices`, one
+/// level and one slice).
+#[derive(Debug, Clone, Copy)]
+enum TwoPlaneCopy {
+    /// `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:...`.
+    Region(BlitRegion),
+    /// `copyFromTexture:sourceSlice:sourceLevel:toTexture:...sliceCount:levelCount:`.
+    Slices,
+}
+
+/// `read()` into halves of each texel of a 16 by 8 texture of `to` (550 or 551) after one
+/// blit of a 16 by 8 texture of `from` into it, on `P`'s `d`: of the whole texture
+/// (`region` `None`), or of a region (origin, size) to a destination origin
+/// ([`two_plane_copy_on`]).
+fn two_plane_blit_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    formats: (u64, u64),
+    region: Option<BlitRegion>,
+) -> Vec<u8> {
+    let copy = TwoPlaneCopy::Region(region.unwrap_or(((0, 0), BLIT_SIZE, (0, 0))));
+    let shape = ((BLIT_SIZE, BLIT_SIZE), copy, TwoPlaneStorage::Default);
+    two_plane_copy_on::<P>(d, desc, formats, shape)
+}
+
+/// Where [`two_plane_copy_on`]'s two-plane textures lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TwoPlaneStorage {
+    /// Each made by the device, of the descriptor's default storage.
+    Default,
+    /// Each made by the device, `Private`.
+    Private,
+    /// Both placed in one `Private` placement heap, one after the other.
+    Heap,
+}
+
+/// The shape of a blit [`two_plane_copy_on`] makes: the textures' sizes (source and
+/// destination), the copy, and where the textures lie.
+type TwoPlaneShape = (((u64, u64), (u64, u64)), TwoPlaneCopy, TwoPlaneStorage);
+
+/// `read()` into halves of each texel of a texture of `to` (550 or 551) of `sizes.1` after
+/// `copy` from a texture of `from` of `sizes.0` into it, the two lying where `storage` says,
+/// on `P`'s `d`. Each texture's texels are written first by a kernel from an `RGBA16Float`
+/// texture of halves in [-0.5, 1.25), apart in every channel and in each texture, so the
+/// blit moves both planes.
+fn two_plane_copy_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    (from, to): (u64, u64),
+    (sizes, copy, storage): TwoPlaneShape,
+) -> Vec<u8> {
+    use crate::gpu::ycbcr::measure::{PROBE, probed_texels};
+    use reims_vgpu_core::platform::HostRange;
+    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use reims_vgpu_core::platform::resource::{Heap as _, Library as _, Texture as _};
+    use reims_vgpu_core::platform::types::MtlRegion;
+    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+    let texture_desc = |format, (w, h): (u64, u64), options| {
+        desc(&TextureDesc {
+            pixel_format: format,
+            width: w,
+            height: h,
+            usage: 0x3,
+            resource_options: options,
+            ..TextureDesc::default()
+        })
+    };
+    let texture = |format, size| {
+        let made = d.new_texture(OnFault::Return, &texture_desc(format, size, None));
+        made.unwrap().unwrap()
+    };
+    let heap = (storage == TwoPlaneStorage::Heap).then(|| {
+        let made = d.new_heap(&HeapDesc {
+            size: 1 << 20,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(2)],
+            address_ranges: None,
+            pinned_gpu_address: None,
+        });
+        made.unwrap().heap.unwrap()
+    });
+    let two_plane = |format, size, at: u64| match (storage, &heap) {
+        (TwoPlaneStorage::Default, _) => texture(format, size),
+        (TwoPlaneStorage::Private, _) => {
+            let made = d.new_texture(OnFault::Return, &texture_desc(format, size, Some(0x20)));
+            made.unwrap().unwrap()
+        }
+        (TwoPlaneStorage::Heap, heap) => {
+            let heap = heap.as_ref().unwrap();
+            let made = heap.new_texture(&texture_desc(format, size, Some(0x20)), at);
+            made.unwrap().unwrap()
+        }
+    };
+    let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
+    let f = library
+        .new_function(OnFault::Die, "copy_texels")
+        .unwrap()
+        .unwrap();
+    let state = d
+        .new_compute_pipeline_state_for_function(Some(&f))
+        .unwrap()
+        .unwrap();
+    let q = d.new_command_queue().unwrap();
+    let written = |format, (w, h): (u64, u64), seed: u32, at: u64| {
+        let halves = texture(115, (w, h));
+        let bytes: Vec<u8> = noise(seed, w * h * 4)
+            .iter()
+            .flat_map(|&b| {
+                let value = f32::from(b) / 256.0 * 1.75 - 0.5;
+                half_bits(value).to_le_bytes()
+            })
+            .collect();
+        let all = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(w, h, 1));
+        halves
+            .replace_region(all, 0, 0, HostRange::of_slice(&bytes), w * 8, 0)
+            .unwrap();
+        let t = two_plane(format, (w, h), at);
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            ComputeCmd::SetComputePipelineState {
+                state: Some(&state),
+            },
+            ComputeCmd::SetTextures {
+                textures: &[Some(&halves), Some(&t)],
+                range: NsRange::new(0, 2),
+            },
+            ComputeCmd::DispatchThreads {
+                threads_per_grid: MtlSize::new(w, h, 1),
+                threads_per_threadgroup: MtlSize::new(8, 8, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        t
+    };
+    // Each in its own half of the heap, where they lie in one.
+    let (source, destination) = (
+        written(from, sizes.0, 3, 0),
+        written(to, sizes.1, 4, 1 << 19),
+    );
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    let blit = match copy {
+        TwoPlaneCopy::Region(((sx, sy), (cw, ch), (dx, dy))) => BlitCmd::CopyTextureRegion {
+            source_texture: &source,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(sx, sy, 0),
+            source_size: MtlSize::new(cw, ch, 1),
+            destination_texture: &destination,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(dx, dy, 0),
+        },
+        TwoPlaneCopy::Slices => BlitCmd::CopyTextureSlices {
+            source_texture: &source,
+            source_slice: 0,
+            source_level: 0,
+            destination_texture: &destination,
+            destination_slice: 0,
+            destination_level: 0,
+            slice_count: 1,
+            level_count: 1,
+        },
+    };
+    for cmd in [blit, BlitCmd::EndEncoding] {
+        e.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    probed_texels::<P>(d, ("read_texels", 8), &destination, sizes.1, None, None)
+}
+
+/// The blits between two-plane XR10 textures
+/// [`two_plane_xr10_copies_of_any_region_are_the_metal_platforms`] compares with Metal, beyond
+/// [`two_plane_xr10_blits_are_the_metal_platforms`]'s: a copy of the whole of level 0 and
+/// slice 0 (`CopyTextureSlices`), and regions whose origins and widths are no multiple of 4,
+/// between textures of widths that are a multiple of 16, of 4 and of neither, of one width
+/// and of two, the destination's rows wider than the copy's and narrower; of the device's
+/// textures of the default storage and `Private`, and, of a placement heap's, the copies that
+/// read and write no byte outside the texels (those that do die:
+/// [`two_plane_xr10_blits_metal_was_not_measured_at_die`]).
+const TWO_PLANE_COPIES: &[TwoPlaneShape] = {
+    use TwoPlaneCopy::{Region, Slices};
+    use TwoPlaneStorage::{Default as Made, Heap, Private};
+    &[
+        (((16, 8), (16, 8)), Slices, Made),
+        (((16, 8), (16, 8)), Region(((1, 0), (3, 8), (1, 0))), Made),
+        (((16, 8), (16, 8)), Region(((1, 2), (3, 4), (5, 1))), Made),
+        (((16, 8), (16, 8)), Region(((2, 1), (5, 3), (9, 4))), Made),
+        (((16, 8), (16, 8)), Region(((3, 0), (1, 8), (0, 0))), Made),
+        (((16, 8), (16, 8)), Region(((4, 0), (4, 8), (1, 0))), Made),
+        (((16, 8), (16, 8)), Region(((1, 0), (4, 8), (4, 0))), Made),
+        (((16, 8), (16, 8)), Region(((0, 1), (16, 3), (0, 4))), Made),
+        (((16, 8), (16, 8)), Region(((5, 3), (7, 5), (2, 1))), Made),
+        (((16, 8), (16, 8)), Region(((13, 0), (3, 8), (0, 0))), Made),
+        (((12, 8), (16, 8)), Region(((0, 0), (12, 8), (2, 0))), Made),
+        (((12, 8), (16, 8)), Region(((1, 1), (11, 6), (3, 2))), Made),
+        (((16, 8), (12, 8)), Region(((3, 0), (9, 8), (0, 0))), Made),
+        (((12, 6), (12, 6)), Slices, Made),
+        (((9, 7), (9, 7)), Region(((0, 0), (8, 7), (1, 0))), Made),
+        (((9, 7), (9, 7)), Region(((1, 0), (7, 7), (0, 0))), Made),
+        (((9, 7), (9, 7)), Slices, Made),
+        (((20, 4), (20, 4)), Slices, Made),
+        (((20, 4), (20, 4)), Region(((1, 1), (17, 2), (2, 2))), Made),
+        (((5, 5), (5, 5)), Region(((1, 0), (3, 5), (2, 0))), Made),
+        (((6, 4), (6, 4)), Region(((1, 0), (4, 4), (2, 0))), Made),
+        (((16, 8), (16, 8)), Slices, Private),
+        (
+            ((16, 8), (16, 8)),
+            Region(((1, 0), (3, 8), (1, 0))),
+            Private,
+        ),
+        (
+            ((16, 8), (16, 8)),
+            Region(((1, 2), (3, 4), (5, 1))),
+            Private,
+        ),
+        (((16, 8), (16, 8)), Region(((0, 0), (16, 1), (0, 0))), Heap),
+        (((16, 8), (16, 8)), Region(((1, 1), (3, 1), (5, 0))), Heap),
+    ]
+};
+
+/// Each blit of [`TWO_PLANE_COPIES`], from either two-plane XR10 format into either, moves
+/// both planes' bytes as Metal's does on this host: `read()` of the destination answers
+/// Metal's texels
+///
+/// The runtime binds a two-plane XR10 texture to its kernels as `RGBA16Float`, a format that may
+/// hold a NaN, and announces `device-nan-encoding` there: the first dispatch of this platform's
+/// side dies, naming the kind ([`crate::answer::DIES`]).
+#[test]
+fn two_plane_xr10_copies_of_any_region_are_the_metal_platforms() {
+    let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
+        let d = dev();
+        let vulkan_desc =
+            |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+        let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
+        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+        for &shape in TWO_PLANE_COPIES {
+            for formats in [(550, 550), (550, 551), (551, 550), (551, 551)] {
+                let ours = two_plane_copy_on::<VulkanPlatform>(&d, &vulkan_desc, formats, shape);
+                if let Some(metal) = &metal {
+                    let theirs = two_plane_copy_on::<reims_vgpu_metal::MetalPlatform>(
+                        metal,
+                        &metal_desc,
+                        formats,
+                        shape,
+                    );
+                    assert_eq!(ours, theirs, "{shape:?} {formats:?}");
+                }
+            }
+        }
+    });
+    assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
+}
+
+/// The bits of the half nearest `value`, which is normal or zero.
+fn half_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = u16::try_from(bits >> 31).unwrap() << 15;
+    if value == 0.0 {
+        return sign;
+    }
+    let exponent = i32::try_from((bits >> 23) & 0xff).unwrap() - 127 + 15;
+    let mantissa = (bits >> 13) & 0x3ff;
+    let rounded = u16::try_from((exponent << 10) as u32 + mantissa).unwrap();
+    sign | rounded
+}
+
+/// A blit between two textures of the two-plane XR10 formats moves both planes' bytes as
+/// Metal's does on this host, whole and of a region to another place, from either format
+/// into either: `read()` of the destination answers Metal's texels
+///
+/// The runtime binds a two-plane XR10 texture to its kernels as `RGBA16Float`, a format that may
+/// hold a NaN, and announces `device-nan-encoding` there: the first dispatch of this platform's
+/// side dies, naming the kind ([`crate::answer::DIES`]).
+#[test]
+fn two_plane_xr10_blits_are_the_metal_platforms() {
+    let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
+        let d = dev();
+        let vulkan_desc =
+            |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+        let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
+        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+        for formats in [(550, 550), (550, 551), (551, 550), (551, 551)] {
+            let whole = two_plane_blit_on::<VulkanPlatform>(&d, &vulkan_desc, formats, None);
+            // Each texel's alpha half, from plane 1: the blit moved more than one value.
+            let alphas: std::collections::BTreeSet<&[u8]> =
+                whole.chunks(8).map(|texel| &texel[6..]).collect();
+            assert!(alphas.len() > 1, "{formats:?}");
+            for region in [None, Some(((4, 2), (8, 4), (8, 3)))] {
+                let ours = two_plane_blit_on::<VulkanPlatform>(&d, &vulkan_desc, formats, region);
+                assert_eq!(region.is_none(), ours == whole, "{formats:?} {region:?}");
+                if let Some(metal) = &metal {
+                    let theirs = two_plane_blit_on::<reims_vgpu_metal::MetalPlatform>(
+                        metal,
+                        &metal_desc,
+                        formats,
+                        region,
+                    );
+                    assert_eq!(ours, theirs, "{formats:?} {region:?}");
+                }
+            }
+        }
+    });
+    assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
+}
+
+/// The bytes of a placement heap of storage `storage` (0 Shared, 2 Private) on `P`'s `d`
+/// after a copy into a 16 by 8 texture of 551 at its offset 0, of one level, from a texture of
+/// 550 of the device's whose texels a kernel wrote from an `RGBA16Float` texture of halves of
+/// every sign, then `fills` filled, each in a command buffer of its own: of the whole level
+/// (`CopyTextureSlices`) where `region` is `None`, or of a region (origin, size) to a
+/// destination origin. A buffer placed over the texture's span and 4096 bytes past it, each
+/// first its offset's low byte, reads the heap's bytes, through a copy into a Shared buffer.
+fn two_plane_copy_into_heap_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    storage: u64,
+    region: Option<BlitRegion>,
+    fills: &[Fill],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::HostRange;
+    use reims_vgpu_core::platform::blit::BlitEncoder as _;
+    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use reims_vgpu_core::platform::resource::{Heap as _, Library as _, Texture as _};
+    use reims_vgpu_core::platform::types::MtlRegion;
+    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+
+    use crate::gpu::ycbcr::measure::PROBE;
+    let (w, h) = (16, 8);
+    let heap = d
+        .new_heap(&HeapDesc {
+            size: 0x10000,
+            heap_type: 1,
+            options: vec![
+                OptionSet::StorageMode(storage),
+                OptionSet::HazardTrackingMode(0),
+            ],
+            address_ranges: None,
+            pinned_gpu_address: None,
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+    let into = desc(&TextureDesc {
+        pixel_format: 551,
+        width: w,
+        height: h,
+        usage: 0x3,
+        resource_options: Some(0x100 | storage << 4),
+        ..TextureDesc::default()
+    });
+    let size = d.heap_texture_size_and_align(&into).unwrap().size;
+    let t = heap.new_texture(&into, 0).unwrap().unwrap();
+    let span = size + 4096;
+    let over = heap
+        .new_buffer_of_length(span, storage << 4, 0)
+        .unwrap()
+        .unwrap();
+    let shared = |bytes: &[u8]| {
+        let length = u64::try_from(bytes.len()).unwrap();
+        let b = d
+            .new_buffer_of_length(OnFault::Die, length, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a Shared buffer of `bytes.len()` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr::<u8>(), bytes.len());
+        }
+        b
+    };
+    let q = d.new_command_queue().unwrap();
+    let blit = |cmd: BlitCmd<'_, P>| {
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        e.encode(OnFault::Die, cmd).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+    };
+    let copied = |from: &P::Buffer, to: &P::Buffer| {
+        blit(BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(from),
+            source_offset: 0,
+            destination_buffer: Some(to),
+            destination_offset: 0,
+            size: span,
+        });
+    };
+    let n = usize::try_from(span).unwrap();
+    let offsets: Vec<u8> = (0..n).map(|i| (i & 0xff) as u8).collect();
+    copied(&shared(&offsets), &over);
+    let halves_texture = d
+        .new_texture(
+            OnFault::Return,
+            &desc(&TextureDesc {
+                pixel_format: 115,
+                width: w,
+                height: h,
+                usage: 0x1,
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let mut x = 9u32;
+    let halves: Vec<u8> = (0..w * h * 4)
+        .flat_map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            u16::try_from((x >> 16) & 0xbfff).unwrap().to_le_bytes()
+        })
+        .collect();
+    let all = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(w, h, 1));
+    halves_texture
+        .replace_region(all, 0, 0, HostRange::of_slice(&halves), w * 8, 0)
+        .unwrap();
+    let source = d
+        .new_texture(
+            OnFault::Return,
+            &desc(&TextureDesc {
+                pixel_format: 550,
+                width: w,
+                height: h,
+                usage: 0x3,
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
+    let f = library
+        .new_function(OnFault::Die, "copy_texels")
+        .unwrap()
+        .unwrap();
+    let state = d
+        .new_compute_pipeline_state_for_function(Some(&f))
+        .unwrap()
+        .unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        ComputeCmd::SetComputePipelineState {
+            state: Some(&state),
+        },
+        ComputeCmd::SetTextures {
+            textures: &[Some(&halves_texture), Some(&source)],
+            range: NsRange::new(0, 2),
+        },
+        ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(w, h, 1),
+            threads_per_threadgroup: MtlSize::new(8, 4, 1),
+        },
+        ComputeCmd::EndEncoding,
+    ] {
+        e.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    for f in fills {
+        blit(fill_of::<P>(&source, f));
+    }
+    blit(match region {
+        None => BlitCmd::CopyTextureSlices {
+            source_texture: &source,
+            source_slice: 0,
+            source_level: 0,
+            destination_texture: &t,
+            destination_slice: 0,
+            destination_level: 0,
+            slice_count: 1,
+            level_count: 1,
+        },
+        Some(((sx, sy), (cw, ch), (dx, dy))) => BlitCmd::CopyTextureRegion {
+            source_texture: &source,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(sx, sy, 0),
+            source_size: MtlSize::new(cw, ch, 1),
+            destination_texture: &t,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(dx, dy, 0),
+        },
+    });
+    let back = shared(&vec![0; n]);
+    copied(&over, &back);
+    // SAFETY: a Shared buffer's `span` bytes, read after the copy completed.
+    unsafe { std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// A copy into a placement heap's one-level 2D texture of 551, Shared or Private, of the whole
+/// level or of rows that end at its last, writes the heap's bytes as Metal's blit does on this
+/// host, byte for byte ([`two_plane_copy_into_heap_on`]): at Metal's blit rows, so a copy of
+/// more than one row writes alpha bytes past the alpha plane, over what else the heap holds
+/// there; the runtime's copy into a heap's texture writes them
+///
+/// The runtime binds a two-plane XR10 texture to its kernels as `RGBA16Float`, a format that may
+/// hold a NaN, and announces `device-nan-encoding` there: the first dispatch of this platform's
+/// side dies, naming the kind ([`crate::answer::DIES`]).
+#[test]
+fn two_plane_copies_into_a_heap_are_the_metal_platforms() {
+    let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
+        let d = dev();
+        let p = crate::platform::tests::platform();
+        let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
+        let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
+        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+        let shapes = [
+            None,
+            Some(((0, 0), (16, 2), (0, 6))),
+            Some(((2, 1), (8, 3), (4, 5))),
+        ];
+        for storage in [0, 2] {
+            for region in shapes {
+                let ours = two_plane_copy_into_heap_on::<VulkanPlatform>(
+                    &d,
+                    &ours_desc,
+                    storage,
+                    region,
+                    &[],
+                );
+                let Some(metal) = &metal else { continue };
+                let theirs = two_plane_copy_into_heap_on::<reims_vgpu_metal::MetalPlatform>(
+                    metal,
+                    &metal_desc,
+                    storage,
+                    region,
+                    &[],
+                );
+                let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                assert_eq!(differ, 0, "storage {storage} {region:?}");
+            }
+        }
+    });
+    assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
+}
+
+/// A copy into a texture of bytes past a no-copy buffer's length reads the caller's bytes
+/// there, the Metal platform's answer on this host; past another buffer's end it dies at its
+/// selector, where Metal copies bytes no one wrote
+#[test]
+fn copies_past_a_buffer() {
+    let d = dev();
+    let page: Vec<u8> = (0..64u8).collect();
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    assert_eq!(
+        copied_past_a_no_copy_buffer_on::<VulkanPlatform>(&d, &vulkan_desc),
+        page
+    );
+    if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
+        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+        assert_eq!(
+            copied_past_a_no_copy_buffer_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc),
+            page
+        );
+    }
+    let t = d
+        .new_texture(OnFault::Return, &bgra(4, 4, 0))
+        .unwrap()
+        .unwrap();
+    let short = shared(63);
+    let cb = buffer();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    let up = BlitCmd::CopyBufferToTexture {
+        source_buffer: &short,
+        source_offset: 0,
+        source_bytes_per_row: 16,
+        source_bytes_per_image: 64,
+        source_size: MtlSize::new(4, 4, 1),
+        destination_texture: &t,
+        destination_slice: 0,
+        destination_level: 0,
+        destination_origin: MtlOrigin::new(0, 0, 0),
+    };
+    let sel = up.selector();
+    let site = catch_death(|| e.encode(OnFault::Return, up)).unwrap_err();
+    assert_eq!(site.file, sel);
+}
+
+/// `MTLPixelFormatStencil8`.
+const STENCIL8: u64 = 253;
+
+/// The bytes on platform `P` of a copy of `units` from a buffer into every sample of a 2D
+/// multisample texture of `format`, `samples` samples a pixel, `width` by `height` texels
+/// (Private, read by shaders and rendered to), then of the whole texture back into a buffer:
+/// rows `units.len() / height` bytes apart, a pixel's samples consecutive, Metal's layout. Where
+/// `cleared`, a pass that clears and stores the texture's depth (its stencil, for `Stencil8`)
+/// runs first in the same command buffer, as a guest's first pass over a new target does.
+fn multisampled_copies_on<P: reims_vgpu_core::platform::Platform>(
+    p: &P,
+    d: &P::Device,
+    cleared: bool,
+    (format, samples, width, height): (u64, u64, u64, u64),
+    units: &[u8],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
+    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    let t = d
+        .new_texture(
+            OnFault::Return,
+            &p.texture_descriptor(&TextureDesc {
+                texture_type: 4,
+                pixel_format: format,
+                width,
+                height,
+                sample_count: samples,
+                usage: 0x5,
+                resource_options: Some(0x20),
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let length = units.len() as u64;
+    let [up, down] = [(); 2].map(|()| {
+        d.new_buffer_of_length(OnFault::Return, length, 0)
+            .unwrap()
+            .unwrap()
+    });
+    // SAFETY: a Shared buffer of `units.len()` bytes the GPU does not use yet.
+    unsafe {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), up.contents().as_ptr::<u8>(), units.len())
+    };
+    let row = length / height;
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    if cleared {
+        // MTLLoadActionClear and MTLStoreActionStore.
+        let (load_action, store_action) = (Some(2), Some(1));
+        let pass = p.render_pass_descriptor();
+        match format {
+            STENCIL8 => pass.set_stencil_attachment(&StencilAttachmentSet {
+                texture: Some(Some(&t)),
+                load_action,
+                store_action,
+                ..StencilAttachmentSet::default()
+            }),
+            _ => pass.set_depth_attachment(&DepthAttachmentSet {
+                texture: Some(Some(&t)),
+                load_action,
+                store_action,
+                ..DepthAttachmentSet::default()
+            }),
+        }
+        let r = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        r.encode(OnFault::Return, RenderCmd::EndEncoding).unwrap();
+    }
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    let cmds = [
+        BlitCmd::CopyBufferToTexture {
+            source_buffer: &up,
+            source_offset: 0,
+            source_bytes_per_row: row,
+            source_bytes_per_image: length,
+            source_size: MtlSize::new(width, height, 1),
+            destination_texture: &t,
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+        },
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &t,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(width, height, 1),
+            destination_buffer: &down,
+            destination_offset: 0,
+            destination_bytes_per_row: row,
+            destination_bytes_per_image: length,
+        },
+        BlitCmd::EndEncoding,
+    ];
+    for cmd in cmds {
+        e.encode(OnFault::Return, cmd).unwrap();
+    }
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    // SAFETY: a Shared buffer's `units.len()` bytes, read after the GPU's writes completed.
+    unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), units.len()) }.to_vec()
+}
+
+/// A copy from a buffer into a multisampled `Depth32Float` or `Stencil8` texture and back puts
+/// each unit in its own sample and returns the buffer bit for bit, as the Metal platform's does
+/// on this host, the texture cleared by a pass first or not, as a macOS 26 guest's screensaver
+/// and HiDPI login window copy into a 4-sample `Depth32Float` texture of 54 by 54 and of 80
+/// by 80. The depths lie in `[0, 1]`, none with the sign bit set, where the runtime's sample-rate draw writes Metal's
+/// values; past them MoltenVK's draw changes them (`drawn-depth-copy`, relayed).
+///
+/// The two `Depth32Float` shapes Metal keeps losslessly compressed (16 texels or more on the
+/// shorter side) read the copied values too where no pass cleared them first: the runtime counts
+/// a blit that writes a whole level as writing the pattern Metal's new texture reads
+#[test]
+fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
+    let vulkan = crate::platform::tests::platform();
+    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|d| {
+        let launcher = Box::new(crate::gpu::device::tests::metal_tests::NoLauncher);
+        (reims_vgpu_metal::MetalPlatform::new(launcher), d)
+    });
+    let depths = |n: u64| -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| ((i % 4096) as f32 / 4095.0).to_le_bytes())
+            .collect()
+    };
+    // Each case's name, shape and bytes.
+    let cases = [
+        (
+            "the screensaver's Depth32Float",
+            (252, 4, 54, 54),
+            depths(54 * 54 * 4),
+        ),
+        (
+            "the login window's Depth32Float",
+            (252, 4, 80, 80),
+            depths(80 * 80 * 4),
+        ),
+        (
+            "Depth32Float of 2 samples",
+            (252, 2, 8, 8),
+            depths(8 * 8 * 2),
+        ),
+        (
+            "Stencil8 of 4 samples",
+            (STENCIL8, 4, 8, 8),
+            noise(0x5e, 8 * 8 * 4),
+        ),
+        (
+            "Stencil8 of 2 samples",
+            (STENCIL8, 2, 8, 8),
+            noise(0x5f, 8 * 8 * 2),
+        ),
+    ];
+    let mut differ = Vec::new();
+    for (name, shape, units) in cases {
+        for cleared in [true, false] {
+            let what = match cleared {
+                true => format!("{name}, cleared first"),
+                false => format!("{name}, uncleared"),
+            };
+            if let Some((mp, md)) = &metal
+                && multisampled_copies_on(mp, md, cleared, shape, &units) != units
+            {
+                differ.push(format!("{what}: Metal's copy did not return the buffer"));
+            }
+            *crate::answer::LAST_LINE.lock() = None;
+            let ours =
+                catch_death(|| multisampled_copies_on(&vulkan, &dev(), cleared, shape, &units));
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            match ours {
+                Ok(ours) if ours == units => {}
+                Ok(ours) => {
+                    let wrong = (ours.iter().zip(&units)).filter(|(a, b)| a != b).count();
+                    differ.push(format!("{what}: {wrong} bytes differ"));
+                }
+                Err(site) => differ.push(format!("{what}: died at {}: {line}", site.file)),
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// A fill of a case: bytes, or a colour in a pixel format; at a level and slice, of a region
+/// given as origin and size.
+enum Fill {
+    Bytes(u64, u64, [u64; 3], [u64; 3], Vec<u8>),
+    Color(u64, u64, [u64; 3], [u64; 3], [f64; 4], u64),
+}
+
+/// The blit of `fill` into `t`.
+fn fill_of<'a, P: reims_vgpu_core::platform::Platform>(
+    t: &'a P::Texture,
+    fill: &'a Fill,
+) -> BlitCmd<'a, P> {
+    let region = |o: [u64; 3], s: [u64; 3]| {
+        MtlRegion::new(
+            MtlOrigin::new(o[0], o[1], o[2]),
+            MtlSize::new(s[0], s[1], s[2]),
+        )
+    };
+    match *fill {
+        Fill::Bytes(level, slice, o, s, ref bytes) => BlitCmd::FillTexture {
+            texture: t,
+            level,
+            slice,
+            region: region(o, s),
+            bytes: reims_vgpu_core::platform::HostRange::of_slice(bytes),
+        },
+        Fill::Color(level, slice, o, s, [red, green, blue, alpha], pixel_format) => {
+            BlitCmd::FillTextureColor {
+                texture: t,
+                level,
+                slice,
+                region: region(o, s),
+                color: ClearColor {
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                },
+                pixel_format,
+            }
+        }
+    }
+}
+
+/// A texture of `format` (`bpp` bytes a block of `block` texels across and down: one texel
+/// but for a compressed format), `texture_type`, `extent`, `levels` and `array` slices,
+/// every byte 0xee, then `fills`, `Private`, its `allowGPUOptimizedContents` the
+/// descriptor's (on) unless `allow_gpu_optimized_contents` sets it. Its bytes are written and
+/// read back as a whole, or, where `aspects` lists them, by each aspect's copies: its blit
+/// option and its bytes a texel (`Depth32Float_Stencil8`'s depth, option 1, and stencil,
+/// option 2).
+struct Case {
+    format: u64,
+    bpp: u64,
+    block: [u64; 2],
+    aspects: &'static [(u64, u64)],
+    texture_type: u64,
+    extent: [u64; 3],
+    levels: u64,
+    array: u64,
+    usage: u64,
+    allow_gpu_optimized_contents: Option<bool>,
+    /// Whether the texture is shareable (`newSharedTextureWithDescriptor:`).
+    shared: bool,
+    fills: Vec<Fill>,
+}
+
+/// The texture `c` fills.
+fn texture_of(c: &Case) -> TextureDesc {
+    TextureDesc {
+        texture_type: c.texture_type,
+        pixel_format: c.format,
+        width: c.extent[0],
+        height: c.extent[1],
+        depth: c.extent[2],
+        mipmap_level_count: c.levels,
+        array_length: c.array,
+        usage: c.usage,
+        resource_options: Some(0x20),
+        allow_gpu_optimized_contents: c.allow_gpu_optimized_contents,
+        ..TextureDesc::default()
+    }
+}
+
+/// Each (slice, level) of `c`'s texture after its fills on platform `P`, read back, in order,
+/// each aspect's bytes in turn.
+fn fills_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    c: &Case,
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    let desc = desc(&texture_of(c));
+    let t = match c.shared {
+        true => d.new_shared_texture(&desc),
+        false => d.new_texture(OnFault::Return, &desc),
+    };
+    let t = t.unwrap().unwrap();
+    let slices = match c.texture_type {
+        1 | 3 => c.array,
+        5 => 6,
+        6 => 6 * c.array,
+        _ => 1,
+    };
+    let whole = [(0, c.bpp)];
+    let aspects: &[(u64, u64)] = if c.aspects.is_empty() {
+        &whole
+    } else {
+        c.aspects
+    };
+    // Each slice's levels, each level's aspects: its slice, level, extent, blit option and
+    // bytes a block.
+    let images: Vec<(u64, u64, [u64; 3], u64, u64)> = (0..slices)
+        .flat_map(|slice| {
+            (0..c.levels).flat_map(move |level| {
+                let e = c.extent.map(|e| (e >> level).max(1));
+                aspects
+                    .iter()
+                    .map(move |&(option, bpp)| (slice, level, e, option, bpp))
+            })
+        })
+        .collect();
+    let buffer_of = |bytes: &[u8]| {
+        let b = d
+            .new_buffer_of_length(OnFault::Return, bytes.len() as u64, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a fresh Shared buffer of `bytes.len()` bytes, written before any use.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr(), bytes.len())
+        };
+        b
+    };
+    let run = |cmds: Vec<BlitCmd<'_, P>>| {
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in cmds {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+    };
+    // A level's bytes a row of blocks of `bpp` bytes, and its bytes.
+    let row_of = |e: [u64; 3], bpp: u64| e[0].div_ceil(c.block[0]) * bpp;
+    let bytes_of = |e: [u64; 3], bpp| row_of(e, bpp) * e[1].div_ceil(c.block[1]) * e[2];
+    let ups: Vec<_> = images
+        .iter()
+        .map(|&(_, _, e, _, bpp)| {
+            buffer_of(&vec![0xee; usize::try_from(bytes_of(e, bpp)).unwrap()])
+        })
+        .collect();
+    run(images
+        .iter()
+        .zip(&ups)
+        .map(|(&(slice, level, e, option, bpp), up)| {
+            let (source_bytes_per_row, source_bytes_per_image) =
+                (row_of(e, bpp), bytes_of([e[0], e[1], 1], bpp));
+            let (source_size, origin) = (MtlSize::new(e[0], e[1], e[2]), MtlOrigin::new(0, 0, 0));
+            if option == 0 {
+                return BlitCmd::CopyBufferToTexture {
+                    source_buffer: up,
+                    source_offset: 0,
+                    source_bytes_per_row,
+                    source_bytes_per_image,
+                    source_size,
+                    destination_texture: &t,
+                    destination_slice: slice,
+                    destination_level: level,
+                    destination_origin: origin,
+                };
+            }
+            BlitCmd::CopyBufferToTextureOptions {
+                source_buffer: Some(up),
+                source_offset: 0,
+                source_bytes_per_row,
+                source_bytes_per_image,
+                source_size,
+                destination_texture: Some(&t),
+                destination_slice: slice,
+                destination_level: level,
+                destination_origin: origin,
+                options: option,
+            }
+        })
+        .collect());
+    let sources: Vec<_> = c
+        .fills
+        .iter()
+        .map(|f| match f {
+            Fill::Bytes(.., bytes) => Some(buffer_of(bytes)),
+            Fill::Color(..) => None,
+        })
+        .collect();
+    let region = |o: [u64; 3], s: [u64; 3]| {
+        MtlRegion::new(
+            MtlOrigin::new(o[0], o[1], o[2]),
+            MtlSize::new(s[0], s[1], s[2]),
+        )
+    };
+    run(c
+        .fills
+        .iter()
+        .zip(&sources)
+        .map(|(f, source)| match (f, source) {
+            (&Fill::Bytes(level, slice, o, sz, ref bytes), Some(source)) => {
+                BlitCmd::FillTexture {
+                    texture: &t,
+                    level,
+                    slice,
+                    region: region(o, sz),
+                    // SAFETY: the source buffer's bytes, live past the send.
+                    bytes: unsafe {
+                        reims_vgpu_core::platform::HostRange::new(
+                            source.contents(),
+                            bytes.len() as u64,
+                        )
+                    },
+                }
+            }
+            (&Fill::Color(level, slice, o, sz, color, pixel_format), _) => {
+                BlitCmd::FillTextureColor {
+                    texture: &t,
+                    level,
+                    slice,
+                    region: region(o, sz),
+                    color: ClearColor {
+                        red: color[0],
+                        green: color[1],
+                        blue: color[2],
+                        alpha: color[3],
+                    },
+                    pixel_format,
+                }
+            }
+            _ => unreachable!(),
+        })
+        .collect());
+    let downs: Vec<_> = images
+        .iter()
+        .map(|&(_, _, e, _, bpp)| {
+            buffer_of(&vec![0x55; usize::try_from(bytes_of(e, bpp)).unwrap()])
+        })
+        .collect();
+    run(images
+        .iter()
+        .zip(&downs)
+        .map(
+            |(&(slice, level, e, option, bpp), down)| BlitCmd::CopyTextureToBufferOptions {
+                source_texture: Some(&t),
+                source_slice: slice,
+                source_level: level,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(e[0], e[1], e[2]),
+                destination_buffer: Some(down),
+                destination_offset: 0,
+                destination_bytes_per_row: row_of(e, bpp),
+                destination_bytes_per_image: bytes_of([e[0], e[1], 1], bpp),
+                options: option,
+            },
+        )
+        .collect());
+    downs
+        .iter()
+        .flat_map(|b| {
+            let length = usize::try_from(b.length()).unwrap();
+            // SAFETY: a Shared buffer's bytes, read after the GPU's writes completed.
+            unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), length) }.to_vec()
+        })
+        .collect()
+}
+
+/// The texture fills write what Metal writes, where it writes it: bytes past a block go
+/// unread and a shorter colour repeats; levels, slices, cube faces and 3D depths; regions cut
+/// at the level, ignored slices and depths, and fills that write nothing; depth textures;
+/// a fill larger than the staging buffer
+#[test]
+fn texture_fills_are_the_metal_platforms() {
+    use reims_vgpu_core::platform::Platform as _;
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let rgba = [1.0, 0.5, 0.25, 1.0];
+    let b = |level, slice, o, s, bytes: &[u8]| Fill::Bytes(level, slice, o, s, bytes.to_vec());
+    let k = |level, slice, o, s, color, pf| Fill::Color(level, slice, o, s, color, pf);
+    let one = [1, 1, 1];
+    let case = |format, bpp, texture_type, extent, levels, array, fills| Case {
+        format,
+        bpp,
+        block: [1, 1],
+        aspects: &[],
+        texture_type,
+        extent,
+        levels,
+        array,
+        usage: 3,
+        allow_gpu_optimized_contents: None,
+        shared: false,
+        fills,
+    };
+    let mut cases = vec![
+        case(
+            70,
+            4,
+            2,
+            [4, 4, 1],
+            1,
+            1,
+            vec![
+                k(0, 0, [1, 1, 0], [2, 2, 1], rgba, 70),
+                b(0, 0, [0, 0, 0], [4, 1, 1], &[1, 2, 3, 4, 5, 6, 7, 8]),
+                b(0, 0, [3, 3, 0], [4, 4, 1], &[9, 10, 11, 12]),
+                k(0, 0, [0, 3, 0], one, [200.0, 100.0, 50.0, 255.0], 73),
+                k(0, 0, [1, 3, 0], one, rgba, 10),
+                k(0, 0, [2, 3, 0], one, rgba, 115),
+                b(0, 7, [0, 2, 5], [1, 1, 0], &[0x21, 0x22, 0x23, 0x24]),
+            ],
+        ),
+        case(
+            10,
+            1,
+            2,
+            [4, 2, 1],
+            1,
+            1,
+            vec![
+                b(0, 0, [0, 0, 0], [4, 1, 1], &[1, 2, 3, 4]),
+                k(0, 0, [0, 1, 0], [2, 1, 1], rgba, 70),
+            ],
+        ),
+        case(
+            115,
+            8,
+            2,
+            [2, 2, 1],
+            1,
+            1,
+            vec![
+                k(0, 0, [0, 0, 0], one, [1.0, 0.5, -0.25, 70000.0], 115),
+                k(0, 0, [1, 0, 0], one, [0.5, 0.0, 0.0, 0.0], 10),
+                k(0, 0, [0, 1, 0], [2, 1, 1], [f64::NAN, -2.0, 1e-6, 3.0], 125),
+            ],
+        ),
+        case(
+            125,
+            16,
+            2,
+            [2, 1, 1],
+            1,
+            1,
+            vec![
+                k(0, 0, [0, 0, 0], one, [1.5, -2.0, 3.25, f64::NAN], 125),
+                k(0, 0, [1, 0, 0], one, [70000.0, -1.0, 2.5, 4e9], 123),
+            ],
+        ),
+        case(
+            252,
+            4,
+            2,
+            [2, 2, 1],
+            1,
+            1,
+            vec![
+                b(0, 0, [0, 0, 0], one, &[0, 0, 0, 0x3f]),
+                k(0, 0, [1, 1, 0], one, [0.25, 0.0, 0.0, 0.0], 55),
+            ],
+        ),
+        case(
+            250,
+            2,
+            2,
+            [2, 2, 1],
+            1,
+            1,
+            vec![b(0, 0, [1, 0, 0], [1, 2, 1], &[0x34, 0x12])],
+        ),
+        case(
+            70,
+            4,
+            3,
+            [2, 1, 1],
+            1,
+            2,
+            vec![
+                b(0, 1, [0, 0, 1], [1, 1, 3], &[1, 2, 3, 4]),
+                b(0, 2, [1, 0, 0], one, &[5, 6, 7, 8]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            0,
+            [4, 1, 1],
+            1,
+            1,
+            vec![
+                b(0, 3, [1, 0, 0], one, &[1, 2, 3, 4]),
+                b(0, 0, [2, 1, 0], one, &[5, 6, 7, 8]),
+                b(0, 0, [3, 0, 0], [1, 2, 1], &[9, 10, 11, 12]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            1,
+            [2, 1, 1],
+            1,
+            2,
+            vec![
+                b(0, 1, [0, 0, 0], one, &[1, 2, 3, 4]),
+                b(0, 2, [1, 0, 0], one, &[5, 6, 7, 8]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            5,
+            [1, 1, 1],
+            1,
+            1,
+            vec![
+                b(0, 3, [0, 0, 0], one, &[1, 2, 3, 4]),
+                b(0, 6, [0, 0, 0], one, &[5, 6, 7, 8]),
+                b(0, 13, [0, 0, 0], one, &[9, 10, 11, 12]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            6,
+            [1, 1, 1],
+            1,
+            2,
+            vec![
+                b(0, 7, [0, 0, 0], one, &[1, 2, 3, 4]),
+                b(0, 12, [0, 0, 0], one, &[5, 6, 7, 8]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            7,
+            [2, 2, 2],
+            1,
+            1,
+            vec![
+                b(0, 0, [0, 1, 1], [2, 1, 1], &[1, 2, 3, 4]),
+                b(0, 1, [0, 0, 0], [1, 1, 3], &[5, 6, 7, 8]),
+                b(0, 0, [1, 1, 0], [1, 1, 0], &[9, 10, 11, 12]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            2,
+            [4, 4, 1],
+            3,
+            1,
+            vec![
+                b(1, 0, [1, 0, 0], [4, 4, 1], &[1, 2, 3, 4]),
+                k(2, 0, [0, 0, 0], one, rgba, 70),
+                b(3, 0, [0, 0, 0], one, &[5, 6, 7, 8]),
+                b(0, 0, [0, 0, 0], [0, 1, 1], &[9, 10, 11, 12]),
+            ],
+        ),
+        case(
+            70,
+            4,
+            2,
+            [4096, 2048, 1],
+            1,
+            1,
+            vec![k(
+                0,
+                0,
+                [1, 1, 0],
+                [65536, 65536, 1],
+                [0.0, 0.25, 0.5, 1.0],
+                70,
+            )],
+        ),
+    ];
+    let mut plain_usage = case(
+        70,
+        4,
+        2,
+        [2, 1, 1],
+        1,
+        1,
+        vec![k(0, 0, [0, 0, 0], one, rgba, 70)],
+    );
+    plain_usage.usage = 1;
+    cases.push(plain_usage);
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    for (i, c) in cases.iter().enumerate() {
+        let ours = fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c);
+        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
+        assert!(
+            ours == theirs,
+            "case {i}: ours {:02x?} Metal {:02x?}",
+            &ours[..ours.len().min(256)],
+            &theirs[..theirs.len().min(256)]
+        );
+    }
+}
+
+/// `cases` filled on this platform and on the Metal platform, read back: each case's bytes
+/// are Metal's. A case this platform dies at fails, naming the death's site and line.
+fn fills_are_metals(cases: &[Case]) {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    for (i, c) in cases.iter().enumerate() {
+        let what = format!("case {i}, format {}", c.format);
+        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
+        let ours = catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c))
+            .unwrap_or_else(|site| {
+                let line = crate::answer::LAST_LINE.lock().clone();
+                panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
+            });
+        assert!(
+            ours == theirs,
+            "{what}: ours {:02x?} Metal {:02x?}",
+            &ours[..ours.len().min(256)],
+            &theirs[..theirs.len().min(256)]
+        );
+    }
+}
+
+/// The bytes of a Private 2D texture of `format`, of `bpp` bytes a texel, 64 texels wide, on
+/// platform `P`, every byte 0xee, once each of `colours` filled a texel of it, in order from
+/// its first, packed in `format`.
+fn packed_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    (format, bpp): (u64, u64),
+    colours: &[[f64; 4]],
+) -> Vec<u8> {
+    let width = 64;
+    let n = u64::try_from(colours.len()).unwrap();
+    let fills = (0u64..)
+        .zip(colours)
+        .map(|(i, &c)| Fill::Color(0, 0, [i % width, i / width, 0], [1, 1, 1], c, format))
+        .collect();
+    let shape = (2, [width, n.div_ceil(width), 1], 1, 1);
+    fills_on::<P>(d, desc, &read_case((format, bpp, [1, 1]), shape, fills))
+}
+
+/// Colours of `v`, each value in each component: colour `i` is values `i` to `i + 3`.
+fn rotations(v: &[f64]) -> Vec<[f64; 4]> {
+    (0..v.len())
+        .map(|i| [0, 1, 2, 3].map(|c| v[(i + c) % v.len()]))
+        .collect()
+}
+
+/// Values for the RGBX colour fills: plain values and each normalized, 8-, 16- and 32-bit
+/// integer and half range's ends, halfway points and the values past them, of either sign;
+/// sRGB's linear segment's end; denormals, infinities and NaNs, quiet and signalling.
+fn rgbx_values() -> Vec<f64> {
+    vec![
+        0.0,
+        -0.0,
+        0.25,
+        0.5,
+        0.3,
+        1.0,
+        -1.0,
+        1.5,
+        -1.5,
+        0.003_130_8,
+        0.5 / 255.0,
+        127.5,
+        255.0,
+        255.5,
+        256.0,
+        -128.5,
+        -129.0,
+        65_504.0,
+        65_535.5,
+        65_536.0,
+        -32_768.5,
+        70_000.0,
+        2_147_483_647.5,
+        -2_147_483_648.5,
+        4_294_967_295.0,
+        4_294_967_296.0,
+        1e10,
+        -1e10,
+        1e-40,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        -f64::NAN,
+        f64::from_bits(0x7ff4_0000_0000_0000),
+    ]
+}
+
+/// The `f64`s at a quarter, a half and three quarters of the way from `a` to `b`, which lie
+/// strictly between two neighbouring `f32`s `a` and `b`: exact, as they differ by a power of
+/// two.
+fn between(a: f64, b: f64) -> [f64; 3] {
+    let step = (b - a) / 4.0;
+    [a + step, a + 2.0 * step, a + 3.0 * step]
+}
+
+/// Values for the bfloat colour fills: plain values, past an `f32`'s range, denormals,
+/// signed zeroes and infinities; at each of a range of exponents, values halfway between two
+/// bfloats and the `f32`s beside them, of either sign, and the `f64`s strictly between each
+/// and its neighbours ([`between`]), where packing through an `f32` first rounds twice; and
+/// NaNs, quiet and signalling, of either sign, whose payloads set the bits a bfloat keeps and
+/// the bit below them.
+fn bfloat_values() -> Vec<f64> {
+    let mut v = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.25,
+        70_000.0,
+        3.4e38,
+        -3.4e38,
+        f64::MAX,
+        1e-40,
+        -1e-40,
+        1e-45,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let next = |x: f32, by: i32| f64::from(f32::from_bits(x.to_bits().wrapping_add_signed(by)));
+    for exponent in [-133, -127, -126, -100, -20, -1, 0, 1, 20, 100, 126, 127] {
+        for step in [0, 1, 2, 63, 126, 127] {
+            let tie = (1.0 + f64::from(2 * step + 1) / 256.0) * 2f64.powi(exponent);
+            for tie in [tie, -tie] {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "nine bits of mantissa at an f32's exponent, exact"
+                )]
+                let tie = tie as f32;
+                let (below, at, above) = (next(tie, -1), f64::from(tie), next(tie, 1));
+                v.extend([at, below, above]);
+                v.extend(between(below, at));
+                v.extend(between(at, above));
+            }
+        }
+    }
+    for bits in [
+        0x7ff8_0000_0000_0000u64,
+        0x7ff8_1000_0000_0000,
+        0x7ff8_2000_0000_0000,
+        0x7ffc_0000_0000_0000,
+        0x7fff_ffff_ffff_ffff,
+        0x7ff0_0000_0000_0001,
+        0x7ff0_2000_0000_0000,
+        0x7ff4_0000_0000_0000,
+    ] {
+        v.extend([f64::from_bits(bits), f64::from_bits(bits | 1 << 63)]);
+    }
+    v
+}
+
+/// The least `f32` that a colour fill in `BGRA10_XR_sRGB` on `P` (Metal's) stores as each
+/// blue code from 1 to 1023, and the `f32` below each: bisected over the `f32`s from -2 to 2
+/// in their order, one fill of each code's middle `f32` a round, the code read from the
+/// texel's first 16-bit word's top 10 bits.
+fn xr_srgb_edges<P: reims_vgpu_core::platform::Platform>(
+    metal: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+) -> Vec<f64> {
+    /// `v`'s place in the order of the `f32`s.
+    fn key(v: f32) -> u32 {
+        let b = v.to_bits();
+        if b >> 31 == 1 { !b } else { b | 0x8000_0000 }
+    }
+    /// The `f32` at place `k`.
+    fn value(k: u32) -> f32 {
+        f32::from_bits(if k & 0x8000_0000 == 0 {
+            !k
+        } else {
+            k & 0x7fff_ffff
+        })
+    }
+    let mut bounds = vec![(key(-2.0), key(2.0)); 1023];
+    while bounds.iter().any(|&(lo, hi)| hi - lo > 1) {
+        let mids: Vec<u32> = bounds.iter().map(|&(lo, hi)| lo + (hi - lo) / 2).collect();
+        let colours: Vec<[f64; 4]> = mids
+            .iter()
+            .map(|&m| [0.0, 0.0, f64::from(value(m)), 1.0])
+            .collect();
+        let bytes = packed_on::<P>(metal, desc, (553, 8), &colours);
+        for (code, ((lo, hi), (&mid, texel))) in
+            (1u16..).zip(bounds.iter_mut().zip(mids.iter().zip(bytes.chunks(8))))
+        {
+            if u16::from_le_bytes([texel[0], texel[1]]) >> 6 >= code {
+                *hi = mid;
+            } else {
+                *lo = mid;
+            }
+        }
+    }
+    bounds
+        .iter()
+        .flat_map(|&(lo, hi)| [f64::from(value(lo)), f64::from(value(hi))])
+        .collect()
+}
+
+/// A colour fill packed in a bfloat format (`R16Bfloat`, `RG16Bfloat`, `RGBA16Bfloat`), an
+/// extended-range `_sRGB` twin (`BGRA10_XR_sRGB`, `BGR10_XR_sRGB`) or an RGBX format (each of
+/// the 11), which the runtime's colour fill packs ([`fill::RUNTIME_PACKED`]), writes Metal's
+/// bytes on this host, each colour into a texel of a texture of its format ([`packed_on`]),
+/// each value in each component ([`rotations`]): for bfloat, [`bfloat_values`]; for the
+/// twins, the least `f32` of each code and the one below it, as Metal stores them here
+/// ([`xr_srgb_edges`]), the `f64`s between the two ([`between`]), and NaNs, infinities,
+/// signed zeroes and values past the ends; for `BGRA10_XR_sRGB`'s linear alpha, each value
+/// halfway between two of its codes, `(k + 0.5 - 384) / 510`, the `f32`s beside it and the
+/// `f64`s between them; for RGBX, [`rgbx_values`]. A colour of each bfloat format and twin
+/// into a texture of another format (`RGBA32Uint`, `R8Unorm`), and an `RGBX8Unorm` colour
+/// into an `RGBA8Unorm` texture, which Metal makes, dies at the fill: a twin's bytes there
+/// follow no rule measured (a colour filled alone repeats; 2057 colours filled one after
+/// another in one encoder each left its packed bytes, then `01` and zeroes, where the
+/// runtime repeats), and a bfloat or RGBX colour's are not compared
+#[test]
+fn colours_the_runtime_packs_are_the_metal_platforms() {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let bfloats = rotations(&bfloat_values());
+    let mut edges = xr_srgb_edges::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc);
+    let pairs: Vec<[f64; 2]> = edges.chunks(2).map(|p| [p[0], p[1]]).collect();
+    edges.extend(
+        pairs
+            .iter()
+            .flat_map(|&[below, least]| between(below, least)),
+    );
+    edges.extend([
+        f64::NAN,
+        -f64::NAN,
+        f64::from_bits(0x7ff4_0000_0000_0000),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        -0.0,
+        -2.0,
+        2.0,
+        1e-40,
+        -1e-40,
+    ]);
+    let edges = rotations(&edges);
+    let rgbx = rotations(&rgbx_values());
+    let next = |x: f32, by: i32| f64::from(f32::from_bits(x.to_bits().wrapping_add_signed(by)));
+    let mut alphas = Vec::new();
+    for k in 383..=894 {
+        let half = (f64::from(k) + 0.5 - 384.0) / 510.0;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the f32 nearest a code's halfway value"
+        )]
+        let near = half as f32;
+        let (below, at, above) = (next(near, -1), f64::from(near), next(near, 1));
+        alphas.extend([half, below, at, above]);
+        alphas.extend(between(below, at));
+        alphas.extend(between(at, above));
+    }
+    let mut twin_alphas = edges.clone();
+    twin_alphas.extend(alphas.iter().map(|&a| [0.25, 0.5, 0.75, a]));
+    let cases = [
+        ((26, 2), &bfloats),
+        ((66, 4), &bfloats),
+        ((116, 8), &bfloats),
+        ((553, 8), &twin_alphas),
+        ((555, 4), &edges),
+        ((300, 4), &rgbx),
+        ((301, 4), &rgbx),
+        ((302, 4), &rgbx),
+        ((303, 4), &rgbx),
+        ((304, 4), &rgbx),
+        ((313, 8), &rgbx),
+        ((314, 8), &rgbx),
+        ((315, 8), &rgbx),
+        ((323, 16), &rgbx),
+        ((324, 16), &rgbx),
+        ((325, 16), &rgbx),
+    ];
+    let mut differ = Vec::new();
+    for ((format, bpp), colours) in cases {
+        let shape = (format, bpp);
+        let theirs =
+            packed_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, shape, colours);
+        let ours =
+            catch_death(|| packed_on::<VulkanPlatform>(&dev(), &vulkan_desc, shape, colours))
+                .unwrap_or_else(|site| {
+                    let line = crate::answer::LAST_LINE.lock().clone();
+                    panic!(
+                        "{format}: died at {} ({:?}): {line:?}",
+                        site.file, site.kind
+                    )
+                });
+        let texel = usize::try_from(bpp).unwrap();
+        let pairs = theirs.chunks(texel).zip(ours.chunks(texel));
+        for (colour, (m, o)) in colours.iter().zip(pairs) {
+            if m != o {
+                let bits = colour.map(f64::to_bits);
+                differ.push(format!(
+                    "{format} {bits:016x?}: ours {o:02x?} Metal {m:02x?}"
+                ));
+            }
+        }
+    }
+    let colour = [0.25, 0.5, 0.75, 1.0];
+    let targets = [(123, 16, "RGBA32Uint"), (10, 1, "R8Unorm")];
+    let mut crossed: Vec<(u64, (u64, u64, &str))> = [26, 66, 116, 553, 555]
+        .into_iter()
+        .flat_map(|format| targets.map(|target| (format, target)))
+        .collect();
+    crossed.push((300, (70, 4, "RGBA8Unorm")));
+    for (format, (target, bpp, name)) in crossed {
+        let fill = Fill::Color(0, 0, [0, 0, 0], [1, 1, 1], colour, format);
+        let case = read_case((target, bpp, [1, 1]), (2, [1, 1, 1], 1, 1), vec![fill]);
+        drop(fills_on::<reims_vgpu_metal::MetalPlatform>(
+            &metal,
+            &metal_desc,
+            &case,
+        ));
+        *crate::answer::LAST_LINE.lock() = None;
+        let into = format!("{format} into {name}");
+        match catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, &case)) {
+            Err(site) if site.file == "fillTexture:level:slice:region:color:pixelFormat:" => {
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                if !line.contains("into a texture of") {
+                    differ.push(format!("{into}: died otherwise: {line}"));
+                }
+            }
+            Err(site) => differ.push(format!("{into}: died at {site:?}")),
+            Ok(_) => differ.push(format!("{into}: taken")),
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} differ, the first: {:#?}",
+        differ.len(),
+        &differ[..differ.len().min(30)]
+    );
+}
+
+/// Fills of a compressed cube and cube array (`BC1_RGBA`, 8 by 8 texels a face), which the
+/// runtime fills in every texture type, write Metal's bytes on this host: bytes at faces
+/// past 6, which take the face modulo 6, at a slice past a cube array's, which writes
+/// nothing, at a region of one block and of the whole level, and a colour
+#[test]
+fn compressed_cube_fills_are_the_metal_platforms() {
+    let whole = ([0, 0, 0], [8, 8, 1]);
+    let block = ([4, 4, 0], [4, 4, 1]);
+    let fills = |slices: [u64; 4]| {
+        vec![
+            bytes_fill(0, slices[0], whole.0, whole.1, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            bytes_fill(0, slices[1], block.0, block.1, &[9, 10, 11]),
+            bytes_fill(0, slices[2], whole.0, whole.1, &[12, 13, 14, 15]),
+            color_fill((0, slices[3]), block, [0.25, 0.5, 0.75, 1.0], 70),
+        ]
+    };
+    fills_are_metals(&[
+        read_case((130, 8, [4, 4]), (5, [8, 8, 1], 1, 1), fills([0, 3, 7, 13])),
+        read_case(
+            (130, 8, [4, 4]),
+            (6, [8, 8, 1], 1, 2),
+            fills([7, 11, 12, 2]),
+        ),
+    ]);
+}
+
+/// A case of `format`, a texture of `texture_type` (a 2D texture 2, a 2D array 3, a cube 5,
+/// a cube array 6) of `extent`, `levels` and `array` slices, of `bpp` bytes a block of
+/// `block` texels, usage `ShaderRead`.
+fn read_case(
+    (format, bpp, block): (u64, u64, [u64; 2]),
+    (texture_type, extent, levels, array): (u64, [u64; 3], u64, u64),
+    fills: Vec<Fill>,
+) -> Case {
+    Case {
+        format,
+        bpp,
+        block,
+        aspects: &[],
+        texture_type,
+        extent,
+        levels,
+        array,
+        usage: 1,
+        allow_gpu_optimized_contents: None,
+        shared: false,
+        fills,
+    }
+}
+
+/// A fill with bytes, at `level` and `slice`, of the region at `origin` of `size`.
+fn bytes_fill(level: u64, slice: u64, origin: [u64; 3], size: [u64; 3], bytes: &[u8]) -> Fill {
+    Fill::Bytes(level, slice, origin, size, bytes.to_vec())
+}
+
+/// A fill of `color` packed in `pixel_format`, at `level` and `slice`, of the region at
+/// `origin` of `size`.
+fn color_fill(
+    (level, slice): (u64, u64),
+    (origin, size): ([u64; 3], [u64; 3]),
+    color: [f64; 4],
+    pixel_format: u64,
+) -> Fill {
+    Fill::Color(level, slice, origin, size, color, pixel_format)
+}
+
+/// A texture of a two-plane XR10 format (550, 551) of its own memory, a 2D one and a 2D
+/// array's slice, of a width a multiple of 4, is filled as Metal fills it: each texel's
+/// colour word the pattern cut at 4 bytes, or repeated to them, read back by the blits,
+/// which move the colour words; regions inside the level and past its edge, with bytes and
+/// with a colour packed in `RGBA8Unorm`
+#[test]
+fn two_plane_xr10_fills_off_a_surface_are_the_metal_platforms() {
+    let rgba = [1.0, 0.5, 0.25, 1.0];
+    let two_plane = |format| (format, 4, [1, 1]);
+    let (low, high) = ([0x21, 0x22, 0x23, 0x24], [0x31, 0x32, 0x33, 0x34]);
+    fills_are_metals(&[
+        read_case(
+            two_plane(550),
+            (2, [16, 3, 1], 1, 1),
+            vec![
+                bytes_fill(0, 0, [0, 0, 0], [16, 1, 1], &[1, 2, 3, 4, 5, 6, 7, 8]),
+                bytes_fill(0, 0, [3, 1, 0], [5, 1, 1], &[9, 10, 11]),
+                color_fill((0, 0), ([12, 2, 0], [8, 1, 1]), rgba, 70),
+            ],
+        ),
+        read_case(
+            two_plane(551),
+            (2, [8, 2, 1], 1, 1),
+            vec![bytes_fill(0, 0, [2, 0, 0], [4, 2, 1], &low)],
+        ),
+        read_case(
+            two_plane(550),
+            (3, [8, 2, 1], 1, 2),
+            vec![bytes_fill(0, 1, [0, 1, 0], [8, 1, 1], &high)],
+        ),
+    ]);
+}
+
+/// A texture of a format whose fill this module does not measure is filled by the runtime's
+/// fill as Metal fills it: a compressed format's blocks (BC1, BC7, ASTC 4x4, ETC2, EAC), each
+/// the pattern cut at the block's bytes or repeated to them, the region counting blocks and
+/// cut at the level's; a 4:2:2 format's texels, 2 bytes each; a stencil format's, 1 byte;
+/// `Depth32Float_Stencil8`'s depth, 4 bytes, read back as its depth; at a level past the first
+/// and a 2D array's slice, with bytes and with a colour packed in another format
+#[test]
+fn fills_the_runtime_writes_are_the_metal_platforms() {
+    let rgba = [1.0, 0.5, 0.25, 1.0];
+    let eight: Vec<u8> = (1..=8).collect();
+    let sixteen: Vec<u8> = (0x41..=0x50).collect();
+    fills_are_metals(&[
+        read_case(
+            (130, 8, [4, 4]),
+            (2, [8, 8, 1], 2, 1),
+            vec![
+                bytes_fill(0, 0, [1, 0, 0], [1, 2, 1], &eight),
+                bytes_fill(1, 0, [0, 0, 0], [1, 1, 1], &[0x61, 0x62, 0x63]),
+                color_fill((0, 0), ([0, 1, 0], [4, 4, 1]), rgba, 70),
+            ],
+        ),
+        read_case(
+            (152, 16, [4, 4]),
+            (3, [4, 4, 1], 1, 2),
+            vec![
+                bytes_fill(0, 1, [0, 0, 0], [1, 1, 1], &sixteen),
+                color_fill((0, 0), ([0, 0, 0], [1, 1, 1]), rgba, 115),
+            ],
+        ),
+        read_case(
+            (204, 16, [4, 4]),
+            (2, [8, 4, 1], 1, 1),
+            vec![bytes_fill(0, 0, [1, 0, 0], [1, 1, 1], &[1, 2, 3, 4, 5])],
+        ),
+        read_case(
+            (180, 8, [4, 4]),
+            (2, [8, 8, 1], 1, 1),
+            vec![bytes_fill(0, 0, [0, 1, 0], [2, 1, 1], &eight)],
+        ),
+        read_case(
+            (170, 8, [4, 4]),
+            (2, [4, 4, 1], 1, 1),
+            vec![color_fill((0, 0), ([0, 0, 0], [1, 1, 1]), rgba, 10)],
+        ),
+        read_case(
+            (240, 4, [2, 1]),
+            (2, [8, 2, 1], 1, 1),
+            vec![
+                bytes_fill(0, 0, [1, 0, 0], [3, 1, 1], &[1, 2, 3]),
+                bytes_fill(0, 0, [6, 1, 0], [4, 1, 1], &[0x71, 0x72]),
+            ],
+        ),
+        read_case(
+            (253, 1, [1, 1]),
+            (2, [4, 4, 1], 1, 1),
+            vec![
+                bytes_fill(0, 0, [1, 1, 0], [2, 2, 1], &[0x5a, 0x5b]),
+                color_fill((0, 0), ([0, 3, 0], [4, 1, 1]), rgba, 70),
+            ],
+        ),
+        read_case(
+            (260, 4, [1, 1]),
+            (2, [4, 2, 1], 1, 1),
+            vec![
+                bytes_fill(0, 0, [1, 0, 0], [2, 2, 1], &[0, 0, 0x80, 0x3f]),
+                color_fill((0, 0), ([0, 1, 0], [1, 1, 1]), [0.5; 4], 55),
+            ],
+        ),
+    ]);
+}
+
+/// The aspects of `Depth32Float_Stencil8`: its depth (option 1), 4 bytes a texel, and its
+/// stencil (option 2), 1 byte.
+const DEPTH_AND_STENCIL: &[(u64, u64)] = &[(1, 4), (2, 1)];
+
+/// A `Depth32Float_Stencil8` texture is filled as Metal fills it, its depth and its stencil
+/// read back apart: each texel's depth the pattern cut at 4 bytes, its stencil kept, at a
+/// level past the first and a 2D array's slice, with bytes and with a colour packed in
+/// another format
+#[test]
+fn depth32_stencil8_fills_keep_the_stencil_as_metals() {
+    let both = |c: Case| Case {
+        aspects: DEPTH_AND_STENCIL,
+        ..c
+    };
+    fills_are_metals(&[
+        both(read_case(
+            (260, 4, [1, 1]),
+            (2, [5, 3, 1], 2, 1),
+            vec![
+                bytes_fill(0, 0, [1, 0, 0], [2, 2, 1], &[0, 0, 0x80, 0x3f]),
+                bytes_fill(1, 0, [0, 0, 0], [100, 100, 1], &[0x11, 0x22, 0x33]),
+                color_fill((0, 0), ([0, 2, 0], [5, 1, 1]), [0.5; 4], 55),
+            ],
+        )),
+        both(read_case(
+            (260, 4, [1, 1]),
+            (3, [4, 2, 1], 1, 2),
+            vec![bytes_fill(0, 1, [0, 1, 0], [4, 1, 1], &[0, 0, 0, 0x3f])],
+        )),
+    ]);
+}
+
+/// An `X32_Stencil8` texture is filled as Metal fills it, its stencil written and read back
+/// by stencil copies (option 2): each texel's byte the pattern's first, the region cut at
+/// the level, with bytes and with a colour packed in another format, at a level past the
+/// first and a 2D array's slice
+#[test]
+fn x32_stencil8_fills_are_the_metal_platforms() {
+    let stencil = |c: Case| Case {
+        aspects: &[(2, 1)],
+        ..c
+    };
+    fills_are_metals(&[
+        stencil(read_case(
+            (261, 1, [1, 1]),
+            (2, [5, 3, 1], 2, 1),
+            vec![
+                bytes_fill(0, 0, [1, 1, 0], [2, 2, 1], &[0x5a, 0x5b]),
+                bytes_fill(0, 0, [3, 0, 0], [100, 1, 1], &[0x31]),
+                bytes_fill(1, 0, [0, 0, 0], [2, 1, 1], &[0x41, 0x42, 0x43]),
+                color_fill((0, 0), ([0, 2, 0], [5, 1, 1]), [1.0, 0.5, 0.25, 1.0], 70),
+            ],
+        )),
+        stencil(read_case(
+            (261, 1, [1, 1]),
+            (3, [4, 2, 1], 1, 2),
+            vec![bytes_fill(0, 1, [0, 1, 0], [4, 1, 1], &[0x77])],
+        )),
+    ]);
+}
+
+/// A `BGRG422` texture is filled as Metal fills it: each texel's 2 bytes the pattern cut at
+/// them or repeated to them, the region counting texels and cut at the level, with bytes and
+/// with a colour packed in another format
+#[test]
+fn bgrg422_fills_are_the_metal_platforms() {
+    fills_are_metals(&[read_case(
+        (241, 4, [2, 1]),
+        (2, [10, 3, 1], 1, 1),
+        vec![
+            bytes_fill(0, 0, [1, 0, 0], [3, 1, 1], &[1, 2, 3]),
+            bytes_fill(0, 0, [6, 1, 0], [40, 1, 1], &[0x71]),
+            color_fill((0, 0), ([0, 2, 0], [4, 1, 1]), [1.0, 0.5, 0.25, 1.0], 70),
+        ],
+    )]);
+}
+
+/// The PVRTC fill cases, of each PVRTC format but the sRGB twins at `allowGPUOptimizedContents`
+/// `allow`, shareable where `shared`, each `(format, block, side, x)`: a square texture of
+/// `side`, its second fill's region from block `x` across, past the level's blocks.
+fn pvrtc_fill_cases(
+    (allow, shared): (Option<bool>, bool),
+    formats: [(u64, [u64; 2], u64, u64); 4],
+) -> Vec<Case> {
+    let rgba = [1.0, 0.5, 0.25, 1.0];
+    let twelve: Vec<u8> = (1..=12).collect();
+    (formats.into_iter())
+        .map(|(format, block, side, x)| Case {
+            aspects: &[(4, 8)],
+            allow_gpu_optimized_contents: allow,
+            shared,
+            ..read_case(
+                (format, 8, block),
+                (2, [side, side, 1], 1, 1),
+                vec![
+                    bytes_fill(0, 0, [1, 1, 0], [1, 2, 1], &[0x61, 0x62, 0x63]),
+                    bytes_fill(0, 0, [x, 0, 0], [100, 1, 1], &twelve),
+                    color_fill((0, 0), ([0, 3, 0], [1, 1, 1]), rgba, 70),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// A shareable texture (`newSharedTextureWithDescriptor:`) of each PVRTC format but the sRGB
+/// twins at the suite's shape (16x16, `Private`, `ShaderRead`, `allowGPUOptimizedContents`
+/// off) is filled as Metal fills it: each block's 8 bytes the pattern cut at them or repeated
+/// to them, the region counting blocks (8 by 4 texels at 2 bits a texel, 4 by 4 at 4) and cut
+/// at the level's, with bytes and with a colour packed in another format. Its bytes are
+/// written and read back row by row (`MTLBlitOptionRowLinearPVRTC`), as
+/// `pvrtc_row_linear_copies_are_the_metal_platforms` measured those copies
+#[test]
+fn pvrtc_fills_are_the_metal_platforms() {
+    fills_are_metals(&pvrtc_fill_cases(
+        (Some(false), true),
+        [
+            (160, [8, 4], 16, 1),
+            (162, [4, 4], 16, 2),
+            (164, [8, 4], 16, 1),
+            (166, [4, 4], 16, 2),
+        ],
+    ));
+}
+
+/// The PVRTC textures the fills were first measured with (32x32 at 2 bits a texel, 16x16 at
+/// 4, `allowGPUOptimizedContents` on), and those of the suite's shape the fills are measured
+/// with, die where `newTextureWithDescriptor:` makes them, as
+/// [`unmeasured_pvrtc_texture_dies`] says: their fills' bytes match Metal's, but no model
+/// gives Metal's size of them
+#[test]
+fn pvrtc_fill_textures_die_where_made() {
+    let suites = pvrtc_fill_cases(
+        (Some(false), false),
+        [
+            (160, [8, 4], 16, 1),
+            (162, [4, 4], 16, 2),
+            (164, [8, 4], 16, 1),
+            (166, [4, 4], 16, 2),
+        ],
+    );
+    let cases = pvrtc_fill_cases(
+        (None, false),
+        [
+            (160, [8, 4], 32, 2),
+            (162, [4, 4], 16, 2),
+            (164, [8, 4], 32, 2),
+            (166, [4, 4], 16, 2),
+        ],
+    );
+    for c in cases.iter().chain(&suites) {
+        unmeasured_pvrtc_texture_dies(&texture_of(c));
+    }
+}
+
+/// A texture of the ASTC formats of HDR blocks (4 by 4 and 12 by 12) is filled as Metal fills
+/// it: each block's 16 bytes the pattern cut at them or repeated to them, the region counting
+/// blocks and cut at the level's, at a level past the first, with bytes and with a colour
+/// packed in another format
+#[test]
+fn astc_hdr_fills_are_the_metal_platforms() {
+    fills_are_metals(&astc_cases(&[(222, [4, 4]), (236, [12, 12])]));
+}
+
+/// A texture of the ASTC formats of blocks other than 4 by 4 (5 by 4 sRGB, 10 by 10 sRGB,
+/// 8 by 8 and 12 by 12) is filled as Metal fills it, as
+/// [`astc_hdr_fills_are_the_metal_platforms`] says
+#[test]
+fn astc_fills_of_other_blocks_are_the_metal_platforms() {
+    fills_are_metals(&astc_cases(&[
+        (187, [5, 4]),
+        (198, [10, 10]),
+        (212, [8, 8]),
+        (218, [12, 12]),
+    ]));
+}
+
+/// Each ASTC `(format, block)`'s cases: a texture of 4 by 3 blocks and two levels, filled in
+/// a region of blocks, past its level's edge at level 1, and with a colour packed in
+/// `RGBA32Float` in one block.
+fn astc_cases(formats: &[(u64, [u64; 2])]) -> Vec<Case> {
+    let sixteen: Vec<u8> = (0x41..=0x50).collect();
+    formats
+        .iter()
+        .map(|&(format, block)| {
+            read_case(
+                (format, 16, block),
+                (2, [4 * block[0], 3 * block[1], 1], 2, 1),
+                vec![
+                    bytes_fill(0, 0, [1, 1, 0], [2, 1, 1], &sixteen),
+                    bytes_fill(1, 0, [0, 0, 0], [100, 100, 1], &[1, 2, 3, 4, 5]),
+                    color_fill((0, 0), ([3, 2, 0], [1, 1, 1]), [1.0, 0.5, 0.25, 1.0], 125),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// The bytes of a placement heap of storage `storage` (0 Shared, 2 Private) on `P`'s `d`
+/// after `fills` into a texture of `format` (550 or 551) of `size`, of one level, at its
+/// offset 0, in one blit encoder. A buffer placed over the texture's span and 4096 bytes past
+/// it, each first its offset's low byte, reads the heap's bytes, the alpha plane's among
+/// them, through a copy into a Shared buffer.
+fn two_plane_heap_fill_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    (storage, format, (w, h)): (u64, u64, (u64, u64)),
+    fills: &[Fill],
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::resource::Heap as _;
+    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+    let heap = d
+        .new_heap(&HeapDesc {
+            size: 0x10000,
+            heap_type: 1,
+            options: vec![
+                OptionSet::StorageMode(storage),
+                OptionSet::HazardTrackingMode(0),
+            ],
+            address_ranges: None,
+            pinned_gpu_address: None,
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+    let into = desc(&TextureDesc {
+        pixel_format: format,
+        width: w,
+        height: h,
+        usage: 0x1,
+        resource_options: Some(0x100 | storage << 4),
+        ..TextureDesc::default()
+    });
+    let size = d.heap_texture_size_and_align(&into).unwrap().size;
+    let t = heap.new_texture(&into, 0).unwrap().unwrap();
+    let span = size + 4096;
+    let over = heap
+        .new_buffer_of_length(span, storage << 4, 0)
+        .unwrap()
+        .unwrap();
+    let n = usize::try_from(span).unwrap();
+    let shared = |bytes: &[u8]| {
+        let b = d
+            .new_buffer_of_length(OnFault::Die, span, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a Shared buffer of `span` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr::<u8>(), n);
+        }
+        b
+    };
+    let q = d.new_command_queue().unwrap();
+    let run = |cmds: Vec<BlitCmd<'_, P>>| {
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in cmds {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+    };
+    let copy = |from, to| BlitCmd::CopyBufferToBuffer {
+        source_buffer: Some(from),
+        source_offset: 0,
+        destination_buffer: Some(to),
+        destination_offset: 0,
+        size: span,
+    };
+    let offsets: Vec<u8> = (0..n).map(|i| (i & 0xff) as u8).collect();
+    let first = shared(&offsets);
+    run(vec![copy(&first, &over)]);
+    run(fills.iter().map(|f| fill_of::<P>(&t, f)).collect());
+    let back = shared(&vec![0; n]);
+    run(vec![copy(&over, &back)]);
+    // SAFETY: a Shared buffer's `span` bytes, read after the copy completed.
+    unsafe { std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// A fill of a placement heap's one-level 2D texture of a two-plane XR10 format (550, 551),
+/// Shared or Private, writes the heap's bytes as Metal's fill does on this host, byte for
+/// byte ([`two_plane_heap_fill_on`]): each texel's colour word at Metal's blit rows, which
+/// overlap where the width is no multiple of 4, the alpha plane and the heap's other bytes
+/// kept; with bytes and with a colour packed in `RGBA8Unorm`, in one encoder
+#[test]
+fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
+    let d = dev();
+    let p = crate::platform::tests::platform();
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let fills = [
+        bytes_fill(0, 0, [0, 0, 0], [100, 100, 1], &[1, 2, 3]),
+        bytes_fill(
+            0,
+            0,
+            [1, 1, 0],
+            [3, 2, 1],
+            &(0x41..=0x48).collect::<Vec<u8>>(),
+        ),
+        color_fill((0, 0), ([2, 3, 0], [2, 1, 1]), [1.0, 0.5, 0.25, 1.0], 70),
+    ];
+    for storage in [0, 2] {
+        for format in [550, 551] {
+            for size in [(16, 8), (6, 5)] {
+                let case = (storage, format, size);
+                let theirs = two_plane_heap_fill_on::<reims_vgpu_metal::MetalPlatform>(
+                    &metal,
+                    &metal_desc,
+                    case,
+                    &fills,
+                );
+                let ours = catch_death(|| {
+                    two_plane_heap_fill_on::<VulkanPlatform>(&d, &ours_desc, case, &fills)
+                })
+                .unwrap_or_else(|site| {
+                    let line = crate::answer::LAST_LINE.lock().clone();
+                    panic!(
+                        "{case:?}: died at {} ({:?}): {line:?}",
+                        site.file, site.kind
+                    )
+                });
+                assert_eq!(ours.len(), theirs.len(), "{case:?}: the bytes read");
+                let differ: Vec<usize> =
+                    (0..ours.len()).filter(|&i| ours[i] != theirs[i]).collect();
+                assert!(
+                    differ.is_empty(),
+                    "{case:?}: {} bytes differ, from {:?}",
+                    differ.len(),
+                    differ.first()
+                );
+            }
+        }
+    }
+}
+
+/// A fill of a two-plane XR10 texture of its own memory, 16 texels wide, keeps its alpha
+/// plane as Metal's does: a kernel writes its texels, a fill with bytes and one with a colour
+/// packed in `RGBA8Unorm` write their colour words, and a copy of the whole level into a
+/// heap's texture, which moves both planes as Metal's does
+/// ([`two_plane_copies_into_a_heap_are_the_metal_platforms`]), reads the heap's bytes, the
+/// alpha plane's among them ([`two_plane_copy_into_heap_on`])
+///
+/// The runtime binds a two-plane XR10 texture to its kernels as `RGBA16Float`, a format that may
+/// hold a NaN, and announces `device-nan-encoding` there: the first dispatch of this platform's
+/// side dies, naming the kind ([`crate::answer::DIES`]).
+#[test]
+fn two_plane_fills_off_a_surface_keep_the_alpha_as_metals() {
+    let d = dev();
+    let p = crate::platform::tests::platform();
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let fills = [
+        bytes_fill(0, 0, [1, 1, 0], [5, 3, 1], &(1..=8).collect::<Vec<u8>>()),
+        color_fill((0, 0), ([8, 0, 0], [8, 8, 1]), [1.0, 0.5, 0.25, 1.0], 70),
+    ];
+    let theirs = two_plane_copy_into_heap_on::<reims_vgpu_metal::MetalPlatform>(
+        &metal,
+        &metal_desc,
+        0,
+        None,
+        &fills,
+    );
+    assert!(!theirs.is_empty(), "the bytes Metal read");
+    let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
+        two_plane_copy_into_heap_on::<VulkanPlatform>(&d, &ours_desc, 0, None, &fills)
+    });
+    assert_eq!(site.file, "dispatchThreads:threadsPerThreadgroup:");
+}
+
+/// fillBuffer:range:pattern4: writes what Metal writes: the pattern from the range's start,
+/// cut at its end, nothing for an empty range, and across more than the staging buffer
+#[test]
+fn pattern_fills_are_the_metal_platforms() {
+    use reims_vgpu_core::platform::Platform;
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    fn on<P: Platform>(d: &P::Device) -> Vec<u8> {
+        let length = 9 << 20;
+        let b = d
+            .new_buffer_of_length(OnFault::Return, length, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a fresh Shared buffer of `length` bytes, written before any use.
+        unsafe { std::ptr::write_bytes(b.contents().as_ptr::<u8>(), 0xee, length as usize) };
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        let long = length - 120;
+        for (at, n) in [
+            (1, 6),
+            (9, 8),
+            (13, 1),
+            (20, 0),
+            (24, 12),
+            (41, 7),
+            (63, 33),
+            (99, long),
+        ] {
+            let fill = BlitCmd::FillBufferPattern4 {
+                buffer: &b,
+                range: NsRange::new(at, n),
+                pattern: 0x0403_0201,
+            };
+            e.encode(OnFault::Return, fill).unwrap();
+        }
+        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        // SAFETY: the buffer's bytes, read after the GPU's writes completed.
+        unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), length as usize) }.to_vec()
+    }
+    let (ours, theirs) = (
+        on::<VulkanPlatform>(&dev()),
+        on::<reims_vgpu_metal::MetalPlatform>(&metal),
+    );
+    assert_eq!(&ours[..64], &theirs[..64]);
+    assert!(ours == theirs, "the long fill differs");
+}
+
+/// The runtime's record of Metal's `generateMipmapsForTexture:` on an Apple M4:
+/// textures of `RGB10A2Unorm` and `BGR10A2Unorm` whose first levels were designed, footprint by
+/// footprint, so that the 2-bit alpha's weighted sums fall near the halves of its grid, and
+/// every texel of their first computed levels where the 2-bit grid's code and the code of the
+/// 10-bit code the bits replicate to differ. A `chain` line names a format and a first level's
+/// extent; each line below it is a texel of the first computed level: its position, the alpha
+/// codes of its four taps (base 4: the first tap's, the next across, the next down, the next
+/// across and down) and the code Metal stored.
+const TWO_BIT_TIES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../metal2vulkan-integration/crates/metal2vulkan",
+    "/src/bind/mipmap_filter/measured_2bit.txt"
+));
+
+/// `MTLPixelFormatRGB10A2Unorm` and `MTLPixelFormatBGR10A2Unorm`, whose alpha is a texel's top
+/// two bits.
+const TEN_BIT_FORMATS: [(&str, u64); 2] = [
+    ("MTLPixelFormatRGB10A2Unorm", 90),
+    ("MTLPixelFormatBGR10A2Unorm", 94),
+];
+
+/// A designed texel of a chain of [`TWO_BIT_TIES`]: its position in the first computed level,
+/// its taps' alpha codes, and the code Metal stored.
+type Tie = ([u64; 2], [u8; 4], u8);
+
+/// The chains of [`TWO_BIT_TIES`]: each one's format, first level's extent, and texels.
+fn two_bit_chains() -> Vec<(u64, [u64; 2], Vec<Tie>)> {
+    let mut chains: Vec<(u64, [u64; 2], Vec<Tie>)> = Vec::new();
+    for line in TWO_BIT_TIES.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [] => {}
+            [first, ..] if first.starts_with('#') => {}
+            ["chain", name, extent] => {
+                let (_, format) = TEN_BIT_FORMATS.iter().find(|(n, _)| n == name).unwrap();
+                let (w, h) = extent.split_once('x').unwrap();
+                chains.push((
+                    *format,
+                    [w.parse().unwrap(), h.parse().unwrap()],
+                    Vec::new(),
+                ));
+            }
+            [x, y, codes, stored] => {
+                let codes = codes.as_bytes();
+                assert_eq!(codes.len(), 4, "{line}");
+                let tie = (
+                    [x.parse().unwrap(), y.parse().unwrap()],
+                    std::array::from_fn(|k| codes[k] - b'0'),
+                    stored.parse().unwrap(),
+                );
+                chains.last_mut().unwrap().2.push(tie);
+            }
+            _ => panic!("a line of no form: {line}"),
+        }
+    }
+    chains
+}
+
+/// The first of the two texels along an axis of `big` texels that texel `i` of the next level,
+/// of `small` texels (a power of two), reads in Metal's filter, as the runtime places it: its
+/// centre `(i + 1/2) big / small - 1/2`, floored, or the texel after where the centre's
+/// fraction rounds to a whole 256th. Every operand is exact in `f32` at these sizes, as on the
+/// GPU, whose reciprocal of a power of two is exact on the M3 Max and the M4 alike.
+fn first_tap(i: u64, big: u64, small: u64) -> u64 {
+    assert!(small.is_power_of_two(), "{small}");
+    let (centre, den) = ((2 * i + 1) * big - small, 2 * small);
+    let (tap, fraction) = (centre / den, centre % den);
+    // The fraction in 256ths, rounded half up.
+    let q = (2 * 256 * fraction + den) / (2 * den);
+    if q == 256 { tap + 1 } else { tap }
+}
+
+/// The first level of `extent` of a chain of [`two_bit_chains`]: `noise(seed, ..)`, 4 bytes a
+/// texel, but for each designed texel's four taps, whose alpha is the code it lists.
+fn designed_first_level(extent: [u64; 2], ties: &[Tie], seed: u32) -> Vec<u8> {
+    let [w, h] = extent;
+    let mut texels = noise(seed, w * h * 4);
+    let small = extent.map(|e| e / 2);
+    for &([x, y], codes, _) in ties {
+        let (x0, y0) = (first_tap(x, w, small[0]), first_tap(y, h, small[1]));
+        for (k, &code) in codes.iter().enumerate() {
+            let (dx, dy) = (u64::try_from(k % 2).unwrap(), u64::try_from(k / 2).unwrap());
+            let at = ((y0 + dy).min(h - 1) * w + (x0 + dx).min(w - 1)) * 4 + 3;
+            let byte = &mut texels[usize::try_from(at).unwrap()];
+            *byte = (*byte & 0x3f) | (code << 6);
+        }
+    }
+    texels
+}
+
+/// Each level of a Private 2D texture of `format` (4 bytes a texel, 8 for `BGRA10_XR` and
+/// `BGRA10_XR_sRGB`), `extent` and `levels` levels, of `usage`, on platform `P`, its first
+/// level `first`, read back once `generateMipmapsForTexture:` made the others.
+fn mipmaps_on<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
+    (format, extent, levels): (u64, [u64; 2], u64),
+    usage: u64,
+    first: &[u8],
+) -> Vec<Vec<u8>> {
+    let t = d
+        .new_texture(
+            OnFault::Return,
+            &desc(&TextureDesc {
+                pixel_format: format,
+                width: extent[0],
+                height: extent[1],
+                mipmap_level_count: levels,
+                usage,
+                resource_options: Some(0x20),
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let buffer_of = |bytes: &[u8]| {
+        let b = d
+            .new_buffer_of_length(OnFault::Return, bytes.len() as u64, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a fresh Shared buffer of `bytes.len()` bytes, written before any use.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr(), bytes.len())
+        };
+        b
+    };
+    let run = |cmds: Vec<BlitCmd<'_, P>>| {
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in cmds.into_iter().chain([BlitCmd::EndEncoding]) {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+    };
+    let extent_of = |level: u64| extent.map(|e| (e >> level).max(1));
+    let texel = match format {
+        552 | 553 => 8,
+        _ => 4,
+    };
+    let up = buffer_of(first);
+    run(vec![BlitCmd::CopyBufferToTexture {
+        source_buffer: &up,
+        source_offset: 0,
+        source_bytes_per_row: extent[0] * texel,
+        source_bytes_per_image: extent[0] * extent[1] * texel,
+        source_size: MtlSize::new(extent[0], extent[1], 1),
+        destination_texture: &t,
+        destination_slice: 0,
+        destination_level: 0,
+        destination_origin: MtlOrigin::new(0, 0, 0),
+    }]);
+    run(vec![BlitCmd::GenerateMipmaps { texture: Some(&t) }]);
+    let downs: Vec<_> = (0..levels)
+        .map(|level| {
+            let [w, h] = extent_of(level);
+            buffer_of(&vec![0x55; usize::try_from(w * h * texel).unwrap()])
+        })
+        .collect();
+    run((0..levels)
+        .zip(&downs)
+        .map(|(level, down)| {
+            let [w, h] = extent_of(level);
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &t,
+                source_slice: 0,
+                source_level: level,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(w, h, 1),
+                destination_buffer: down,
+                destination_offset: 0,
+                destination_bytes_per_row: w * texel,
+                destination_bytes_per_image: w * h * texel,
+            }
+        })
+        .collect());
+    downs
+        .iter()
+        .map(|b| {
+            let length = usize::try_from(b.length()).unwrap();
+            // SAFETY: a Shared buffer's bytes, read after the GPU's writes completed.
+            unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), length) }.to_vec()
+        })
+        .collect()
+}
+
+/// `generateMipmapsForTexture:` of `RGB10A2Unorm` and `BGR10A2Unorm` textures writes Metal's
+/// levels, byte for byte, the 2-bit alpha's at sums a hair from a half of its grid included,
+/// and announces neither `mipmap-tie-rounding` nor `mipmaps-as-apple-m4`. The runtime filters
+/// that alpha as the 10-bit code its bits replicate to, taken to that code's nearest 2-bit
+/// code, and floors each filter tap's term of a 10-bit field to 2^-14 of a code before the sum,
+/// where the exact sum missed the M3 Max's code by one at a field
+/// four times whose sum lay a hair from a half. The textures are [`TWO_BIT_TIES`]' chains of
+/// two levels, whose first levels are the runtime's designs over random colours, and at each
+/// designed texel both platforms store the code an M4 stored; and chains of every level from
+/// 64 by 64 and 45 by 29 texels of random bytes, whose levels the runtime takes from the M3
+/// Max's passes
+#[test]
+fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let designed = two_bit_chains()
+        .into_iter()
+        .map(|(format, extent, ties)| ((format, extent, 2), ties));
+    let whole = TEN_BIT_FORMATS.into_iter().flat_map(|(_, format)| {
+        [([64, 64], 7), ([45, 29], 6)]
+            .map(|(extent, levels)| ((format, extent, levels), Vec::new()))
+    });
+    let mut differ = Vec::new();
+    let mut seed = 0;
+    for (chain, ties) in designed.chain(whole) {
+        seed += 1;
+        let (format, extent, levels) = chain;
+        let what = format!(
+            "format {format} {}x{} of {levels} levels",
+            extent[0], extent[1]
+        );
+        let first = designed_first_level(extent, &ties, seed);
+        let theirs =
+            mipmaps_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, chain, 1, &first);
+        let ours =
+            catch_death(|| mipmaps_on::<VulkanPlatform>(&dev(), &vulkan_desc, chain, 1, &first))
+                .unwrap_or_else(|site| {
+                    let line = crate::answer::LAST_LINE.lock().clone();
+                    panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
+                });
+        for (level, (o, m)) in ours.iter().zip(&theirs).enumerate() {
+            let width = usize::try_from((extent[0] >> level).max(1)).unwrap();
+            let wrong = o
+                .chunks(4)
+                .zip(m.chunks(4))
+                .enumerate()
+                .filter(|(_, (a, b))| a != b);
+            let count = wrong.clone().count();
+            if let Some((i, (a, b))) = wrong.into_iter().next() {
+                differ.push(format!(
+                    "{what} level {level}: {count} texels differ, the first ({}, {}): ours \
+                     {a:02x?}, Metal {b:02x?}",
+                    i % width,
+                    i / width
+                ));
+            }
+        }
+        // The alpha each platform stored at the designed texels of the first computed level.
+        let width = extent[0] / 2;
+        let alpha = |level: &[u8], [x, y]: [u64; 2]| {
+            level[usize::try_from((y * width + x) * 4 + 3).unwrap()] >> 6
+        };
+        for (platform, levels) in [("ours", &ours), ("Metal", &theirs)] {
+            let missed: Vec<_> = (ties.iter())
+                .filter(|&&(at, _, stored)| alpha(&levels[1], at) != stored)
+                .map(|&(at, codes, stored)| (at, codes, stored, alpha(&levels[1], at)))
+                .collect();
+            if !missed.is_empty() {
+                differ.push(format!(
+                    "{what}: {platform} stored another alpha than the M4 at {} of {} \
+                     designed texels, the first (position, taps, the M4's, stored): {:?}",
+                    missed.len(),
+                    ties.len(),
+                    missed[0]
+                ));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+    let relayed = crate::answer::RELAYED.lock().clone();
+    for kind in [
+        rt::Degradation::MipmapTieRounding,
+        rt::Degradation::MipmapsAsAppleM4,
+    ] {
+        assert!(!relayed.contains(&kind), "{} was relayed", kind.code());
+    }
+}
+
+/// What fails a test of `generateMipmapsForTexture:` of chains of each of `formats`, of 4
+/// bytes a texel, whose levels the runtime takes from the Apple M3 Max's passes: a level
+/// whose bytes are not Metal's on this host, and `mipmaps-as-apple-m4` announced. The chains
+/// are Private textures of random bytes, of every level: of `ShaderRead` usage, 256 by 256
+/// (Maps' chain's shape), 2048 by 32 and 32 by 2048, which Metal keeps losslessly compressed
+/// and whose passes take the M3 Max's step after a level one texel tall or wide, and the strips
+/// 1024 by 12, 4096 by 1 and 1000 by 3, which Metal does not compress; and of `ShaderWrite`
+/// usage too, 256 by 256, which Metal does not compress, whose passes the runtime knows for
+/// every format
+fn m3_max_chains(formats: &[u64]) -> Vec<String> {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return Vec::new();
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    let chains = [
+        ([256, 256], 9),
+        ([2048, 32], 12),
+        ([32, 2048], 12),
+        ([1024, 12], 11),
+        ([4096, 1], 13),
+        ([1000, 3], 10),
+    ];
+    crate::answer::RELAYED.lock().clear();
+    let mut differ = Vec::new();
+    let mut seed = 0x6d33;
+    let written = ([256, 256], 9, 3);
+    let read = chains.map(|(extent, levels)| (extent, levels, 1));
+    for &format in formats {
+        for (extent, levels, usage) in read.into_iter().chain([written]) {
+            seed += 1;
+            let chain = (format, extent, levels);
+            let what = format!(
+                "format {format} {}x{} of {levels} levels, usage {usage}",
+                extent[0], extent[1]
+            );
+            let first = noise(seed, extent[0] * extent[1] * 4);
+            let theirs = mipmaps_on::<reims_vgpu_metal::MetalPlatform>(
+                &metal,
+                &metal_desc,
+                chain,
+                usage,
+                &first,
+            );
+            let ours = catch_death(|| {
+                mipmaps_on::<VulkanPlatform>(&dev(), &vulkan_desc, chain, usage, &first)
+            })
+            .unwrap_or_else(|site| {
+                let line = crate::answer::LAST_LINE.lock().clone();
+                panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
+            });
+            for (level, (o, m)) in ours.iter().zip(&theirs).enumerate() {
+                let wrong = o.chunks(4).zip(m.chunks(4)).filter(|(a, b)| a != b).count();
+                if wrong != 0 {
+                    differ.push(format!("{what} level {level}: {wrong} texels differ"));
+                }
+            }
+        }
+    }
+    let kind = rt::Degradation::MipmapsAsAppleM4;
+    if crate::answer::RELAYED.lock().contains(&kind) {
+        differ.push(format!("{} was relayed", kind.code()));
+    }
+    differ
+}
+
+/// `generateMipmapsForTexture:` of `BGRA8Unorm`, `RGBA8Unorm`, `RGB10A2Unorm` and `RG16Unorm`
+/// chains writes Metal's levels on this host, byte for byte, and announces no
+/// `mipmaps-as-apple-m4` ([`m3_max_chains`])
+#[test]
+fn m3_max_mipmap_passes_are_the_metal_platforms() {
+    let differ = m3_max_chains(&[80, 70, 90, 60]);
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// `generateMipmapsForTexture:` of `RG11B10Float` chains, past 65 texels among them, writes
+/// Metal's levels on this host, byte for byte, and announces no `mipmaps-as-apple-m4`
+/// ([`m3_max_chains`]): the runtime takes them from the M3 Max's passes, its tail reading an
+/// axis of one texel alone
+#[test]
+fn rg11b10_float_mipmaps_are_the_metal_platforms() {
+    let differ = m3_max_chains(&[92]);
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// `generateMipmapsForTexture:` of `BGRA10_XR` and `BGR10_XR` textures writes Metal's levels
+/// on this host, byte for byte, and announces neither `mipmap-tie-rounding` nor
+/// `mipmaps-as-apple-m4`. The runtime floors each filter tap's term before the sum,
+/// where the exact sum missed the M3 Max's code by one at a level's ties. The chains are
+/// Private textures of `ShaderRead` usage and random codes, of every level: 64 by 64, 45 by
+/// 29 and 256 by 256
+#[test]
+fn extended_range_mipmaps_are_the_metal_platforms() {
+    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
+        return;
+    };
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    crate::answer::RELAYED.lock().clear();
+    let mut differ = Vec::new();
+    let mut seed = 0x7872;
+    for (format, texel) in [(552, 8), (554, 4)] {
+        for (extent, levels) in [([64, 64], 7), ([45, 29], 6), ([256, 256], 9)] {
+            seed += 1;
+            let chain = (format, extent, levels);
+            let what = format!(
+                "format {format} {}x{} of {levels} levels",
+                extent[0], extent[1]
+            );
+            let first = noise(seed, extent[0] * extent[1] * texel);
+            let theirs = mipmaps_on::<reims_vgpu_metal::MetalPlatform>(
+                &metal,
+                &metal_desc,
+                chain,
+                1,
+                &first,
+            );
+            let ours = catch_death(|| {
+                mipmaps_on::<VulkanPlatform>(&dev(), &vulkan_desc, chain, 1, &first)
+            })
+            .unwrap_or_else(|site| {
+                let line = crate::answer::LAST_LINE.lock().clone();
+                panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
+            });
+            for (level, (o, m)) in ours.iter().zip(&theirs).enumerate() {
+                let step = usize::try_from(texel).unwrap();
+                let wrong = (o.chunks(step).zip(m.chunks(step)))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                if wrong != 0 {
+                    differ.push(format!("{what} level {level}: {wrong} texels differ"));
+                }
+            }
+        }
+    }
+    for kind in [
+        rt::Degradation::MipmapTieRounding,
+        rt::Degradation::MipmapsAsAppleM4,
+    ] {
+        if crate::answer::RELAYED.lock().contains(&kind) {
+            differ.push(format!("{} was relayed", kind.code()));
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}

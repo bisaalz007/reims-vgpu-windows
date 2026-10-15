@@ -1,16 +1,108 @@
-# Cargo workspace for the project's host-side product crate.
-#
-# Product path: crates/reims-vgpu (protocol + C ABI + Metal|Vulkan backend).
-# UEFI option ROM: crates/reims-vgpu-efi (own Cargo workspace — x86_64-unknown-uefi;
-# not a member here so host builds never pull the no_std PE graph).
+# ReimsVGPU: the framework and its tooling (architecture.md).
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
-  "crates/reims-vgpu",
-]
-exclude = [
-  "crates/reims-vgpu-efi",
+    "crates/reims-vgpu-core",
+    "crates/reims-vgpu-metal",
+    "crates/reims-vgpu-window",
+    "crates/reims-vgpu",
+    "crates/reims-vgpu-c",
+    "crates/reims-vgpu-vulkan",
+    "xtask",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
+
+[workspace.dependencies]
+reims-vgpu-core = { path = "crates/reims-vgpu-core" }
+reims-vgpu-metal = { path = "crates/reims-vgpu-metal" }
+# Without their default features: each member that wants SDL3's macOS window asks for it
+# (`macos-sdl`), so `reims-vgpu-c`'s default decides whether the library has it.
+reims-vgpu-window = { path = "crates/reims-vgpu-window", default-features = false }
+reims-vgpu = { path = "crates/reims-vgpu", default-features = false }
+reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
+# The Vulkan platform's proof of concept (architecture D1): a Metal-shaped API on Vulkan, from
+# metal2vulkan's public repository at the commit both name.
+metal2vulkan-runtime = { git = "https://github.com/tqmane/metal2vulkan", rev = "8556e6e4fe54fd8edcf45d48415242a2ac875421" }
+# Its translator, for the Metal enums and descriptor values the runtime's calls take.
+metal2vulkan = { git = "https://github.com/tqmane/metal2vulkan", rev = "8556e6e4fe54fd8edcf45d48415242a2ac875421" }
+# The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
+sha2 = "0.10.9"
+# A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's
+# version: `loaded` opens the Vulkan loader at run time, as the runtime does.
+ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
+# A display's window on Linux, and on macOS with REIMS_VGPU_WINDOW_IMPL=sdl
+# (reims-vgpu-window/src/sdl): SDL3, built from its pinned source release (sdl3-src 3.4.18) and
+# linked statically, with its video subsystem alone; its Vulkan types are ash's.
+sdl3-sys = { version = "=0.7.2", default-features = false, features = [
+    "build-from-source-static",
+    "no-default-subsystems",
+    "sdl-video",
+    "use-ash-v0-38",
+] }
+# core (architecture 2.2)
+parking_lot = "0.12.5"
+zerocopy = { version = "0.8.27", features = ["derive"] }
+bitflags = "2.9"
+# every crate's lines, and the default stderr logger (core::logging)
+log = "0.4.34"
+# metal and the public crate. objc2 `exception` is always on; `catch-all` is never enabled
+# (architecture 2.3). objc2's checks (a message to nil, a missing method, the encodings) are
+# debug assertions: on in dev, off in `checked` (the objc2 profile override below).
+objc2 = { version = "0.6.4", features = ["exception"] }
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-io-surface = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+# the window crate (AppKit, Core Animation, CoreGraphics). Default features off: their defaults
+# pull in every framework the crates cover (objc2-open-gl among them).
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
+mach2 = "0.7"
+libc = "0.2.180"
+# dev and tooling
+proptest = "1.7"
+loom = "0.7"
+
+# Architecture 17.4. reims-vgpu-core adds its stricter set in lib.rs.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+
+# Architecture 2.3.
 [profile.release]
-opt-level = 2
+panic = "unwind"               # D9: objc2 exception::catch unwinds through its closure frame
+overflow-checks = false        # wrapping is explicit (D19); release is the product
+debug = "line-tables-only"
+lto = "thin"
+
+[profile.dev]
+panic = "unwind"
+overflow-checks = true         # an unannotated arithmetic slip dies in tests
+
+[profile.checked]              # the suite's second pass (13.6)
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+
+# objc2's debug_assertions checks panic on a message to nil, on a missing
+# method and on an encoding the runtime disagrees with. Dev builds keep them,
+# so the tests that send to real Metal check every send they make; the
+# suite's `checked` pass leaves them off, and release has none at all (D36).
+[profile.checked.package.objc2]
+debug-assertions = false

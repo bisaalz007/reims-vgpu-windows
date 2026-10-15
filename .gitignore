@@ -1,58 +1,22 @@
+# Build output: QEMU's builds, the coverage build and the VM clones.
+/build/
 
-build/
-# build output
-.cache/
-# caches / scratch
-dist/
-*.dmg
-.DS_Store
-# editor / OS cruft
-*.fd
-/target/
-/host/target/
-.idea/
-# (Negations must re-include the parent dir before re-including files within it.)
-*.o
-OVMF_VARS*.fd
-*.part
-*.png
-!/assets/
-!/assets/readme/
-!/assets/readme/reims-vgpu-macos-arm64-desktop.png
-!/assets/readme/reims-vgpu-macos-x86-desktop.png
-*.ppm
+# Windows development caches, private diagnostics and guest state.
+/.work/
+/vm/
+/vendor/metal2vulkan/
+
+# The option ROM's build, when make runs in firmware/ (cargo xtask dist builds
+# it under the target directory).
+/firmware/build/
+
+# Python's bytecode caches.
 __pycache__/
-*.qcow2
-*.spv
-*.spv.h
-*.swp
-/vm/*
-!/vm/boot-arm64.sh
-!/vm/boot-x86.sh
-vm/debug/
-vm/logs/
-# OVMF firmware blobs (CODE/VARS .fd) — large binary runtime, never commit
-/vm/ovmf/
-!/vm/README.md
-!/vm/.version
-.vscode/
-Vulkan-Headers/
-.claude/worktrees/
-.claude/settings.local.json
-/.agents/
 
-# Private research notes and handoff material.
-/kb/
-/journal/
-/m2v-handoff/
+# Editor / OS
+.DS_Store
 
-# vendor/qemu is a git submodule (steelbrain/qemu-reims-vgpu, branch host-reims-vgpu-vmapple).
-# Its own build/ output is ignored by QEMU's own .gitignore.
-
-# In-workspace vmapple guest bundle (provisioned by scripts/vmapple-provision;
-# disk/aux images + instance-specific vm.json + per-boot run scratch). Large/private.
-/vm/guest/
-/vm/ipsw/
-
-# Guest crash reports (.ips) — Apple diagnostic artifacts, keep local, never commit
-.agents/crashes/
+# The Cargo workspace's build trees (target, and any target-* beside it), and
+# reims-ctl's, which is a workspace of its own.
+/target*/
+/crates/reims-ctl/target/

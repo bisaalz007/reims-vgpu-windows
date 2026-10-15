@@ -1,0 +1,40 @@
+[package]
+name = "reims-vgpu-vulkan"
+description = "A proof of concept: the Platform implementation over metal2vulkan-runtime, on Vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+reims-vgpu-core.workspace = true
+metal2vulkan-runtime.workspace = true
+metal2vulkan.workspace = true
+# The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
+log.workspace = true
+# A display window's swapchain (`swapchain.rs`) and the window system's extensions
+# (`os/wsi.rs`), through ash, on either OS.
+ash.workspace = true
+
+# On macOS the OS services are the metal crate's (threads, clock, Mach VM, the autorelease pool and
+# IOSurface, `os/macos.rs`), with Metal's system default device, whose registryID the runtime's
+# default device answers (os/macos.rs's default_registry_id). The tests that compare answers with
+# the Metal platform's use it too.
+[target.'cfg(target_os = "macos")'.dependencies]
+reims-vgpu-metal.workspace = true
+
+# On Linux the OS services are this crate's own (`os/linux.rs`): threads, clocks, the views of
+# guest pages over the memory map's files, and IOSurface's stand-in.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+# The hashes of the metallibs' sources, which a metallib built elsewhere is checked by (build.rs).
+[build-dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+reims-vgpu-core = { workspace = true, features = ["testkit"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,41 @@
+# reims-ctl: creates, boots and manages macOS VMs on QEMU's apple-gfx (README.md). It links
+# nothing of the library: it runs the QEMU that scripts/install-ctl.sh builds on it. Its own
+# workspace, so it builds without the rest of the tree (or the metal2vulkan the library's
+# workspace fetches).
+[package]
+name = "reims-ctl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
+description = "Create, boot and manage macOS VMs on QEMU with reims-vgpu"
+
+[workspace]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+crc32fast = "1.5.2"
+flate2 = "1.1.10"
+libc = "0.2.190"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.153"
+shlex = "2.0.1"
+toml = "1.1.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Lists the host's Vulkan GPUs; `loaded` opens the Vulkan loader at run time, so the binary
+# needs no Vulkan to start.
+ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Installs macOS from an IPSW into a new VM (vz.rs): only Virtualization.framework restores one.
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSData", "NSProgress", "NSObject", "NSArray", "NSRunLoop", "NSDate"] }
+objc2-virtualization = "0.3.2"
+
+[profile.release]
+debug = "line-tables-only"

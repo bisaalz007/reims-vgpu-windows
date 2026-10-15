@@ -1,0 +1,332 @@
+//! `extended-range-bits-kept`: what becomes of the bits an extended-range format's codes leave
+//! unused, and of codes past its range, through blits, CPU uploads, loads, clears and draws.
+//!
+//! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs; random bytes,
+//! 64 by 64, Private and Shared, with and without `allowGPUOptimizedContents`, and of
+//! `ShaderWrite` usage):
+//! - *Canonical* codes: `BGRA10_XR` (and `_sRGB`) with the low six bits of each 16-bit field zero
+//!   and the alpha code clamped to [384, 894]; `BGR10_XR` (and `_sRGB`) with bits 30 and 31 ones.
+//! - A GPU blit into a `BGRA10_XR` texture Metal keeps losslessly compressed
+//!   (`allowGPUOptimizedContents`, neither `ShaderWrite` nor `PixelFormatView` usage, the shorter
+//!   side 16 or more; Private or Shared alike) writes canonical codes; into one it keeps
+//!   uncompressed it writes the bytes. A blit between two such textures, and a pass that loads
+//!   and stores without drawing, keep the texture's bytes. `BGR10_XR` keeps every bit through
+//!   every blit, compressed or not. A CPU `replaceRegion` keeps every bit, and a blit out of the
+//!   texture then reads ([`replaced_then_read`]'s answer).
+//! - A pass that loads and stores the texture and draws rewrites every undrawn texel of each
+//!   tile its draws reach to its canonical code, and keeps every byte of the tiles they do not
+//!   reach. A draw writes canonical codes. A pass with no draw call that clears writes
+//!   `BGRA10_XR`'s canonical codes but `BGR10_XR`'s bits 30 and 31 as zeros (an `ObjC` probe of
+//!   this host: a draw writes them ones), values past the range as the nearest code, and a NaN
+//!   channel as code 0, or 384 (zero) in an `_sRGB` twin ([`cleared`]; the test compares the
+//!   bytes).
+//!
+//! **Not probed**: `RGB10A8_2P_XR10` and `RGBA16Float_XR`; the padded `R10Unorm_X6` and
+//! `RG10Unorm_X12` (an `ObjC` probe of this host found random bytes through a blit into a
+//! compressed one move half its texels, and a CPU `replaceRegion` then `getBytes` read zeros,
+//! not recorded here); multisample textures; levels past the first; other Apple GPU generations.
+//!
+//! **This platform today**: the runtime models the compressed blit's rule and the load pass's
+//! rewrite: a pass rewrites every tile of its draws' viewports
+//! until the draw's capture form is made, announcing `unreached-tiles-rewritten`, relayed, and a
+//! load pass it does not take (a multisampled attachment, a shadowed or sparse texture) keeps
+//! the bits, announcing `extended-range-bits-kept`, relayed. A clear to a NaN dies at the
+//! encoder, named. The tests require each other difference of this platform's bytes from Metal's
+//! to come with one of the two kinds.
+//!
+//! **To answer as Metal**: the load pass's rewrite in only the tiles the draws' primitives reach
+//! from a pipeline's first pass on (capture replay made before the pass, not on the runtime's
+//! threads after it), and in the attachments it does not take today: a multisampled one (each
+//! sample's code), and a shadowed or sparse texture's image; a NaN clear's codes (0, or 384 in an
+//! `_sRGB` twin) taken into the runtime's clear.
+
+use metal2vulkan_runtime as rt;
+use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::types::ClearColor;
+
+use super::{
+    Aspect, CLEAR, Colour, Draw, IN_TILE_1_1, LOAD, Pass, READ, SHARED, STORE, Shape, Step, TARGET,
+    WRITE, buffer, heard, metal, near, once, positions, random_bytes, replace, run, state,
+};
+use reims_vgpu_core::raise::death::DeathKind;
+use reims_vgpu_core::testkit::capture::catch_death;
+
+use crate::gpu::device::tests::dev;
+use crate::platform::tests::platform;
+
+/// `BGRA10_XR`, `BGRA10_XR_sRGB`, `BGR10_XR` and `BGR10_XR_sRGB`.
+const FORMATS: [u64; 4] = [552, 553, 554, 555];
+
+/// The shapes probed: Private, Private without `allowGPUOptimizedContents`, Shared, and Private of
+/// `ShaderWrite` usage, each 64 by 64.
+fn shapes(format: u64) -> [Shape; 4] {
+    let base = Shape::of(format, (64, 64));
+    [
+        base,
+        Shape {
+            optimized: Some(false),
+            ..base
+        },
+        Shape {
+            options: SHARED,
+            ..base
+        },
+        Shape {
+            usage: READ | WRITE | TARGET,
+            ..base
+        },
+    ]
+}
+
+/// Whether Metal keeps a texture of `shape` losslessly compressed (module docs).
+fn compressed(shape: Shape) -> bool {
+    shape.optimized != Some(false)
+        && shape.usage & WRITE == 0
+        && shape.size.0.min(shape.size.1) >= 16
+}
+
+/// The canonical code of a texel of `format` (module docs).
+fn canonical(format: u64, texel: &[u8]) -> Vec<u8> {
+    if matches!(format, 552 | 553) {
+        let mut out = Vec::new();
+        for (field, c) in texel.chunks(2).enumerate() {
+            let mut code = u16::from_le_bytes([c[0], c[1]]) >> 6;
+            if field == 3 {
+                code = code.clamp(384, 894);
+            }
+            out.extend((code << 6).to_le_bytes());
+        }
+        out
+    } else {
+        let word = u32::from_le_bytes(texel.try_into().unwrap()) | 0xc000_0000;
+        word.to_le_bytes().to_vec()
+    }
+}
+
+/// The bytes of a `shape` texture after: a blit of `raw` into it; a blit of it into another of
+/// its shape; a pass that loads and stores it with no draw; one that draws [`IN_TILE_1_1`].
+fn paths<P: Platform>((p, d): (&P, &P::Device), shape: Shape, raw: &[u8]) -> [Vec<u8>; 4] {
+    let (t, copy) = (shape.texture(p, d), shape.texture(p, d));
+    let s = state::<P>(d, &[shape.format], (None, None), 1);
+    let at = buffer::<P>(d, 48, &positions(&IN_TILE_1_1, shape.size));
+    let draw = Draw {
+        state: &s,
+        depth_stencil: None,
+        positions: &at,
+        vertices: 3,
+    };
+    let steps = [
+        Step::Upload(&t, shape, raw),
+        Step::Read(&t, shape),
+        Step::Copy(&t, &copy, shape),
+        Step::Read(&copy, shape),
+        Step::Pass(Pass::of(&t, Aspect::Colour, (LOAD, STORE), Vec::new())),
+        Step::Read(&t, shape),
+        Step::Pass(Pass::of(&t, Aspect::Colour, (LOAD, STORE), vec![draw])),
+        Step::Read(&t, shape),
+    ];
+    let r = run(p, d, &steps);
+    [r[0].clone(), r[1].clone(), r[2].clone(), r[3].clone()]
+}
+
+/// Metal's rule over [`paths`]' bytes (module docs).
+fn holds_metals_rule(shape: Shape, raw: &[u8], [up, copied, loaded, drawn]: &[Vec<u8>; 4]) {
+    let texel = super::texel_bytes(shape.format);
+    let rewrites = matches!(shape.format, 552 | 553) && compressed(shape);
+    let expected_up: Vec<u8> = raw
+        .chunks(texel)
+        .flat_map(|t| {
+            if rewrites {
+                canonical(shape.format, t)
+            } else {
+                t.to_vec()
+            }
+        })
+        .collect();
+    assert!(*up == expected_up, "Metal: {shape:?}: the blit's bytes");
+    assert!(copied == up, "Metal: {shape:?}: the copy's bytes");
+    assert!(loaded == up, "Metal: {shape:?}: a pass that draws nothing");
+    for (i, (b, a)) in up.chunks(texel).zip(drawn.chunks(texel)).enumerate() {
+        let (x, y) = (i % 64, i / 64);
+        if x < 32 || y < 32 {
+            assert_eq!(
+                a, b,
+                "Metal: {shape:?}: texel ({x}, {y}) of an unreached tile"
+            );
+        } else if !near(&IN_TILE_1_1, (x, y)) {
+            assert_eq!(
+                a,
+                canonical(shape.format, b),
+                "Metal: {shape:?}: texel ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// Requires `ours` to be `theirs`, or the runtime to have announced one of the extended-range
+/// kinds; answers whether they differ.
+fn against(case: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> bool {
+    let kinds = [
+        rt::Degradation::UnreachedTilesRewritten,
+        rt::Degradation::ExtendedRangeBitsKept,
+    ];
+    let differ = ours != theirs;
+    if differ {
+        assert!(
+            kinds.into_iter().any(heard),
+            "{case}: off Metal's, with neither kind heard"
+        );
+    }
+    differ
+}
+
+/// Each extended-range format's random bytes through a blit into each of [`shapes`], a blit
+/// between two textures, a pass with no draw and a pass that draws: Metal's rule on this host in
+/// every run. This platform's bytes are Metal's, or the runtime announced
+/// `unreached-tiles-rewritten` or `extended-range-bits-kept`
+#[test]
+fn extended_range_codes_through_blits_and_loads_are_metals() {
+    let metal = metal();
+    let (p, d) = (platform(), dev());
+    let mut differ = Vec::new();
+    for format in FORMATS {
+        for (name, shape) in ["Private", "Private unoptimized", "Shared", "ShaderWrite"]
+            .into_iter()
+            .zip(shapes(format))
+        {
+            let Some((mp, md)) = metal.as_ref() else {
+                return;
+            };
+            let raw = random_bytes(shape.length(), 41);
+            let m = once(&format!("{shape:?}"), || paths((mp, md), shape, &raw));
+            holds_metals_rule(shape, &raw, &m);
+            let o = paths((&p, &d), shape, &raw);
+            for (path, (o, m)) in ["blit", "copy", "no draw", "drawn"]
+                .iter()
+                .zip(o.iter().zip(&m))
+            {
+                if against(
+                    &format!("{shape:?} {path}"),
+                    std::slice::from_ref(o),
+                    std::slice::from_ref(m),
+                ) {
+                    differ.push(format!("{format} {name} {path}"));
+                }
+            }
+        }
+    }
+    eprintln!("off Metal's, a kind heard: {differ:#?}");
+}
+
+/// The bytes a blit reads out of a Shared `format` texture whose texels a CPU `replaceRegion`
+/// wrote from `raw`.
+fn replaced_then_read<P: Platform>((p, d): (&P, &P::Device), shape: Shape, raw: &[u8]) -> Vec<u8> {
+    let t = shape.texture(p, d);
+    replace::<P>(&t, shape, raw);
+    run(p, d, &[Step::Read(&t, shape)]).remove(0)
+}
+
+/// The bytes of a `format` texture, cleared to `colour` by a pass that stores it.
+fn cleared<P: Platform>((p, d): (&P, &P::Device), format: u64, colour: ClearColor) -> Vec<u8> {
+    let shape = Shape::of(format, (16, 16));
+    let t = shape.texture(p, d);
+    let pass = Pass {
+        colours: vec![Colour {
+            clear: Some(colour),
+            ..Colour::new(&t, (CLEAR, STORE))
+        }],
+        depth: None,
+        stencil: None,
+        draws: Vec::new(),
+    };
+    run(p, d, &[Step::Pass(pass), Step::Read(&t, shape)]).remove(0)
+}
+
+/// A CPU `replaceRegion` of random bytes into a Shared texture of each extended-range format,
+/// read back by a blit, and clears to values inside and past the formats' ranges: Metal's bytes
+/// are one value on this host in every run (a blit out of a compressed `BGRA10_XR` texture reads
+/// canonical codes; `BGR10_XR` keeps every bit). This platform's are Metal's, or the runtime
+/// announced `unreached-tiles-rewritten` or `extended-range-bits-kept`; a clear to a NaN dies at
+/// the encoder, named, where Metal stores a code (0, or 384 in an `_sRGB` twin)
+#[test]
+fn extended_range_cpu_uploads_and_clears_are_metals() {
+    let metal = metal();
+    let (p, d) = (platform(), dev());
+    let colours = [
+        ClearColor {
+            red: 0.25,
+            green: 0.5,
+            blue: 0.75,
+            alpha: 1.0,
+        },
+        ClearColor {
+            red: -0.75,
+            green: 1.5,
+            blue: 2.25,
+            alpha: -1.0,
+        },
+        ClearColor {
+            red: 1e6,
+            green: -1e6,
+            blue: f64::NAN,
+            alpha: 3.0,
+        },
+    ];
+    let mut differ = Vec::new();
+    for format in FORMATS {
+        let Some((mp, md)) = metal.as_ref() else {
+            return;
+        };
+        {
+            let shape = Shape {
+                options: SHARED,
+                ..Shape::of(format, (64, 64))
+            };
+            let raw = random_bytes(shape.length(), 43);
+            let m = once(&format!("{format} replaced"), || {
+                replaced_then_read((mp, md), shape, &raw)
+            });
+            let canon: Vec<u8> = raw
+                .chunks(super::texel_bytes(format))
+                .flat_map(|t| canonical(format, t))
+                .collect();
+            let expected = if matches!(format, 552 | 553) {
+                &canon
+            } else {
+                &raw
+            };
+            assert!(
+                m == *expected,
+                "Metal: {format}: replaced, then read by a blit"
+            );
+            let o = replaced_then_read((&p, &d), shape, &raw);
+            if against(&format!("{format} replaced"), &[o], &[m]) {
+                differ.push(format!("{format} replaced"));
+            }
+        }
+        for colour in colours {
+            let m = once(&format!("{format} {colour:?}"), || {
+                cleared((mp, md), format, colour)
+            });
+            if colour.blue.is_nan() {
+                // This platform dies at the encoder, naming the NaN its clear is not measured to
+                // store as Metal does.
+                *crate::answer::LAST_LINE.lock() = None;
+                let died = catch_death(|| cleared((&p, &d), format, colour)).unwrap_err();
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                assert_eq!(
+                    (died.kind, died.file),
+                    (DeathKind::Abort, "renderCommandEncoderWithDescriptor:"),
+                    "{line}"
+                );
+                assert!(line.contains("is a NaN"), "{format}: {line}");
+                continue;
+            }
+            let o = cleared((&p, &d), format, colour);
+            if against(&format!("{format} {colour:?}"), &[o], &[m]) {
+                differ.push(format!("{format} {colour:?}"));
+            }
+        }
+    }
+    eprintln!("off Metal's, a kind heard: {differ:#?}");
+}

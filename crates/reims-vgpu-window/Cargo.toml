@@ -1,0 +1,107 @@
+[package]
+name = "reims-vgpu-window"
+description = "A guest display's own window: on macOS AppKit (or SDL3) and a CAMetalLayer, on Linux SDL3 and Vulkan; input and the host's screens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+reims-vgpu-core.workspace = true
+log.workspace = true
+# ash's Vulkan types for a window's surface (`present`): SDL's on Linux, the layer's on macOS.
+ash.workspace = true
+
+# The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface, and the
+# Vulkan crate's threads.
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+reims-vgpu-vulkan.workspace = true
+sdl3-sys.workspace = true
+
+[features]
+default = ["macos-sdl"]
+# SDL's library left unbuilt and unlinked: for a check of the Linux target on another OS, which
+# compiles but never links (`cargo xtask check`'s clippy of the Linux target on a Mac).
+sdl-no-link = ["sdl3-sys?/no-link"]
+# SDL3's window on macOS (`sdl`, `native/macos/sdl.rs`), which `REIMS_VGPU_WINDOW_IMPL=sdl` opens
+# in place of AppKit's. `cargo xtask dist` keeps SDL's symbols out of the archive's globals and
+# gives its Objective-C classes the library's own names (xtask/src/dist/macos.rs), so a host's
+# own SDL never binds to them. Without the feature the macOS build has no SDL, and its windows
+# are AppKit's: `reims-vgpu` and `reims-vgpu-c` forward it as their default, so
+# `cargo build -p reims-vgpu-c --no-default-features` builds the library without SDL.
+macos-sdl = ["dep:sdl3-sys"]
+
+# The window's AppKit side (`native/macos.rs`): AppKit, Core Animation, CoreGraphics and Carbon,
+# and the metal crate's message layer and threads.
+[target.'cfg(target_os = "macos")'.dependencies]
+reims-vgpu-metal.workspace = true
+sdl3-sys = { workspace = true, optional = true }
+libc.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+block2.workspace = true
+objc2-core-foundation = { workspace = true, features = [
+    "CFArray",
+    "CFCGTypes",
+    "CFDictionary",
+    "CFNumber",
+    "CFRunLoop",
+    "block2",
+    "objc2",
+] }
+objc2-core-graphics = { workspace = true, features = [
+    "CGColor",
+    "CGColorSpace",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGError",
+    "CGEvent",
+    "CGEventTypes",
+    "CGGeometry",
+    "CGRemoteOperation",
+    "objc2",
+] }
+objc2-quartz-core = { workspace = true, features = [
+    "CALayer",
+    "CAMediaTiming",
+    "CAMetalLayer",
+    "CATransaction",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-metal",
+] }
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSButton",
+    "NSColor",
+    "NSColorSpace",
+    "NSControl",
+    "NSCursor",
+    "NSEvent",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSTrackingArea",
+    "NSUserInterfaceItemIdentification",
+    "NSView",
+    "NSWindow",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-quartz-core",
+] }
+
+[dev-dependencies]
+reims-vgpu-core = { workspace = true, features = ["testkit"] }
+
+[lints]
+workspace = true

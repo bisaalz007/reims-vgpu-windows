@@ -1,0 +1,185 @@
+//! Fake: the `platform/command.rs` traits over the fake models (architecture 13.2).
+//!
+//! The queue's and command buffer's ordered calls log their selector and arguments
+//! (`fake::calllog`) and consult the script (`fake::script`) before the model; `status`, `error`
+//! and `device` are free and read the model.
+
+use super::super::calllog::Arg;
+use super::super::objects::{CommandBufferModel, Fk, Model, kind};
+use super::super::platform::FakePlatform;
+use super::fatal;
+use crate::platform::command::*;
+use crate::platform::types::{CommandBufferStatus, NsErrorText};
+use crate::platform::{EventRef, Platform};
+use crate::raise::{OnFault, RaiseResult};
+use crate::testkit::script::Policy;
+
+impl CommandQueue<FakePlatform> for Fk<kind::CommandQueue> {
+    fn command_buffer(
+        &self,
+        on: OnFault,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::CommandBuffer>> {
+        self.make(Policy::On(on), "commandBuffer", vec![], |w| {
+            Some(w.new_obj::<kind::CommandBuffer>(Model::CommandBuffer(
+                CommandBufferModel::default(),
+            )))
+        })
+    }
+
+    fn set_label(&self, label: &str) {
+        fatal(self.act(Policy::Fatal, "setLabel:", vec![Arg::Str(label.to_owned())]));
+    }
+}
+
+impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
+    fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addCompletedHandler:",
+            vec![Arg::Block(true)],
+        )?;
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.handlers.push(block);
+        }
+        Ok(())
+    }
+
+    fn blit_encoder(
+        &self,
+        on: OnFault,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::BlitEncoder>> {
+        self.make(Policy::On(on), "blitCommandEncoder", vec![], |w| {
+            Some(w.new_obj::<kind::BlitEncoder>(Model::None))
+        })
+    }
+
+    fn commit(&self, on: OnFault) -> RaiseResult<()> {
+        self.act(Policy::On(on), "commit", vec![])?;
+        super::super::objects::commit_obj(self.obj());
+        Ok(())
+    }
+
+    fn compute_encoder(
+        &self,
+        on: OnFault,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::ComputeEncoder>> {
+        self.make(Policy::On(on), "computeCommandEncoder", vec![], |w| {
+            Some(w.new_obj::<kind::ComputeEncoder>(Model::None))
+        })
+    }
+
+    fn device(&self) -> Option<<FakePlatform as Platform>::Device> {
+        self.device_handle()
+    }
+
+    fn encode_signal(
+        &self,
+        event: Option<EventRef<'_, FakePlatform>>,
+        value: u64,
+    ) -> RaiseResult<()> {
+        let ev = event.map(|e| match e {
+            EventRef::Event(x) => x.erase(),
+            EventRef::Shared(x) => x.erase(),
+        });
+        self.act(
+            Policy::Caught,
+            "encodeSignalEvent:value:",
+            vec![Arg::Obj(event.map(|e| e.id())), Arg::U64(value)],
+        )?;
+        if let (Some(ev), Model::CommandBuffer(m)) = (ev, &mut self.state().model) {
+            m.signal_on_complete.push((ev, value));
+        }
+        Ok(())
+    }
+
+    fn encode_signal_when_scheduled(
+        &self,
+        signal_event_scheduled: Option<&<FakePlatform as Platform>::SharedEvent>,
+        value: u64,
+    ) -> RaiseResult<()> {
+        self.act(
+            Policy::Caught,
+            "encodeSignalEventScheduled:value:",
+            vec![Arg::opt(signal_event_scheduled), Arg::U64(value)],
+        )?;
+        if let (Some(ev), Model::CommandBuffer(m)) = (
+            signal_event_scheduled.map(Fk::erase),
+            &mut self.state().model,
+        ) {
+            m.signal_on_schedule.push((ev, value));
+        }
+        Ok(())
+    }
+
+    fn encode_wait(
+        &self,
+        event: Option<EventRef<'_, FakePlatform>>,
+        value: u64,
+    ) -> RaiseResult<()> {
+        self.act(
+            Policy::Caught,
+            "encodeWaitForEvent:value:",
+            vec![Arg::Obj(event.map(|e| e.id())), Arg::U64(value)],
+        )
+    }
+
+    fn error(&self) -> Option<NsErrorText> {
+        match &self.state().model {
+            Model::CommandBuffer(m) => m.error.clone(),
+            _ => None,
+        }
+    }
+
+    fn render_encoder(
+        &self,
+        on: OnFault,
+        render_pass_descriptor: &<FakePlatform as Platform>::RenderPassDescriptor,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::RenderEncoder>> {
+        self.make(
+            Policy::On(on),
+            "renderCommandEncoderWithDescriptor:",
+            vec![Arg::obj(render_pass_descriptor)],
+            |w| Some(w.new_obj::<kind::RenderEncoder>(Model::None)),
+        )
+    }
+
+    fn set_protection_options(&self, on: OnFault, options: u64) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "setProtectionOptions:",
+            vec![Arg::U64(options)],
+        )
+    }
+
+    fn status(&self) -> CommandBufferStatus {
+        match &self.state().model {
+            Model::CommandBuffer(m) => m.status,
+            _ => CommandBufferStatus::default(),
+        }
+    }
+
+    fn wait_until_completed(&self, on: OnFault) -> RaiseResult<()> {
+        self.act(Policy::On(on), "waitUntilCompleted", vec![])?;
+        super::super::objects::wait_status(self.obj(), CommandBufferStatus::COMPLETED);
+        Ok(())
+    }
+
+    fn wait_until_scheduled(&self) -> RaiseResult<()> {
+        self.act(Policy::Caught, "waitUntilScheduled", vec![])?;
+        super::super::objects::wait_status(self.obj(), CommandBufferStatus::SCHEDULED);
+        Ok(())
+    }
+
+    /// A new encoder, with the value in the log.
+    fn compute_encoder_for_pass(
+        &self,
+        desc: &crate::platform::values::ComputePassDesc,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::ComputeEncoder>> {
+        self.make(
+            Policy::Caught,
+            "computeCommandEncoderWithDescriptor:",
+            vec![Arg::val(desc)],
+            |w| Some(w.new_obj::<kind::ComputeEncoder>(Model::None)),
+        )
+    }
+}

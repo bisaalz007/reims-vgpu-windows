@@ -1,25 +1,16 @@
 # reims-vgpu
 
-[![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0%20or%20later-blue.svg)](LICENSE)
+[![License: GPL-2.0-or-later OR LGPL-3.0-or-later](https://img.shields.io/badge/License-GPL--2.0--or--later%20OR%20LGPL--3.0--or--later-blue.svg)](LICENSE) [![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/D2AM9mrDgs)
 
-> **Alpha.** This project is early and under active development. The QEMU device ABI, boot scripts,
-> crate layout, backend behavior, and supported host/guest pathways may change without a stable
-> compatibility guarantee. Treat it as research-quality: useful for experimentation and bring-up,
-> not a frozen virtualization product.
+> **Beta.** reims-vgpu has largely stabilized. We're now working through differences between
+> platforms and GPU drivers, so how well it runs can still depend on your host and its GPU.
 
-reims-vgpu is an experimental virtual GPU for macOS guests. It aims to let macOS running inside a
-VM use accelerated graphics instead of a basic framebuffer, while keeping the guest operating system
-unchanged.
+reims-vgpu is a virtual GPU for macOS VMs. It gives macOS running in QEMU accelerated graphics,
+through Metal on a Mac or Vulkan on Linux, using the GPU driver macOS already ships with. There's
+nothing to install in the guest.
 
-macOS already includes a paravirtual GPU driver named `AppleParavirtGPU.kext`.
-reims-vgpu provides the QEMU device that driver attaches to, then decodes the guest's GPU command
-stream on the host and executes it through Metal (TODO) or Vulkan, with Vulkan translation handled
-by [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan). There is no custom macOS kext and
-no guest driver to install.
-
-Contributions are welcome. I am especially interested in collaborating with developers who want to
-work on correctness, visual glitches, synchronization bugs, command-stream decoding, Metal/Vulkan
-translation, and making more host/guest combinations reliable.
+Alongside the GPU, we ship a QEMU build that uses it, and `reims-ctl`, a small tool that creates
+and runs macOS VMs for you.
 
 ![reims-vgpu running an arm64 macOS 13 Ventura guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
 
@@ -29,137 +20,285 @@ translation, and making more host/guest combinations reliable.
 
 *x86_64 macOS 13 Ventura guest on a Linux host.*
 
-## Three pathways
-
-`crates/reims-vgpu` targets the following host/guest/backend combinations. Agents pick the pathway
-their unit of work is on.
-
-| Pathway | Host | Guest | Device attach | Backend | Boot |
-|---|---|---|---|---|---|
-| **x86 macOS / Linux Vulkan** | Linux x86_64 (KVM) | x86_64 macOS Metal guest | PCI `reims-vgpu-pci` | host **Vulkan** via `metal2vulkan` | `vm/boot-x86.sh` |
-| **arm64 macOS / macOS Metal** | Apple Silicon macOS (HVF) | arm64 macOS Metal guest (`vmapple`) | sysbus MMIO `reims-vgpu-mmio` | host **Metal** | `vm/boot-arm64.sh` |
-| **arm64 macOS / macOS Vulkan** | Apple Silicon macOS (HVF) | arm64 macOS Metal guest (`vmapple`) | sysbus MMIO `reims-vgpu-mmio` | host **Vulkan** via `metal2vulkan` through MoltenVK | `vm/boot-arm64.sh` |
-
-- QEMU device shims: `vendor/qemu` tracks
-  [`steelbrain/qemu-reims-vgpu@host-reims-vgpu-vmapple`](https://github.com/steelbrain/qemu-reims-vgpu/tree/host-reims-vgpu-vmapple)
-  (thin C — QOM/MMIO/IRQ/console/HostOps only)
-- Product logic: `crates/reims-vgpu` (decode + device model + Metal/Vulkan backends)
-- Vulkan translator dependency: public `steelbrain/metal2vulkan` Git crate. On macOS, the Vulkan
-  host backend runs through MoltenVK.
-- VM lifecycle: `vm/` (snapshot-revert; arm and x86 guest boot scripts)
-
 ## Getting started
 
-This tree ships **boot scripts and the device**, not a ready-made macOS disk image. Guest disks,
-firmware vars, and OpenCore blobs are private/gitignored under `vm/`. Pick a pathway, provision a
-guest once, freeze a golden snapshot, then use the snapshot-revert boots for day-to-day work.
-macOS 13 Ventura is the recommended guest release for bring-up.
+You bring your own macOS; we don't ship disk images. On an Apple silicon Mac, that's an IPSW, or a
+VM you already made with macosvm or tart. On Linux, it's an OpenCore image with a macOS installer,
+or a disk that already has macOS on it.
 
-### x86_64 guest on Linux (KVM)
+We've tested arm64 macOS 13, 14, 15 and 26 on an M3 Max, and x86-64 macOS 26 on Linux with an RTX
+5080 laptop GPU. [docs/qemu.md](docs/qemu.md) has the details.
 
-1. **Host prep.** You need KVM (`/dev/kvm`), a working NVIDIA (or other) Vulkan stack for the product
-   backend, and build deps for the in-tree QEMU (`scripts/qemu-build/qemu-build.sh --target x86_64
-   --backend vulkan`). KVM must ignore unhandled MSRs or macOS will not boot — e.g. a modprobe conf
-   with `options kvm ignore_msrs=1` (reboot or reload the module after).
+### Windows native development branch
 
-2. **Generate OpenCore, OVMF, and a guest disk with [OSX-KVM](https://github.com/kholia/OSX-KVM).**
-   **macOS 13 is recommended**.Follow that project’s docs to fetch recovery media, build OpenCore,
-   and install macOS under QEMU+KVM. The point of this step is only to produce a
-   **working, post-Setup-Assistant guest** plus the usual OpenCore/OVMF pieces — not to stay on
-   OSX-KVM’s long-term launcher.
+The `windows-native-tahoe` branch adds native UCRT64/LLVM builds, WHPX,
+SDL3 Win32/Vulkan windows and PowerShell VM management. See
+[Windows setup](docs/windows-vm.md), [implementation status](docs/IMPLEMENTATION_STATUS.md)
+and [validation limits](docs/KNOWN_ISSUES.md).
 
-3. **Drop the artifacts where this repo expects them** (paths are the defaults in `vm/boot-x86.sh`;
-   override with env if you prefer):
-
-   | Artifact | Default location |
-   |---|---|
-   | Guest system disk | `vm/disks/macos.img` |
-   | OpenCore boot disk | `vm/disks/OpenCore.qcow2` |
-   | OVMF code | `vm/ovmf/OVMF_CODE_4M.fd` |
-   | OVMF vars template | `vm/ovmf/OVMF_VARS-1920x1080.fd` |
-
-   Finish install in the guest: enable Remote Login, install your SSH key, turn off sleep/screensaver
-   as you like. Host SSH is typically `localhost:2222` → guest `:22` (see `vm/boot-x86.sh`).
-
-4. **Capture the first immutable snapshot.** From a clean guest state (logged in, network/SSH
-   known-good), shut down cleanly while booting in snapshot-capture mode:
-
-   ```bash
-   vm/boot-x86.sh --snapshot --device vmware-svga
-   # clean shutdown from inside the guest → new label under vm/disks/snapshots/
-   # and snapshots/current points at it
-   ```
-
-   Every later boot clones `snapshots/current` (COW when possible) and **throws the clone away** on
-   exit, so wedges and hard kills never poison the golden image.
-
-5. **Day-to-day boots.**
-
-   ```bash
-   # Console only (mainstream OSX-KVM-style VGA) while you debug the host stack
-   vm/boot-x86.sh --testing --device vmware-svga
-
-   # Product Reims VGPU device (needs in-tree QEMU + reims-vgpu Vulkan)
-   REIMS_VGPU_BACKEND=vulkan scripts/qemu-build/qemu-build.sh --target x86_64
-   vm/boot-x86.sh --testing --device reims-vgpu-pci
-
-   # Host-window screenshot on the Linux/Plasma host
-   scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png
-   ```
-
-### arm64 guest on Apple Silicon (HVF / vmapple)
-
-Arm bring-up is **in-tree**: Virtualization.framework via Homebrew **`macosvm`**, then QEMU’s
-`vmapple` machine under HVF. There is no OSX-KVM step.
-
-1. Install **`macosvm`**, and build the vendored QEMU:
-
-   ```bash
-   scripts/qemu-build/qemu-build.sh --target aarch64 --backend metal
-   ```
-
-2. Provision a guest from a UniversalMac IPSW with the project helpers in
-   `scripts/vmapple-provision/`. The live bundle lives under `vm/guest/` (disk, aux, `vm.json` /
-   ECID).
-
-3. Configure the guest once: enable Remote Login, run `scripts/vmapple-guest-config/` for no-sleep
-   settings, and optionally enable auto-login by hand in System Settings. Capture a golden under
-   `vm/guest/snapshots/` with the snapshot helpers (`scripts/vmapple-snapshot/`, or
-   `vm/boot-arm64.sh --snapshot` once the disk is ready).
-
-4. Boot:
-
-   ```bash
-   vm/boot-arm64.sh --testing --device reims-vgpu-mmio    # product
-   vm/boot-arm64.sh --testing --device apple-gfx-mmio   # Apple ParavirtualizedGraphics A/B
-   scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png
-   ```
-
-   Optional **performance ceiling** reference: the same guest under native VZ via `macosvm --gui`.
-
-### After the first snapshot
-
-- Prefer **`--testing`** for agent/measurement boots (time-bounded, always reverts).
-- Use **`--interactive`** when you need an open-ended GUI session (still reverts unless you are in
-  `--snapshot` capture mode).
-- Never commit disks, IPSWs, or OpenCore/OVMF runtime under `vm/`.
-- Device/backend work lives in `crates/reims-vgpu` + the thin shims in `vendor/qemu`; rebuild QEMU after
-  product changes before claiming a live boot result.
-
-## Repo layout
-
-```text
-AGENTS.md           - repo operating guide for agents
-crates/             - Rust crates (`reims-vgpu`, `reims-vgpu-efi`)
-scripts/            - host setup, VM lifecycle, screenshot, and diagnostic helpers
-vendor/             - vendored QEMU submodule and patch record
-vm/                 - VM launch/configuration glue; images are private/untracked
+```powershell
+./scripts/windows/bootstrap.ps1
+./scripts/windows/build.ps1
+./scripts/windows/prepare-opencore.ps1
+./scripts/windows/prepare-vm.ps1 -Iso '<your macOS installer>'
+./scripts/windows/doctor.ps1 -RequireWhpx
+./scripts/windows/start.ps1
 ```
+
+Windows Hypervisor Platform must be enabled and Windows restarted before
+normal boot. Preparation, native GPU tests and a paused TCG diagnostic have
+passed; installed Tahoe, Liquid Glass and workload FPS are not yet verified.
+Read the Apple license conditions in the setup guide and handle installer
+agreement/account input yourself.
+### Install reims-ctl
+
+Clone the repository (without `--recursive`: QEMU's own submodules are not needed) and run:
+
+```sh
+scripts/install-ctl.sh
+```
+
+It installs what the build needs (Homebrew on macOS; apt on Ubuntu and Debian, pacman on Arch and
+CachyOS; Rust through rustup.rs), fetches `vendor/qemu`, builds the library and QEMU on it, installs
+QEMU into `~/.local/share/reims-ctl/qemu`, and `reims-ctl` into `~/.cargo/bin`. `vendor/qemu` is
+fetched from its public repository (`steelbrain/qemu-reims-vgpu`), at the commit this checkout
+pins, and Cargo fetches metal2vulkan from its public repository, at the commit the workspace's
+`Cargo.toml` names. `reims-ctl doctor` checks the host and the install.
+
+### x86-64 guest on Linux (KVM)
+
+1. **Host prep.** You need KVM (`/dev/kvm`) and a Vulkan driver; `reims-ctl gpus` lists the GPUs a
+   VM can be given. The library's views of guest memory take a kernel mapping for each run of
+   guest pages, so raise `vm.max_map_count`: `sudo sysctl -w vm.max_map_count=1048576` covers a
+   12 GiB guest, and a file in `/etc/sysctl.d` keeps it. `scripts/install-ctl.sh` and `reims-ctl`
+   warn when it is too low.
+
+2. **Get OpenCore and an installer with [OSX-KVM](https://github.com/kholia/OSX-KVM)** (or ULTMOS).
+   Follow that project's docs to fetch the recovery image and build OpenCore. You only need its
+   pieces, not its launcher: `reims-ctl` copies the OpenCore image into the VM and finds OVMF beside
+   it, or uses QEMU's own.
+
+   ```sh
+   reims-ctl create mac --opencore ~/OSX-KVM/OpenCore/OpenCore.qcow2 \
+     --installer ~/OSX-KVM/BaseSystem.dmg       # a new 128G disk
+   reims-ctl create mac --from-script ~/OSX-KVM/OpenCore-Boot.sh   # or take all a launch script names
+   reims-ctl start mac
+   ```
+
+   `--disk` uses an existing disk instead (copied, reflinked where the file system can; as a qcow2
+   overlay; or in place), and `reims-ctl eject mac` takes the installer out once macOS is
+   installed.
+
+3. **Set Metal's error mode in the guest**, once:
+
+   ```sh
+   sudo defaults write /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE -int 5
+   ```
+
+   Without it the guest's icon service crash-loops, and apps wait minutes for their icons
+   ([docs/qemu.md](docs/qemu.md), "x86-64 macOS guests: Metal's error mode").
+
+### arm64 guest on an Apple silicon Mac (HVF / vmapple)
+
+QEMU's `vmapple` machine boots what Virtualization.framework makes, so a guest comes from an IPSW
+or from an existing Virtualization.framework VM. There is no OpenCore step.
+
+```sh
+reims-ctl create mac --ipsw latest              # install the newest macOS this Mac supports (a 64G disk)
+reims-ctl create mac --ipsw ~/Downloads/UniversalMac.ipsw   # or a given IPSW
+reims-ctl create mac --bundle ~/VMs/macos13     # or import a macosvm or tart VM (an APFS clone)
+reims-ctl start mac                             # a window opens for each guest display
+```
+
+`make vm VM=path/to/macosvm-vm` boots a macosvm VM on `make qemu`'s QEMU without `reims-ctl`
+([docs/qemu.md](docs/qemu.md)).
+
+### Day to day
+
+`reims-ctl` with no command opens its interactive interface: create a VM, start it (a window for
+each display), stop it (the guest shuts down, or is powered off after a timeout), edit its CPUs,
+memory, displays, resolution, HiDPI, borderless windows, GPU, audio and logs, change its installer,
+print the exact QEMU command it runs, and zip its logs with the host's details into Downloads for a
+bug report.
+
+```sh
+reims-ctl list                  # the VMs and whether they run
+reims-ctl set mac --memory 12G --resolution host   # applies at the next start
+reims-ctl command mac           # the QEMU command it runs, as a shell script
+reims-ctl report mac            # logs, settings and the host's details, zipped, for a bug report
+reims-ctl update                # pull the checkout and install again
+reims-ctl update --channel development   # switch to the development branch first (stable is master)
+```
+
+`reims-ctl help` lists every command; every option takes `--name value` or `--name=value`. A running
+VM keeps the QEMU it started with across an update.
+
+### The window takes your keyboard shortcuts
+
+Each guest display opens in a window the library owns (`crates/reims-vgpu-window`). **Click into the
+guest's picture to capture the keyboard:** shortcuts and system keys then go to the guest instead
+of the host. Keys reach the guest by position, so the guest's own layout applies, and on Linux the
+Super key is the guest's ⌘.
+
+| Host | While captured | Release |
+|---|---|---|
+| macOS (AppKit's window) | ⌘ shortcuts and system keys, ⌘Q, ⌘W, ⌘Tab and ⌘Space among them | **⌃⌥⌘** together |
+| Linux (SDL3's window, on Wayland or X11) | the whole keyboard, which the window grabs, so the compositor's shortcuts (Super, Alt+Tab) reach the guest | **Ctrl+Alt+Super** together |
+
+The title says when input is captured and how to release it. Losing focus releases capture too,
+and gives the host back its system keys. Uncaptured, ⌘ shortcuts drive the host's menu on a Mac.
+Losing focus, releasing capture or closing the window sends a key-up for every key still down, so
+nothing sticks. Closing a window powers the VM off.
+
+Fn/Globe does not reach the guest (QEMU's USB keyboard cannot carry it), and there is no HDR output.
+[`crates/reims-vgpu-window/features.md`](crates/reims-vgpu-window/features.md) lists everything the
+window does: its sizing, HiDPI, pointer, scrolling and cursor, each entry with its guard.
+
+### Environment overrides
+
+Set in QEMU's environment (`reims-ctl set <vm> --env KEY=VALUE`). Every one is optional; the library
+reads them once per process, and an unset or unparsable value is the default.
+
+| Variable | Effect |
+|---|---|
+| `REIMS_VGPU_LOG=info` | the library's log lines to stderr, filtered by a level and `target=level` pairs (`warn,reims_vgpu_core::fifo=debug`); unset, nowhere. `reims-ctl set <vm> --log-level` sets it |
+| `REIMS_VGPU_STATS=1` | a line of frame statistics a second per display |
+| `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it, not the library) |
+| `REIMS_VGPU_WINDOW_BORDERLESS=1` | borderless windows that fill their screens |
+| `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
+| `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
+| `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS: SDL3's window in place of AppKit's |
+| `REIMS_VGPU_STRICT=1` | the Vulkan platform: end the process at each difference from Metal's answer it would otherwise log |
+| `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ([docs/accuracy-ledger.md](docs/accuracy-ledger.md)) |
+
+The guest's mode is QEMU's `apple-gfx` property `resolution=` (`2560x1600`, `2560x1600@200` for a
+density, or `host`; 1920x1080 at 1× by default), which `reims-ctl`'s resolution and HiDPI settings
+set. [docs/api.md](docs/api.md) section 2 lists every setting and variable,
+`REIMS_VGPU_CENSUS_DIR`'s diagnostic among them.
+
+## Three pathways
+
+| Pathway | Host | Guest | QEMU machine and device | Platform | Run with |
+|---|---|---|---|---|---|
+| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `apple-gfx-pci` (`106b:eeee`) with its option ROM | **Vulkan** through metal2vulkan | `reims-ctl` |
+| **arm64 macOS / macOS Metal** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Metal** | `reims-ctl`, or `make vm` |
+| **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | QEMU configured on `cargo xtask dist --platform vulkan`'s tree |
+
+On a Mac, Metal is the product and the default, and `reims-ctl` runs on it. The Vulkan platform
+builds there too, into `target/dist-vulkan`, so the smoke, the suite and a QEMU configured on that
+tree can run on it beside the Metal one.
+
+- The library: `crates/`. Core holds all behavior, generic over its platform; beside it are the
+  Metal and Vulkan platforms, a display's window, the Rust API and the C API
+  ([docs/development.md](docs/development.md#crates)).
+- QEMU: `vendor/qemu` tracks
+  [`steelbrain/qemu-reims-vgpu@steelbrain/reims-vgpu`](https://github.com/steelbrain/qemu-reims-vgpu/tree/steelbrain/reims-vgpu):
+  `apple-gfx` in C on the C API, which finds the library through pkg-config and links it
+  statically.
+- The option ROM: `firmware/`, the PCI device's UEFI driver, in C, which an x86-64 guest's
+  firmware runs.
+- The Vulkan platform's runtime: metal2vulkan's public repository, at the commit the workspace's
+  `Cargo.toml` names. On macOS it runs on MoltenVK.
+- VMs: `reims-ctl` (`crates/reims-ctl`) creates, boots and manages them.
+
+## Developing
+
+macOS already includes a paravirtual GPU driver named `AppleParavirtGPU.kext`, written against the
+host side Apple ships as `ParavirtualizedGraphics.framework`. reims-vgpu replaces that framework.
+It takes the guest's GPU command stream and runs it on Metal on a Mac, or on Vulkan on Linux
+through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan), and can draw each guest
+display into a window of its own. QEMU's `apple-gfx` devices link it, on a Mac as on Linux. There
+is no custom macOS kext and no guest driver to install.
+
+The guest drivers were written against Apple's framework, so what the guest and the host observe is
+the contract: API results and refusals, host callbacks and their order, guest memory, MMIO reads,
+interrupts, frames, GPU results, and where a run faults, dies or hangs. The codebase's own tests pin
+it: the behaviour-lock suite's expected files record what the code does, and every change is
+checked against them. [AGENTS.md](AGENTS.md) has the rules for changing it.
+
+The library is the device `vmapple` and `apple-gfx-pci` guests draw through, its displays, its
+IOSurface host device and its isolated GPU tasks. It draws frames with its own shaders, and under
+process isolation it runs each guest task other than task 0 on threads of its own, in the host's
+process. Its C API (`crates/reims-vgpu-c/include/reims_vgpu.h`, specified in
+[docs/api.md](docs/api.md)) is its interface: `cargo xtask dist` writes the library, the header, a
+pkg-config package and the device's EFI option ROM into `target/dist`, which QEMU and the suite's
+runner both link. `scripts/install-ctl.sh` installs what it needs itself; working on the code needs
+the following.
+
+### Requirements
+
+- An Apple silicon Mac. Every Rust binary is arm64 (`aarch64-apple-darwin`): rustc's arm64e target
+  has no pointer authentication, and its binaries crash before `main` (`rust-toolchain.toml`).
+- The toolchain `rust-toolchain.toml` pins: stable 1.98.1 with rustfmt and clippy. rustup installs
+  it on first use.
+- `cargo-nextest`, which runs the tests in `cargo xtask check`
+  (`cargo install --locked cargo-nextest`).
+- cbindgen 0.29.4, for `cargo xtask header` (`cargo install --locked cbindgen --version 0.29.4`).
+- `cargo-llvm-cov` and rustup's `llvm-tools` component, for `make coverage` only.
+- Xcode's clang, for objc2's exception helper (which the `cc` crate builds), the C API's pins, the
+  smoke program and the suite's runner. The library compiles its shaders from source at run time,
+  so `make` needs no Metal toolchain; the Vulkan platform's crate, which `cargo build --workspace`
+  and `cargo xtask check` build, does (`xcodebuild -downloadComponent MetalToolchain`).
+- Homebrew's `lld` (`brew install lld`), whose `lld-link` and `ld.lld` link the EFI option ROM
+  (`firmware/`) that `cargo xtask dist` builds with Xcode's clang.
+- For the QEMU targets: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
+  QEMU's build dependencies (Homebrew's `meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so
+  on).
+
+The suite's host-dependent expected files are recorded on an Apple M3 Max with a 40-core GPU, macOS
+build 25G229.
+
+On x86-64 Linux the library builds on the Vulkan platform alone, with no Mac and no Xcode. It needs
+the toolchain above (cargo fetches metal2vulkan at the commit the workspace's `Cargo.toml` names),
+CMake and a C compiler for SDL3, which the build compiles from its pinned source, and, for
+`cargo xtask dist`, clang, lld and binutils.
+
+### Building
+
+```sh
+make              # the library as a plain library (cargo xtask dist): target/dist
+make smoke        # link it as QEMU does and run an isolated guest task
+make test         # the behaviour-lock suite on the library
+make bless        # record expected files for new or changed scenarios
+make coverage     # the suite on an instrumented build; a line report per file
+make qemu         # QEMU with apple-gfx on the library (cargo xtask dist), in build/qemu
+make vm VM=path/to/macosvm-vm   # boot a macOS guest on it (docs/qemu.md)
+make clean        # remove build/
+```
+
+The Makefile's header describes every target and its variables. `make` runs `cargo`, which you can
+drive directly. [docs/development.md](docs/development.md) has the repository's layout, its tests,
+the crates, `cargo xtask` and the build profiles and features.
+
+On Linux, `cargo xtask dist` builds the library on the Vulkan platform into `target/dist-vulkan`.
+The Vulkan platform's shaders are metallibs, which only Apple's compiler makes. A Mac compiles its
+own as it builds; any other host copies those a Mac compiled, committed in
+`crates/reims-vgpu-vulkan/metallibs`, once their `metallibs.toml` names each with the sha256 of the
+commands and sources this tree compiles it from (`crates/reims-vgpu-vulkan/build.rs`).
+`RVG_METALLIB_DIR=<dir>` takes them from `<dir>` instead.
+
+```sh
+cargo xtask metallibs         # on a Mac: compile them into crates/reims-vgpu-vulkan/metallibs
+cargo xtask metallibs <dir>   # the same into <dir>, for RVG_METALLIB_DIR
+```
+
+A change to a `.metal` source of the Vulkan crate, or to the metal crate's `shaders.metal`, commits
+the metallibs `cargo xtask metallibs` writes with it: until then a test of `cargo xtask check` fails
+on the Mac (`the_committed_metallibs_are_this_trees`), and the build fails on Linux.
 
 ## License
 
-Licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE)
-(`LGPL-3.0-or-later`).
+The repository is free software under the GNU General Public License, version 2 or later, or the
+GNU Lesser General Public License, version 3 or later, at the recipient's choice:
+`GPL-2.0-or-later OR LGPL-3.0-or-later`, the workspace's `license` in `Cargo.toml`.
+[LICENSE](LICENSE) says so, and `LICENSES/` holds the texts, the GPL's version 3 among them, since
+the LGPL's version 3 adds its permissions to it.
 
-Metal, macOS are trademarks of Apple Inc. reims-vgpu is an independent project and is not affiliated
-with, sponsored by, or endorsed by Apple Inc.
+QEMU (`vendor/qemu`) keeps QEMU's licenses. The crates the build takes keep their own:
+metal2vulkan's, which the Vulkan platform links, and SDL3's sources, which the window crate builds
+and links statically, among them.
+
+## Legal
+
+Metal and macOS are trademarks of Apple Inc. reims-vgpu is an independent project and is not
+affiliated with, sponsored by, or endorsed by Apple Inc.

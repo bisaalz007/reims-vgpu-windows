@@ -1,0 +1,151 @@
+//! The OS services on Linux: the clocks ([`LinuxClock`]), threads ([`LinuxThreads`]), Mach VM's
+//! calls over `mmap` ([`LinuxVm`]), whose views of the guest's pages map the files the backing
+//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), and what the
+//! window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
+//! the loader). No Objective-C runs here: core pushes no autorelease pool where none is
+//! installed.
+
+mod budget;
+mod clock;
+use super::backing as files;
+mod import;
+use super::standin as surface;
+mod threads;
+mod vm;
+
+use std::ffi::CStr;
+
+use ash::vk;
+use metal2vulkan_runtime as rt;
+
+pub use clock::LinuxClock;
+pub use files::{GuestMemoryLease, lease_guest_memory};
+pub use surface::{StandInSurface as LinuxSurface, StandInSurfaces as LinuxSurfaces};
+pub use threads::LinuxThreads;
+pub use vm::LinuxVm;
+pub(crate) use vm::OwnMemory;
+
+pub(super) fn warn_if_short(guest_ram: u64) {
+    budget::warn_if_short(guest_ram);
+}
+
+pub(crate) use import::{TWINS_READ_ONLY, allocate_zeros, import_view, shown_at};
+pub(crate) use surface::{plane_at, plane_shape, recorded_mut, ycbcr_matrix};
+#[cfg(test)]
+pub(crate) use vm::allocate_aliasable;
+#[cfg(test)]
+pub(crate) use vm::tests::{PAGE, mapped, writable};
+
+/// The instance's surface extensions a display's window may present over, besides
+/// `VK_KHR_surface`, each asked for where the loader lists it (`crate::os`'s `wsi`): Wayland's,
+/// XCB's and Xlib's, so a window opens over whichever the window library picks.
+pub(crate) const WINDOW_SURFACE_EXTENSIONS: [&CStr; 3] = [
+    ash::khr::wayland_surface::NAME,
+    ash::khr::xcb_surface::NAME,
+    ash::khr::xlib_surface::NAME,
+];
+
+/// The device extensions a window's swapchain needs besides `VK_KHR_swapchain`: none.
+pub(crate) const WINDOW_DEVICE_EXTENSIONS: [&CStr; 0] = [];
+
+/// The Vulkan loader, opened by its usual name, as the runtime opens it.
+pub(crate) fn open_loader() -> Result<ash::Entry, ash::LoadingError> {
+    // SAFETY: opening the loader runs its initialization, and it is kept open while the entry
+    // lives.
+    unsafe { ash::Entry::load() }
+}
+
+/// What fetches a swapchain image's drawable ahead of its frame: nothing here, where an image's
+/// memory is the driver's own once it is acquired (`crate::swapchain`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Drawables {}
+
+impl Drawables {
+    /// None on Linux.
+    pub(crate) fn load(_raw: &rt::Device) -> Option<Drawables> {
+        None
+    }
+
+    /// Never called: there is no value.
+    ///
+    /// # Safety
+    ///
+    /// None needed.
+    pub(crate) unsafe fn fetch(&self, _image: vk::Image) -> bool {
+        match *self {}
+    }
+}
+
+/// The clocks.
+pub type OsClock = LinuxClock;
+/// The threads.
+pub type OsThreads = LinuxThreads;
+/// Mach VM's calls.
+pub type OsVm = LinuxVm;
+/// An IOSurface: the stand-in's, one reference.
+pub type OsSurface = LinuxSurface;
+/// IOSurface creation: the stand-in's.
+pub type OsSurfaces = LinuxSurfaces;
+
+/// The kernel's count of physical memory, as IOSurface's stand-in bounds allocations.
+pub(crate) fn physical_memory() -> u64 {
+    // SAFETY: sysconf reads system constants.
+    let (pages, page) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    u64::try_from(pages)
+        .unwrap_or(0)
+        .saturating_mul(u64::try_from(page).unwrap_or(0))
+}
+
+/// Installs what the process's platform needs before it runs, once: the soft limit of open files
+/// raised to the hard limit, as each IOSurface stand-in of its own memory holds a file open
+/// (`memfd_create`), as does each range a view can be made of. A limit left lower is logged.
+pub fn install_process_services() {
+    static RAISED: std::sync::Once = std::sync::Once::new();
+    RAISED.call_once(|| {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid rlimit to fill and then to set.
+        let raised = unsafe {
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0
+                && (limit.rlim_cur >= limit.rlim_max || {
+                    limit.rlim_cur = limit.rlim_max;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0
+                })
+        };
+        if !raised {
+            log::warn!(
+                target: "reims_vgpu_vulkan::os",
+                "the open-file limit stays where it is ({}): {}",
+                limit.rlim_cur,
+                std::io::Error::last_os_error()
+            );
+        }
+    });
+}
+
+/// The macOS release whose Metal the runtime's devices answer as where releases differ
+/// (`DeviceOptions::metal_level`): macOS 26.7, the release of the M3 Max whose Metal the suite's
+/// expected files, the pins and the measurements here were taken on, so a Linux host answers the
+/// guest as that Mac does. The runtime's default off macOS is its newest measured release,
+/// which takes and describes other pixel formats ([`rt::MetalLevel::knows`],
+/// [`rt::MetalLevel::describes`]).
+pub const METAL_LEVEL: Option<rt::MetalLevel> = Some(rt::MetalLevel::MacOS26_7);
+
+/// The registry ID the platform answers for the runtime's default device in place of its own:
+/// none, as there is no Metal here to ask, so the runtime's own stands.
+pub fn default_registry_id() -> Option<u64> {
+    None
+}
+
+/// The GPU core count Metal answers for the device [`default_registry_id`] names: none, as there
+/// is no Metal here to ask.
+pub fn default_gpu_core_count() -> Option<u64> {
+    None
+}

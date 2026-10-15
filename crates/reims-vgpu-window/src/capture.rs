@@ -1,0 +1,198 @@
+//! Keyboard capture: whether the guest or the host gets a key.
+//!
+//! A click into the image captures the keyboard: from then on every key goes to the guest, ⌘
+//! shortcuts included (and the host's system keys, which the AppKit side turns off while
+//! captured). Pressing ⌃⌥⌘ together releases it, and so does the window losing the keyboard.
+//! Uncaptured, a key with ⌘ held drives the host's menu and every other key goes to the guest.
+//!
+//! The click that makes the window key only brings it forward: the view does not take a first
+//! click (`acceptsFirstMouse:`), so that click neither captures nor reaches the guest. Clicks
+//! after it capture, and are sent to the guest.
+
+use crate::keys::Modifiers;
+
+/// What to do with a click into the image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClickAction {
+    /// Whether the click goes to the guest.
+    pub forward: bool,
+}
+
+/// Who a key goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// The guest's keyboard.
+    Guest,
+    /// The host: the app's menu and AppKit's own handling.
+    Host,
+}
+
+/// Whether the keyboard is captured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capture {
+    /// Captured.
+    captured: bool,
+}
+
+/// What the title says while captured.
+const CAPTURED_SUFFIX: &str =
+    " \u{2014} input captured (press \u{2303}\u{2325}\u{2318} to release)";
+
+impl Capture {
+    /// Not captured.
+    pub fn new() -> Capture {
+        Capture::default()
+    }
+
+    /// Whether the keyboard is captured.
+    pub fn is_captured(&self) -> bool {
+        self.captured
+    }
+
+    /// A click landed in the image: the keyboard is captured. `window_was_key` is whether the
+    /// window already had the keyboard before the click; a click that made it key, where one
+    /// reaches the input, is not forwarded.
+    pub fn click_in_image(&mut self, window_was_key: bool) -> ClickAction {
+        self.captured = true;
+        ClickAction {
+            forward: window_was_key,
+        }
+    }
+
+    /// Releases the keyboard. Whether it was captured.
+    pub fn release(&mut self) -> bool {
+        std::mem::replace(&mut self.captured, false)
+    }
+
+    /// The window lost the keyboard: capture is released. Whether it was captured, so that the
+    /// host's system keys are given back.
+    pub fn resign_key(&mut self) -> bool {
+        self.release()
+    }
+
+    /// Who a key goes to, `command_held` whether ⌘ is down: the guest while captured; the host
+    /// for a ⌘ key while not; else the guest.
+    pub fn route(&self, command_held: bool) -> Route {
+        if !self.captured && command_held {
+            Route::Host
+        } else {
+            Route::Guest
+        }
+    }
+
+    /// Whether `held` is the release chord, ⌃⌥⌘ all down (Shift either way), while captured.
+    /// The caller then sends the ups of the keys down ([`crate::keys::KeyState::release_all`])
+    /// and releases capture ([`Capture::release`]).
+    pub fn release_chord(&self, held: Modifiers) -> bool {
+        self.captured && held.control && held.option && held.command
+    }
+
+    /// The text the window's title ends with: what capture is on and how to release it while
+    /// captured, and nothing while not.
+    pub fn title_suffix(&self) -> &'static str {
+        if self.captured { CAPTURED_SUFFIX } else { "" }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHORD: Modifiers = Modifiers {
+        control: true,
+        option: true,
+        command: true,
+        shift: false,
+    };
+
+    /// A click into the image captures; the click that makes the window key is not forwarded
+    #[test]
+    fn a_click_in_the_image_captures() {
+        let mut capture = Capture::new();
+        assert!(!capture.is_captured());
+        assert_eq!(
+            capture.click_in_image(false),
+            ClickAction { forward: false }
+        );
+        assert!(capture.is_captured());
+        assert_eq!(capture.click_in_image(true), ClickAction { forward: true });
+        assert!(capture.is_captured());
+        // Released, the window still key: the next click captures and is forwarded.
+        assert!(capture.release());
+        assert_eq!(capture.click_in_image(true), ClickAction { forward: true });
+        assert!(capture.is_captured());
+    }
+
+    /// Captured, every key goes to the guest, ⌘ shortcuts included
+    #[test]
+    fn captured_keys_go_to_the_guest() {
+        let mut capture = Capture::new();
+        capture.click_in_image(true);
+        assert_eq!(capture.route(true), Route::Guest);
+        assert_eq!(capture.route(false), Route::Guest);
+    }
+
+    /// Uncaptured, ⌘ keys go to the host's menu and other keys to the guest
+    #[test]
+    fn uncaptured_command_goes_to_the_host() {
+        let capture = Capture::new();
+        assert_eq!(capture.route(true), Route::Host);
+        assert_eq!(capture.route(false), Route::Guest);
+    }
+
+    /// ⌃⌥⌘ together releases capture, with or without Shift; fewer do not
+    #[test]
+    fn control_option_command_releases() {
+        let mut capture = Capture::new();
+        assert!(!capture.release_chord(CHORD), "not captured");
+        capture.click_in_image(true);
+        assert!(capture.release_chord(CHORD));
+        assert!(capture.release_chord(Modifiers {
+            shift: true,
+            ..CHORD
+        }));
+        for held in [
+            Modifiers {
+                control: false,
+                ..CHORD
+            },
+            Modifiers {
+                option: false,
+                ..CHORD
+            },
+            Modifiers {
+                command: false,
+                ..CHORD
+            },
+            Modifiers::default(),
+        ] {
+            assert!(!capture.release_chord(held), "{held:?}");
+        }
+        assert!(capture.release());
+        assert!(!capture.is_captured());
+        assert!(!capture.release());
+    }
+
+    /// Losing the keyboard releases capture, and says whether it was captured
+    #[test]
+    fn losing_focus_releases() {
+        let mut capture = Capture::new();
+        capture.click_in_image(false);
+        assert!(capture.resign_key());
+        assert!(!capture.is_captured());
+        assert_eq!(capture.route(true), Route::Host);
+        assert!(!capture.resign_key());
+    }
+
+    /// The title says so while captured, and how to release
+    #[test]
+    fn the_title_says_when_captured() {
+        let mut capture = Capture::new();
+        assert_eq!(capture.title_suffix(), "");
+        capture.click_in_image(true);
+        assert!(capture.title_suffix().contains("captured"));
+        assert!(capture.title_suffix().contains("\u{2303}\u{2325}\u{2318}"));
+        capture.release();
+        assert_eq!(capture.title_suffix(), "");
+    }
+}

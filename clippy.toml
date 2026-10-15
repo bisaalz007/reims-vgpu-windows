@@ -1,0 +1,21 @@
+# Architecture 17.4. reims-vgpu-core denies clippy::disallowed_types and
+# clippy::disallowed_methods; other crates see them as warnings.
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "use sync::Mutex (parking_lot) (7.1)" },
+    { path = "std::sync::RwLock", reason = "use parking_lot or sync::WriterPrefRwLock (7.1)" },
+]
+
+disallowed-methods = [
+    { path = "std::process::abort", reason = "use raise::death::fatal (6.4)" },
+    { path = "std::thread::spawn", reason = "core's threads come from the platform's Threads: rt::thread::spawn_named (7.1)" },
+    { path = "std::time::Instant::now", reason = "use Clock (7.5)" },
+    { path = "std::time::SystemTime::now", reason = "use Clock (7.5)" },
+    { path = "std::panic::catch_unwind", reason = "allowed only in the testkit (capture, death, launcher), an isolated task's trap (tasks::isolation::life) (6.5) and the C API's catch on Linux (ffi::catch, 6.7)" },
+]
+
+# Tests may unwrap, index and panic: a failure is the assertion (architecture 17.4).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

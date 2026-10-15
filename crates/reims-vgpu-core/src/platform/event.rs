@@ -1,0 +1,48 @@
+//! Platform trait: `SharedEvent`; the event kinds a command buffer waits on or signals.
+
+use super::{Handle, Platform};
+use crate::raise::RaiseResult;
+
+/// `id<MTLSharedEvent>`: the FIFO's event and the service's copy of it
+/// (`newSharedEventWithHandle:`).
+pub trait SharedEvent<P: Platform>: Handle {
+    /// sel: newSharedEventHandle — The handle crosses to an
+    /// isolated task's service (+1, released after the send). No path reaches it under a
+    /// handler: a raise inside it dies at the send.
+    fn new_shared_event_handle(&self) -> Option<P::SharedEventHandle>;
+    /// sel: setSignaledValue:
+    fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()>;
+    /// sel: waitUntilSignaledValue:timeoutMS:
+    /// (5000 ms). `false` on timeout (measured: `NO` for an unsignalled value after 10 ms). Blocks
+    /// the calling thread; the fake runs it on the virtual clock. No path reaches it under a
+    /// handler: a raise inside it dies at the send.
+    fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool;
+}
+
+/// The event a command buffer waits on or signals: core passes both kinds to
+/// `encodeWaitForEvent:value:` and `encodeSignalEvent:value:` (the paging `MTLEvent` and the FIFO's
+/// `MTLSharedEvent`).
+pub enum EventRef<'a, P: Platform> {
+    /// An `id<MTLEvent>` (`-[MTLDevice newEvent]`).
+    Event(&'a P::Event),
+    /// An `id<MTLSharedEvent>`.
+    Shared(&'a P::SharedEvent),
+}
+
+impl<P: Platform> Clone for EventRef<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Platform> Copy for EventRef<'_, P> {}
+
+impl<P: Platform> EventRef<'_, P> {
+    /// The event's identity (its pointer), for the fake's call log.
+    pub fn id(&self) -> super::ObjId {
+        match self {
+            EventRef::Event(e) => e.id(),
+            EventRef::Shared(e) => e.id(),
+        }
+    }
+}

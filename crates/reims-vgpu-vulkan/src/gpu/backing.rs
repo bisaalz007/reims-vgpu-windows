@@ -1,0 +1,1785 @@
+//! Buffers and heaps over the guest's pages: the alias a heap over address ranges is made over
+//! (`setAddressRanges:`), and the one each replace of a detached backing gives a buffer or a heap
+//! (`replaceBackingWithRanges:readOnly:`); and what `detachBacking` keeps.
+//!
+//! - **An alias per attach.** The ranges' pages are remapped, shared, into a fresh range of this
+//!   platform's own (`mach_vm_remap`, one call per run of host-contiguous ranges), and the
+//!   runtime is given that range with a keep-alive that frees it (`new_heap_with_bytes_no_copy`,
+//!   `rebind_bytes_no_copy`, [`keep_alive`]), and no deallocator: no one but this platform sees
+//!   the alias go. A write through the alias shows in the guest's pages and one through the
+//!   guest's pages in the alias, so the GPU's writes land in the guest's memory at once and it
+//!   reads the guest's latest bytes, as Metal's do. The runtime keeps an alias, and so the pages
+//!   under it, until every command buffer committed with it completed and it freed its import of
+//!   them, which it does before it drops the keep-alive: a later replace, a detach or
+//!   the object's release never takes pages a committed command buffer still uses or the device
+//!   still imports, and the guest's memory stays mapped under it whatever the guest's own mapping
+//!   does meanwhile. A replace never remaps under a range the runtime holds: the runtime keeps
+//!   the pages a range had when it imported them (`tests/no_copy_remap.rs`).
+//! - **Ranges off whole pages.** Core's ranges are whole pages, each starting on a page; Metal
+//!   takes others, a heap's and a replace's alike, and this platform takes them as Metal does
+//!   (measured on the M3 Max, macOS 26.7, `tests/detach_backing.rs`'s `unaligned`): ranges whose
+//!   bytes follow on from the previous range's are one run of bytes, and each run of bytes takes
+//!   the pages it lies in, whole, from the page of its first byte through the page of its last
+//!   ([`spans`]). A range of part of a page takes all of it, the page's bytes past the range
+//!   included (the CPU and the GPU read them, and the GPU's fill writes them), and a later range
+//!   starting off its page takes it from the page's start. A first range starting off its page dies
+//!   where it is given ([`off_the_page`]): Metal's `contents` answers its bytes from the range's
+//!   own address, and its GPU reads and writes them from its page's start, which no alias gives at
+//!   once.
+//! - **Read-only.** A read-only alias (the replace's `readOnly:`, or an object made with
+//!   `MTLResourceOptions` bit 24) has its maximum protection lowered to read (`mach_vm_protect`
+//!   with `set_maximum`), as Metal's alias of a read-only replace of several ranges is
+//!   (measured: current and maximum protection read). The GPU's writes never reach such pages,
+//!   and the command buffer completes: later commands of the same command buffer read what it
+//!   wrote, and a later command buffer the guest's bytes, as under a read-only replace on Metal
+//!   (blit fills, measured on both platforms by `tests/detach_backing.rs`; kernel stores are
+//!   dropped alike on Metal). On Linux the runtime imports such an alias through a writable twin
+//!   of its pages, so the GPU's writes would reach them ([`Backing::writes_kept`]): every
+//!   command that may write through the object dies where it is encoded
+//!   (`crate::gpu::writes::kept_write`).
+//! - **Detach** marks the object detached; its `contents` and its GPU address stay, as Metal's do
+//!   (measured: `contents` stays the alias of the last replace, still over its pages). A
+//!   submission of a command buffer that uses it fails while it is detached, as do those of
+//!   command buffers made before it was released detached ([`submission_check`],
+//!   `crate::gpu::command`'s docs). A command that names the object, encoded before a replace,
+//!   and whose command buffer is first submitted after it (committed after it, or committed
+//!   before it and held behind an event wait), fails in the runtime, which resolved the use as
+//!   the command was encoded (`CommandBufferError::EncodedUseRebound`): that dies where its
+//!   failure is first read (`crate::gpu::command`), where Metal runs the command over the pages
+//!   the object lies in as it submits. The runtime decides each of the command buffer's
+//!   submissions as it submits it, after the submission check, so one the check fails keeps its
+//!   code: a use detached behind a wait, in the first submission or a later one (an event's
+//!   split), fails with code 8, as Metal's (`tests/detach_backing.rs`). A rebound use in a later
+//!   submission dies all the same, the command buffer keeping that code, where Metal runs it over
+//!   the new pages. One submitted before keeps the pages it had, as Metal's does. Detaching a
+//!   buffer placed in a heap over address ranges detaches the heap, as Metal's does (measured):
+//!   every resource placed in it fails from then on, and a replace of the placed buffer answers
+//!   NO, leaving the heap detached. A heap made over no address ranges, and a buffer placed in
+//!   one, never detach: Metal answers NO to the detach and to a replace, and their command
+//!   buffers run (measured, `tests/detach_backing.rs`). Core detaches neither: its detached
+//!   buffers are no-copy buffers of their own, and its detached heaps placement heaps over
+//!   address ranges. Any other detach succeeds but one in flight (below), and detaching a
+//!   detached object is no change.
+//! - **No memory while detached.** A detach is the runtime's (`detach_backing`): the
+//!   object lies in no memory until a replace gives it some, so the runtime holds the memory it
+//!   was over no more, the guest's pages a replace gave it or what it was made over (core's
+//!   temporary allocation, which core makes its detached buffers and heaps over and detaches at
+//!   once). The detach ends the object's use: a command that reaches it without naming it (an
+//!   address a kernel loads), which no submission check sees, reads 0 and its writes are dropped,
+//!   the command buffer completing with no error, until a command buffer uses the object after a
+//!   replace, where it would reach pages the guest has given up, or core's memory. Metal answers
+//!   so too: a detached buffer, used or not, replaced or not, and a buffer placed in a detached
+//!   heap, reached through an indirect command's buffer address or a loaded pointer, read 0 and
+//!   drop the write, the command buffer completing with no error (measured on the M3 Max, macOS
+//!   26.7: through a loaded pointer on both platforms in `tests/detach_backing.rs`'s
+//!   `detached_reach` and `never_replaced`, and through an indirect command's buffer address by a
+//!   probe outside the tree). No memory is imported for it, so nothing the GPU writes there is
+//!   kept on any host. A texture over the object's bytes stays, and presents a stand-in of its
+//!   image's plan, zero bytes, until they lie in pages again (after Metal's
+//!   answer measured on an M4: such a texture reads zero bytes and drops its writes). Where a
+//!   texture over the bytes has no exact stand-in (a multisample or multi-planar one, or one with
+//!   a depth or decoded twin) or is being made, the runtime refuses the detach, and the process
+//!   ends there ([`refused_detach`]). `contents` stays what it was: the alias of the last
+//!   replace, or of the ranges a heap was made over, or the memory a no-copy buffer was made over
+//!   ([`Own`]), which the detach does not free: Metal runs a no-copy buffer's deallocator at its
+//!   first replace, inside the call, or as it is destroyed, never at a detach, so the run the
+//!   runtime hands over as it lets go of the memory at the detach waits until then ([`Held`]). A
+//!   buffer neither replaced nor made over memory of the caller's by `newBufferWithDescriptor:`
+//!   (one of the device's own memory, one made on a surface, one `newBufferWithBytesNoCopy:`
+//!   made) dies at the detach, where what Metal's `contents` answers and when it runs the
+//!   deallocator are not measured; core detaches none. A replace's rebind ends the use too, as
+//!   Metal's replace does, so after it such a command reads 0 and drops the write until a command
+//!   buffer uses the object again, and then reaches its new pages (measured on Metal so: a buffer
+//!   or a heap used, detached and replaced; both platforms in `tests/detach_backing.rs`). A
+//!   command buffer not yet committed that used the object, its encoder ended or still open,
+//!   leaves the detach as it is: it fails with code 8 as it is submitted, and a command that
+//!   reaches the object unnamed meanwhile reads 0, as on Metal (measured,
+//!   `tests/detach_backing.rs`'s `held`). The runtime resolves what a command buffer reaches
+//!   unnamed as it is first submitted, so one committed before the detach and
+//!   submitted after it reads 0 there too, and one submitted before it keeps the pages it reached
+//!   until it completed, as Metal's does.
+//! - **In flight.** Metal answers NO to a detach, and the object stays attached, while a command
+//!   buffer submitted and not yet completed took it (a command that named it, a buffer placed in
+//!   the heap included, or made it resident): a heap's at once, a buffer's once each such command
+//!   buffer completed, the call blocking until then. A buffer's answer after that wait is a race
+//!   in the kernel's one call, NO in most runs and YES in some (13 of 150 on 2026-10-11); a heap's
+//!   is always NO (measured on the M3 Max, macOS 26.7, 25G229, `tests/detach_backing.rs`'s
+//!   `in_flight` and `expected_in_flight`). This platform answers NO, one of Metal's two. Each
+//!   submission the runtime submits is noted with its encoders as its check decides it
+//!   ([`Opened::submit`]), until the command buffer closes, after its completed handlers ran; a
+//!   detach asks the runtime what those encoders use ([`in_flight`]), and a buffer's waits by
+//!   reading the command buffer's status, which the runtime sets before it runs the completed
+//!   handlers. Where none took it, the runtime's detach answers too, by the same rule over what
+//!   it holds of each command buffer's work until that work completed: a NO of its own, which
+//!   only a command buffer completing as the detach is made could leave, is answered as Metal's
+//!   NO, the object attached. Metal also answers NO while its GPU retires the object's last use after the
+//!   command buffer completed (measured: 197 of 200 detaches made in the completed handler of
+//!   the command buffer that used the object, 9 of 200 made as its `waitUntilCompleted`
+//!   returned, none of 200 made 2 ms later; `tests/detach_backing.rs` waits 20 ms before such a
+//!   detach); here one made in a completed handler answers NO, and one made once
+//!   `waitUntilCompleted` returned YES. Core never reads the answer: after a NO, its next prepare
+//!   has the replace answer NO, which raises (`BufferBackingRefused`, `HeapBackingRefused`), and
+//!   a command buffer that uses the object before it runs.
+//!
+//! What Metal answers, measured on the M3 Max (macOS 26.7, 25G229), and this platform with it:
+//! - **A replace** answers NO, and leaves the object detached, for an attached object, an empty
+//!   array, a NULL or unmapped range, a range with a page mapped without access, and ranges
+//!   whose lengths total other than the buffer's length or the heap descriptor's size (a heap of
+//!   descriptor size 0x4010, size 0x8000, takes ranges of 0x4010 bytes, and neither 0x4000 nor
+//!   0x8000; a buffer of two pages refuses a range of 0x1000 bytes, or of a page and 0x40 bytes,
+//!   before one of a page or two, whose pages would fill it). One that answers YES keeps the
+//!   object's GPU address, and runs the deallocator of a buffer's memory before it inside the
+//!   call (this platform's runtime once no committed command buffer still uses it).
+//! - **A heap over address ranges** is made over ranges of any total, shorter or longer than its
+//!   size: this platform's heap takes the ranges' pages up to its size, and zero-filled pages of
+//!   its own past them. None is made over an empty array or a NULL or unmapped range, or one
+//!   with a page mapped without access, past its size too, nor of size 0. Read-only pages make one,
+//!   and replace, read-only or not (`tests/detach_backing.rs`, `pages_without_access`).
+//! - **`contents`** answers the alias: the bytes are the guest's either way, and the address is
+//!   the host's alone. Metal's differs in where it points: a buffer replaced by one range answers
+//!   that range's own address (writable whatever `readOnly:` says), and the buffers of a heap
+//!   made over one range, as core makes its heaps, answer their offsets in that range after any
+//!   replace, over its pages and not the replacing ones; core frees that range after the heap's
+//!   first replace. A CPU read through such a heap buffer's `contents` after a replace (a texture
+//!   filled from its bytes) reads the guest's bytes here, where Metal reads memory core has
+//!   freed.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
+use metal2vulkan_runtime as rt;
+use reims_vgpu_core::host::HostPtr;
+use reims_vgpu_core::platform::os::vm::{HostVm, KernReturn, VmProt};
+use reims_vgpu_core::platform::types::ResourceAddressRange;
+use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use reims_vgpu_core::rt::BlockEnv;
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::tasks::isolation::TaskLife;
+
+use crate::answer::unrepresentable;
+use crate::gpu::over_pages::Seen;
+use crate::os::OsVm;
+
+/// `replaceBackingWithRanges:readOnly:`.
+pub(crate) const REPLACE: &str = "replaceBackingWithRanges:readOnly:";
+
+/// `detachBacking`.
+const DETACH: &str = "detachBacking";
+
+/// The runtime rounds a heap's size up to a multiple of this (16 KiB), and the heap's memory
+/// covers all of it.
+pub(crate) const HEAP_GRANULE: u64 = 0x4000;
+
+/// Whether a buffer or heap is detached (`detachBacking`), and the read-only bit it was made
+/// with, which every alias it takes keeps. Core sends one object's detaches and replaces one at a
+/// time. While it is detached, and once it is released detached, the submissions that use it
+/// fail ([`submission_check`]), by its runtime identity.
+#[derive(Debug)]
+pub struct Backing {
+    detached: AtomicBool,
+    read_only: bool,
+    /// Whether the object is a heap, whose detach answers NO at once where a command buffer in
+    /// flight took it; a buffer's waits for each such command buffer first ([`Backing::detach`]).
+    heap: bool,
+    /// The runtime object's identity, which names it in [`DETACHED`]; `None` for one a detach
+    /// never detaches: a heap made over no address ranges, and a buffer placed in a heap, whose
+    /// detach is its heap's (module docs).
+    id: Option<rt::ObjectId>,
+    /// The memory `contents` stays over while the object is detached.
+    alias: Mutex<Aliased>,
+    /// Whether the runtime imports the memory the object lies in now through a writable twin of
+    /// read-only pages ([`crate::os::import_view`]): the alias of its last replace, or of the
+    /// ranges a heap was made over, or the memory a no-copy buffer was made over.
+    kept: AtomicBool,
+    /// The guest's pages the object's memory is over, whether a detach left it in no memory since
+    /// its last replace, and the commands' uses of those pages, as [`crate::gpu::over_pages`]
+    /// reads them without the object.
+    pub(crate) seen: Arc<Seen>,
+}
+
+/// The memory a buffer's or heap's `contents` stays over while a detach left it in no memory
+/// ([`Seen::zeroed`]): the alias of its last replace, or of the address ranges a heap was made
+/// over ([`Alias`]), which the runtime holds until the object is detached or rebound and no
+/// command buffer submitted uses it, and [`Backing`] until another takes its place; or the memory
+/// a no-copy buffer was made over ([`Own`]), until its first replace.
+#[derive(Debug, Default)]
+struct Aliased {
+    /// The alias of the last replace, or the one a heap over address ranges was made over;
+    /// `None` for a buffer never replaced.
+    last: Option<Arc<Alias>>,
+    /// The memory of the caller's a no-copy buffer was made over, until its first replace;
+    /// `None` for any other object.
+    own: Option<Own>,
+}
+
+/// The memory of the caller's a no-copy buffer was made over (`newBufferWithDescriptor:`, as core
+/// makes its detached buffers over a temporary allocation): its first byte, which `contents`
+/// answers while the buffer is detached, as Metal's stays, and the hold on the run of its
+/// deallocator ([`Held`]).
+#[derive(Debug)]
+pub(crate) struct Own {
+    /// The first byte.
+    at: NonNull<u8>,
+    held: Arc<Held>,
+}
+
+// SAFETY: `at` is an address only, which nothing here reads through: it is answered as
+// `contents`.
+unsafe impl Send for Own {}
+
+// SAFETY: as for `Send`.
+unsafe impl Sync for Own {}
+
+impl Own {
+    /// The memory of `at`, whose deallocator's run, which the runtime makes once it lets go of
+    /// the memory, goes through `held`.
+    pub(crate) fn new(at: NonNull<u8>, held: Arc<Held>) -> Own {
+        Own { at, held }
+    }
+}
+
+/// The run of a no-copy buffer's deallocator. Metal makes it at the buffer's first replace,
+/// inside the call, or as the buffer is destroyed, and never at a detach (measured on the M3 Max,
+/// macOS 26.7: `tests/detach_backing.rs`'s `buffer_life`). The runtime makes it once it lets go of
+/// the memory, which a rebind does, and a detach: so a run the runtime hands over after such a
+/// detach is held ([`Held::hold`]) until the replace that follows, or until the buffer is
+/// destroyed ([`Held::release`], [`Backing`]'s drop).
+#[derive(Default)]
+pub(crate) struct Held(Mutex<Hold>);
+
+/// Whether [`Held`] holds a run.
+#[derive(Default)]
+enum Hold {
+    /// A run handed over is made at once.
+    #[default]
+    Runs,
+    /// A run handed over waits for [`Held::release`]: the run, once handed over.
+    Holding(Option<Box<dyn FnOnce() + Send>>),
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let holding = matches!(*self.0.lock(), Hold::Holding(_));
+        f.debug_struct("Held").field("holding", &holding).finish()
+    }
+}
+
+impl Held {
+    /// The run of the deallocator, which the runtime hands over: made now, or held.
+    pub(crate) fn run(&self, run: Box<dyn FnOnce() + Send>) {
+        let mut hold = self.0.lock();
+        if let Hold::Holding(held) = &mut *hold {
+            *held = Some(run);
+            return;
+        }
+        drop(hold);
+        run();
+    }
+
+    /// A run handed over from now on is held.
+    fn hold(&self) {
+        let mut hold = self.0.lock();
+        if matches!(*hold, Hold::Runs) {
+            *hold = Hold::Holding(None);
+        }
+    }
+
+    /// A run held is made now, and one handed over later at once.
+    fn release(&self) {
+        let held = match std::mem::take(&mut *self.0.lock()) {
+            Hold::Holding(held) => held,
+            Hold::Runs => None,
+        };
+        if let Some(run) = held {
+            run();
+        }
+    }
+}
+
+impl Backing {
+    /// The attached backing of the runtime buffer `id`, over the memory it was made with;
+    /// `read_only` for one made with `MTLResourceOptions` bit 24.
+    pub(crate) fn new(read_only: bool, id: rt::ObjectId) -> Backing {
+        Backing::of(read_only, false, id)
+    }
+
+    /// The attached backing of the runtime heap `id`, made over address ranges, as
+    /// [`Backing::new`]'s.
+    pub(crate) fn heap(read_only: bool, id: rt::ObjectId) -> Backing {
+        Backing::of(read_only, true, id)
+    }
+
+    /// The attached backing of the runtime buffer or `heap` `id`.
+    fn of(read_only: bool, heap: bool, id: rt::ObjectId) -> Backing {
+        Backing {
+            detached: AtomicBool::new(false),
+            read_only,
+            heap,
+            id: Some(id),
+            alias: Mutex::new(Aliased::default()),
+            kept: AtomicBool::new(false),
+            seen: Arc::default(),
+        }
+    }
+
+    /// The backing of an object a detach never detaches: it stays attached, and a replace
+    /// answers NO, as Metal's does (module docs).
+    pub(crate) fn fixed() -> Backing {
+        Backing {
+            detached: AtomicBool::new(false),
+            read_only: false,
+            heap: false,
+            id: None,
+            alias: Mutex::new(Aliased::default()),
+            kept: AtomicBool::new(false),
+            seen: Arc::default(),
+        }
+    }
+
+    /// `detachBacking` of the object, which `detach`, the runtime's detach of its runtime object
+    /// (`detach_backing`), detaches: the object is detached from now on, but for one that never
+    /// detaches ([`Backing::fixed`]), and one a command buffer submitted and not yet completed
+    /// took, which stays attached, Metal's NO: a heap's at once, a buffer's once each such
+    /// command buffer completed ([`in_flight`], module docs). The runtime's object then lies in
+    /// no memory, so the GPU no longer reaches the memory it was over through it, the guest's
+    /// pages a replace gave it or what it was made over, and a command reaches it unnamed nowhere
+    /// until a replace; where the runtime refuses that, the process ends here
+    /// ([`refused_detach`]), and where it answers NO, a command buffer completing as the detach
+    /// is made having taken the object, it stays attached. A buffer neither replaced nor made over
+    /// memory of the caller's by `newBufferWithDescriptor:` dies here ([`unmeasured_detach`]). The
+    /// commands' uses of its pages are forgotten ([`Seen::forget_uses`]): core detaches an object
+    /// the guest discards, whose pages the guest may give another object.
+    pub(crate) fn detach(&self, detach: impl FnOnce() -> Result<bool, rt::Error>) {
+        let Some(id) = self.id else {
+            return;
+        };
+        if self.is_detached() {
+            return;
+        }
+        let held = {
+            let aliased = self.alias.lock();
+            match (&aliased.last, &aliased.own) {
+                (None, None) => unmeasured_detach(),
+                // A buffer never replaced: the run of its deallocator, which the runtime hands
+                // over as it lets go of the memory, waits for the first replace or the release.
+                (None, Some(own)) => Some(Arc::clone(&own.held)),
+                (Some(_), _) => None,
+            }
+        };
+        let takers = in_flight(id);
+        if !takers.is_empty() {
+            if !self.heap {
+                takers.iter().for_each(completed);
+            }
+            return;
+        }
+        if let Some(held) = &held {
+            held.hold();
+        }
+        match detach() {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(held) = held {
+                    held.release();
+                }
+                return;
+            }
+            Err(refused) => fatal_with_detail(
+                DeathId::Platform {
+                    kind: DeathKind::Abort,
+                    call: DETACH,
+                },
+                &refused_detach(&refused),
+            ),
+        }
+        self.detached.store(true, Ordering::Release);
+        DETACHED.lock().detached(id);
+        self.seen.forget_uses();
+        self.seen.zero();
+    }
+
+    /// Where the object's `contents` stays while it is detached: the first byte of the alias of
+    /// its last replace or of the ranges a heap was made over, or of the memory a no-copy buffer
+    /// was made over, which it had when it was detached ([`Backing::detach`]); `None` for one
+    /// attached, whose runtime object answers.
+    pub(crate) fn kept_contents(&self) -> Option<NonNull<u8>> {
+        let aliased = self.alias.lock();
+        let kept = match (&aliased.last, &aliased.own) {
+            (Some(alias), _) => Some(alias.at),
+            (None, Some(own)) => Some(own.at),
+            (None, None) => None,
+        };
+        self.seen.zeroed().then_some(kept).flatten()
+    }
+
+    /// The object, a heap, was made over `alias`, the alias of `ranges` of the guest's pages
+    /// ([`Backing::in_pages`]), which its `contents` stays over while it is detached.
+    pub(crate) fn made_over(&self, ranges: &[ResourceAddressRange], alias: Option<Arc<Alias>>) {
+        let kept = alias.as_ref().is_some_and(|alias| alias.writes_kept());
+        self.alias.lock().last = alias;
+        self.kept.store(kept, Ordering::Release);
+        self.seen.set_pages(pages(ranges));
+    }
+
+    /// The object, a no-copy buffer, was made over `own`, memory of the caller's.
+    pub(crate) fn made_over_own(&self, own: Own) {
+        self.alias.lock().own = Some(own);
+    }
+
+    /// The object, a no-copy buffer, was made over memory of the caller's that the runtime
+    /// imports through a writable twin of read-only pages where `kept`
+    /// ([`crate::os::import_view`]).
+    pub(crate) fn imported(&self, kept: bool) {
+        self.kept.store(kept, Ordering::Release);
+    }
+
+    /// Whether the GPU's writes through the object reach read-only memory, where Metal's drop:
+    /// the runtime imports the memory it lies in through a writable twin of read-only pages (on
+    /// Linux, [`crate::os::TWINS_READ_ONLY`]); not while it is detached, in no memory.
+    pub(crate) fn writes_kept(&self) -> bool {
+        self.kept.load(Ordering::Acquire) && !self.seen.zeroed()
+    }
+
+    /// [`Backing::writes_kept`], asked again as work that may write through the object is
+    /// encoded ([`crate::gpu::writes::Kept`]).
+    pub(crate) fn kept(&self) -> crate::gpu::writes::Kept {
+        match self.writes_kept() {
+            true => crate::gpu::writes::Kept::Until(Arc::clone(&self.seen)),
+            false => crate::gpu::writes::Kept::No,
+        }
+    }
+
+    /// The host memory of the object's bytes `bytes` in the guest's pages its memory is over now,
+    /// as the host maps them (each a first byte and an end): those of its last replace, or of the
+    /// address ranges a heap was made over; `None` for one over memory of its own, or detached,
+    /// whose writes reach no guest page ([`Seen::in_pages`]).
+    pub(crate) fn in_pages(
+        &self,
+        bytes: &std::ops::Range<u64>,
+    ) -> Option<Vec<std::ops::Range<u64>>> {
+        self.seen.in_pages(bytes)
+    }
+
+    /// Whether a detach detaches the object: a buffer not placed in a heap, or a heap made over
+    /// address ranges; not one [`Backing::fixed`] made.
+    pub(crate) fn detaches(&self) -> bool {
+        self.id.is_some()
+    }
+
+    /// Whether the object is detached.
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    /// `replaceBackingWithRanges:readOnly:` of an object whose ranges must total `length` bytes
+    /// (a buffer's length, a heap descriptor's size) and whose runtime object covers `size`
+    /// (its length, the heap's size): NO for an attached object, ranges of another total, and
+    /// ranges [`gather`] cannot alias, as Metal answers; else `rebind` gives the runtime's object
+    /// the alias, and YES. The alias is freed by its keep-alive, which a refused `rebind` drops
+    /// at once. A no-copy buffer's first YES runs its deallocator inside the call, as Metal's
+    /// does, where the runtime let go of the memory it was made over ([`Held`]). A YES dies where
+    /// the new pages bring a texture a heap keeps apart and another object over the same pages
+    /// together ([`crate::gpu::over_pages::moved`]).
+    pub(crate) fn replace(
+        &self,
+        ranges: &[ResourceAddressRange],
+        read_only: bool,
+        length: u64,
+        size: u64,
+        rebind: impl FnOnce(NonNull<u8>, rt::KeepAlive) -> RaiseResult<()>,
+    ) -> RaiseResult<bool> {
+        if !self.is_detached() || total(ranges) != Some(length) {
+            return Ok(false);
+        }
+        let Some(alias) = gather(REPLACE, ranges, size, read_only || self.read_only) else {
+            return Ok(false);
+        };
+        let alias = Arc::new(alias);
+        let (first, keep) = Arc::clone(&alias).into_runtime();
+        rebind(first, keep)?;
+        let own = {
+            let mut aliased = self.alias.lock();
+            self.kept.store(alias.writes_kept(), Ordering::Release);
+            aliased.last = Some(alias);
+            self.seen.set_pages(pages(ranges));
+            aliased.own.take()
+        };
+        // The memory the buffer was made over goes now, inside the call, as Metal's does.
+        if let Some(own) = own {
+            own.held.release();
+        }
+        self.detached.store(false, Ordering::Release);
+        if let Some(id) = self.id {
+            DETACHED.lock().attached(id);
+        }
+        crate::gpu::over_pages::moved(REPLACE, &self.seen);
+        Ok(true)
+    }
+}
+
+impl Drop for Backing {
+    /// The object's release: the command buffers made before it that use it, detached, still
+    /// fail. The runtime object may go before or after: no other object takes its identity. A
+    /// no-copy buffer never replaced runs its deallocator now where a detach held the run, as
+    /// Metal's runs it as the buffer is destroyed ([`Held`]).
+    fn drop(&mut self) {
+        if self.is_detached()
+            && let Some(id) = self.id
+        {
+            DETACHED.lock().released(id);
+        }
+        let own = self.alias.lock().own.take();
+        if let Some(own) = own {
+            own.held.release();
+        }
+    }
+}
+
+/// The `MTLCommandBufferError` code of a submission that uses a detached buffer or heap:
+/// `MTLCommandBufferErrorOutOfMemory`, as Metal fails it (module docs of
+/// [`crate::gpu::command`]).
+pub(crate) const DETACHED_USE: u64 = 8;
+
+/// The detached objects, the command buffers they may fail, and those submitted.
+static DETACHED: Mutex<Detached> = Mutex::new(Detached {
+    next: 0,
+    detached: BTreeSet::new(),
+    released: BTreeMap::new(),
+    open: BTreeMap::new(),
+    submitted: BTreeMap::new(),
+});
+
+/// The objects detached now and those released detached since the oldest open command buffer
+/// was made, and the open command buffers, numbered in one sequence of makes and releases, those
+/// submitted with what they submitted. An object is named by its runtime identity
+/// ([`rt::Buffer::object_id`], [`rt::Heap::object_id`]), which no other object ever takes, as the
+/// runtime lists a command's uses ([`rt::UsedResources`]): a buffer not placed in a heap, or a
+/// heap. `released` holds an object at most once, so it grows at most to the objects released
+/// while the oldest open command buffer stays open.
+#[derive(Debug)]
+struct Detached {
+    /// The next number of the sequence.
+    next: u64,
+    /// The objects detached now.
+    detached: BTreeSet<rt::ObjectId>,
+    /// The objects released detached: the number of the release. A command buffer made before
+    /// it may hold a use of the object.
+    released: BTreeMap<rt::ObjectId, u64>,
+    /// The numbers of the open command buffers ([`Opened`]), each with the isolated task that
+    /// made it, if one did, until it commits. An ended task's never commits, and one of a task
+    /// that died is never released ([`TaskLife`]), so it holds nothing; a committed one closes
+    /// once it completed, whatever its task does.
+    open: BTreeMap<u64, Option<Weak<TaskLife>>>,
+    /// The open command buffers a submission of which the runtime submitted, by number: what
+    /// [`in_flight`] asks what they took.
+    submitted: BTreeMap<u64, Submitted>,
+}
+
+/// A command buffer whose submissions the runtime submitted, until it closes ([`Opened`]): it,
+/// and the encoders of each submission, by their places among its ended encoders
+/// ([`rt::Submission::encoders`]).
+#[derive(Debug)]
+struct Submitted {
+    cb: rt::CommandBuffer,
+    encoders: Vec<std::ops::Range<usize>>,
+}
+
+impl Detached {
+    /// The next number of the sequence.
+    fn number(&mut self) -> u64 {
+        let number = self.next;
+        self.next += 1;
+        number
+    }
+
+    /// Object `id` detached.
+    fn detached(&mut self, id: rt::ObjectId) {
+        self.detached.insert(id);
+    }
+
+    /// Object `id`, detached, replaced: attached again. A command buffer committed before the
+    /// replace that names it fails in the runtime, which resolved the use as it was encoded
+    /// (module docs).
+    fn attached(&mut self, id: rt::ObjectId) {
+        self.detached.remove(&id);
+    }
+
+    /// Object `id` released detached: kept while a command buffer is open, which may have been
+    /// made before it.
+    fn released(&mut self, id: rt::ObjectId) {
+        self.detached.remove(&id);
+        let number = self.number();
+        if !self.open.is_empty() {
+            self.released.insert(id, number);
+        }
+    }
+
+    /// Whether a command buffer made at `made` fails where it uses object `id`: the object is
+    /// detached, or was released detached after the command buffer was made.
+    fn fails(&self, id: rt::ObjectId, made: u64) -> bool {
+        self.detached.contains(&id) || self.released.get(&id).is_some_and(|&at| at > made)
+    }
+
+    /// Whether a command buffer made at `made` can fail by any object.
+    fn any(&self, made: u64) -> bool {
+        !self.detached.is_empty() || self.released.values().any(|&at| at > made)
+    }
+
+    /// Command buffer `made` submitted `submission`, which no detached object fails: a detach of
+    /// what it uses answers NO until it closes ([`in_flight`]).
+    fn submitted(&mut self, made: u64, submission: &rt::Submission<'_>) {
+        self.submitted
+            .entry(made)
+            .or_insert_with(|| Submitted {
+                cb: submission.command_buffer().clone(),
+                encoders: Vec::new(),
+            })
+            .encoders
+            .push(submission.encoders());
+    }
+
+    /// Command buffer `made` closed, and those of ended tasks dropped: the releases no open
+    /// command buffer was made before are forgotten. What it submitted is answered, to be let go
+    /// of without the lock: it holds the command buffer.
+    fn closed(&mut self, made: u64) -> Option<Submitted> {
+        self.open.remove(&made);
+        self.open.retain(|_, task| {
+            task.as_ref()
+                .is_none_or(|task| task.upgrade().is_some_and(|task| !task.has_ended()))
+        });
+        match self.open.keys().next() {
+            Some(&oldest) => self.released.retain(|_, &mut at| at > oldest),
+            None => self.released.clear(),
+        }
+        self.submitted.remove(&made)
+    }
+}
+
+/// A command buffer's place in the sequence of [`Detached`], where it was made, open until it
+/// drops: when the command buffer is released uncommitted, when it commits with no check, or
+/// when it completes, as the runtime then drops its check ([`submission_check`]).
+#[derive(Debug)]
+pub(crate) struct Opened(u64);
+
+impl Opened {
+    /// The place of a command buffer made now, by the isolated task whose code runs, if one is.
+    pub(crate) fn new() -> Opened {
+        let task = TaskLife::current().map(|task| Arc::downgrade(&task));
+        let mut detached = DETACHED.lock();
+        let made = detached.number();
+        detached.open.insert(made, task);
+        Opened(made)
+    }
+
+    /// The command buffer commits now: open until it completed, whatever its task does.
+    pub(crate) fn commit(self) -> Opened {
+        if let Some(task) = DETACHED.lock().open.get_mut(&self.0) {
+            *task = None;
+        }
+        self
+    }
+}
+
+impl Opened {
+    /// The submission check of `submission` of the command buffer ([`submission_check`]): it
+    /// fails with [`DETACHED_USE`] where it uses a buffer or heap detached now, or one released
+    /// detached since the command buffer was made ([`Detached::fails`]); else it is submitted
+    /// ([`Detached::submitted`]), decided and noted at once, so a detach either fails it or
+    /// sees it. What it uses is asked only where an object could fail it.
+    fn submit(&self, submission: &rt::Submission<'_>) -> Option<NonZeroU64> {
+        {
+            let mut detached = DETACHED.lock();
+            if !detached.any(self.0) {
+                detached.submitted(self.0, submission);
+                return None;
+            }
+        }
+        let ids = ids(submission.used_resources());
+        let mut detached = DETACHED.lock();
+        if ids.into_iter().any(|id| detached.fails(id, self.0)) {
+            return NonZeroU64::new(DETACHED_USE);
+        }
+        detached.submitted(self.0, submission);
+        None
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        let submitted = DETACHED.lock().closed(self.0);
+        // Released without the lock: it may hold the command buffer's last handle.
+        drop(submitted);
+    }
+}
+
+/// Whether command buffer `cb`, where it uses what `used` lists, fails: it uses a buffer or heap
+/// detached now, or one released detached since it was made ([`Detached::fails`]). `used` is
+/// asked only where an object could fail it.
+pub(crate) fn uses_detached(used: impl FnOnce() -> rt::UsedResources, cb: &Opened) -> bool {
+    if !DETACHED.lock().any(cb.0) {
+        return false;
+    }
+    let ids = ids(used());
+    let detached = DETACHED.lock();
+    ids.into_iter().any(|id| detached.fails(id, cb.0))
+}
+
+/// The identities of what `used` lists, a buffer not placed in a heap or a heap, as
+/// [`Detached`] names them. `used` is released here, without the lock: what it holds may be a
+/// resource's last handle.
+fn ids(used: rt::UsedResources) -> Vec<rt::ObjectId> {
+    used.buffers
+        .iter()
+        .map(rt::Buffer::object_id)
+        .chain(used.heaps.iter().map(rt::Heap::object_id))
+        .collect()
+}
+
+/// The check of each submission of the command buffer committed as `cb`
+/// ([`rt::CommandBuffer::set_submission_check`]), which the runtime runs on its scheduler thread
+/// once the submission's event waits are met, just before it submits it: one that uses a
+/// detached buffer or heap, or one released detached since `cb` was made, fails with
+/// [`DETACHED_USE`]; any other is noted submitted ([`Opened::submit`]). The runtime drops it,
+/// and so closes `cb`, once the command buffer completed, after its completed handlers ran.
+pub(crate) fn submission_check(cb: Opened) -> rt::SubmissionCheck {
+    Arc::new(move |submission: &rt::Submission<'_>| {
+        // A callout on the runtime's scheduler thread: marked ours, so a panic here aborts.
+        let _env = BlockEnv::foreign();
+        cb.submit(submission)
+    })
+}
+
+/// The command buffers submitted and not yet completed that took object `id`, a buffer not
+/// placed in a heap or a heap: through a command of a submission the runtime submitted that
+/// named it (a buffer placed in the heap included) or made it resident, as the runtime lists
+/// what each of its ended encoders uses until it completes ([`rt::CommandBuffer::ended_encoders`]).
+/// A submission noted after they were read is decided by the runtime's own detach, which makes
+/// the object's uses in submissions after it fail as Metal's do, and answers NO where one
+/// submitted before it took the object ([`Backing::detach`]).
+fn in_flight(id: rt::ObjectId) -> Vec<rt::CommandBuffer> {
+    let submitted: Vec<(rt::CommandBuffer, Vec<std::ops::Range<usize>>)> = DETACHED
+        .lock()
+        .submitted
+        .values()
+        .map(|s| (s.cb.clone(), s.encoders.clone()))
+        .collect();
+    // The command buffers not taken are let go of here, without the lock.
+    submitted
+        .into_iter()
+        .filter(|(cb, encoders)| took(cb, encoders, id))
+        .map(|(cb, _)| cb)
+        .collect()
+}
+
+/// Whether `cb`'s ended encoders at `encoders`, those of its submissions the runtime submitted,
+/// use object `id` ([`in_flight`]): none does once it completed.
+fn took(cb: &rt::CommandBuffer, encoders: &[std::ops::Range<usize>], id: rt::ObjectId) -> bool {
+    let ended = cb.ended_encoders();
+    encoders
+        .iter()
+        .flat_map(Clone::clone)
+        .filter_map(|at| ended.get(at))
+        .any(|encoder| {
+            let used = &encoder.used_resources;
+            used.buffers.iter().any(|b| b.object_id() == id)
+                || used.heaps.iter().any(|h| h.object_id() == id)
+        })
+}
+
+/// Returns once `cb` completed, its status `Completed` or `Error`, which the runtime sets before
+/// it runs its completed handlers: a handler of its own sees it so. The status is read every
+/// [`COMPLETION_POLL`].
+fn completed(cb: &rt::CommandBuffer) {
+    while !matches!(
+        cb.status(),
+        rt::CommandBufferStatus::Completed | rt::CommandBufferStatus::Error
+    ) {
+        std::thread::sleep(COMPLETION_POLL);
+    }
+}
+
+/// How often [`completed`] reads a command buffer's status.
+const COMPLETION_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// The host's pages `ranges` lie in, in their order, as an alias of them maps them ([`spans`]),
+/// each a first byte and an end, those that meet merged.
+fn pages(ranges: &[ResourceAddressRange]) -> Vec<std::ops::Range<u64>> {
+    let mut runs: Vec<std::ops::Range<u64>> = Vec::new();
+    for span in spans(ranges, OsVm::new().page_size()).unwrap_or_default() {
+        match runs.last_mut() {
+            Some(run) if run.end == span.start => run.end = span.end,
+            _ => runs.push(span),
+        }
+    }
+    runs
+}
+
+/// The ranges' lengths added up; `None` past `u64::MAX`.
+fn total(ranges: &[ResourceAddressRange]) -> Option<u64> {
+    ranges
+        .iter()
+        .try_fold(0u64, |sum, range| sum.checked_add(range.length))
+}
+
+/// A range of this platform's address space whose pages are the guest's, shared, and zeros past
+/// them ([`gather`]); freed when it drops.
+#[derive(Debug)]
+pub(crate) struct Alias {
+    at: NonNull<u8>,
+    length: u64,
+    /// Whether the runtime imports it through a writable twin of read-only pages, as its last
+    /// import found ([`Alias::into_runtime`]).
+    kept: AtomicBool,
+}
+
+// SAFETY: an `Alias` is an address range this platform owns; nothing reads through it here, and
+// it is freed once, by whichever thread drops it.
+unsafe impl Send for Alias {}
+
+// SAFETY: as for `Send`: a shared `Alias` only answers where it is.
+unsafe impl Sync for Alias {}
+
+impl Alias {
+    /// The first byte the runtime imports, and the runtime's keep-alive of the alias, which lets
+    /// go of it as it drops: once the runtime freed its import, or at once where the call was
+    /// refused. The alias is freed once nothing else holds it.
+    ///
+    /// The runtime imports the alias's pages, or, where the host's runtime cannot import them as
+    /// they are mapped (read-only, on Linux), a writable twin of them ([`crate::os::import_view`]),
+    /// whose first byte this answers, and which the keep-alive holds too: the GPU's writes then
+    /// reach the pages, where Metal drops them ([`Alias::writes_kept`]).
+    pub(crate) fn into_runtime(self: Arc<Self>) -> (NonNull<u8>, rt::KeepAlive) {
+        let first = self.at;
+        let view = crate::os::import_view(first, self.length);
+        let imported = view.at();
+        self.kept.store(view.writes_kept(), Ordering::Release);
+        let (_, twin) = view.release(first, None);
+        (imported, keep_alive((twin, self)))
+    }
+
+    /// Whether the runtime imports the alias through a writable twin of read-only pages, whose
+    /// GPU writes reach them where Metal drops them, as its last import found
+    /// ([`crate::os::import_view`]).
+    pub(crate) fn writes_kept(&self) -> bool {
+        self.kept.load(Ordering::Acquire)
+    }
+
+    /// The first byte.
+    #[cfg(test)]
+    pub(crate) fn first(&self) -> NonNull<u8> {
+        self.at
+    }
+}
+
+impl Drop for Alias {
+    fn drop(&mut self) {
+        let _ = OsVm::new().deallocate(HostPtr::from_ptr(self.at.as_ptr()), self.length);
+    }
+}
+
+/// The runtime's keep-alive of `kept`, what keeps the memory of a no-copy buffer's or heap's
+/// import mapped (an [`Alias`], a twin, an [`UnmapHold`](crate::remap::UnmapHold)): the runtime
+/// drops it once it freed the device's import of the memory, after the deallocator ran, on
+/// the thread that frees the import, which may be one of the runtime's. Its drop runs
+/// marked ours, so a panic there aborts.
+pub(crate) fn keep_alive(kept: impl Send + 'static) -> rt::KeepAlive {
+    /// `kept`, dropped marked ours.
+    struct Kept<T>(Option<T>);
+    impl<T> Drop for Kept<T> {
+        fn drop(&mut self) {
+            // A callout on the runtime's thread: marked ours, so a panic here aborts.
+            let _env = BlockEnv::foreign();
+            drop(self.0.take());
+        }
+    }
+    Box::new(Kept(Some(kept)))
+}
+
+/// One remap of a gather: `length` bytes from `source`, at `offset` in the alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Run {
+    /// Where in the alias.
+    pub(crate) offset: u64,
+    /// The first byte of the guest's pages.
+    pub(crate) source: u64,
+    /// The bytes, whole pages.
+    pub(crate) length: u64,
+}
+
+/// The pages of `page` bytes `ranges` lie in, as Metal maps them (the module docs), each a first
+/// byte and an end: ranges whose bytes follow on from the previous range's are one run of bytes,
+/// and each run of bytes takes the pages it lies in, from the page of its first byte through the
+/// page of its last; one of no bytes takes none. `None` past `u64::MAX`.
+fn spans(ranges: &[ResourceAddressRange], page: u64) -> Option<Vec<std::ops::Range<u64>>> {
+    let mut bytes: Vec<std::ops::Range<u64>> = Vec::new();
+    for r in ranges {
+        let end = r.address.checked_add(r.length)?;
+        match bytes.last_mut() {
+            Some(run) if run.end == r.address => run.end = end,
+            _ => bytes.push(r.address..end),
+        }
+    }
+    bytes
+        .into_iter()
+        .filter(|run| !run.is_empty())
+        .map(|run| Some(run.start - run.start % page..run.end.checked_next_multiple_of(page)?))
+        .collect()
+}
+
+/// The remaps of `ranges` into an alias of `size` bytes, whole pages of `page` bytes: the pages
+/// of [`spans`] in order, up to `size`, one remap per run of them that follow on in the host's
+/// memory. `None` for an empty list or a NULL range, which Metal refuses, and past `u64::MAX`. A
+/// first range that starts off its page dies at `sel` ([`off_the_page`]).
+pub(crate) fn runs(
+    sel: &'static str,
+    ranges: &[ResourceAddressRange],
+    size: u64,
+    page: u64,
+) -> Option<Vec<Run>> {
+    let first = ranges.first()?;
+    if ranges.iter().any(|range| range.address == 0) {
+        return None;
+    }
+    if first.address % page != 0 {
+        off_the_page(sel, first.address, first.address % page);
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut offset = 0u64;
+    for span in spans(ranges, page)? {
+        let length = (span.end - span.start).min(size.saturating_sub(offset));
+        if length == 0 {
+            break;
+        }
+        match runs.last_mut() {
+            Some(run) if run.source.checked_add(run.length) == Some(span.start) => {
+                run.length += length;
+            }
+            _ => runs.push(Run {
+                offset,
+                source: span.start,
+                length,
+            }),
+        }
+        offset += length;
+    }
+    Some(runs)
+}
+
+/// The death at `sel` of address ranges whose first starts at `address`, `into` bytes into its
+/// page ([`runs`]). Metal's `contents` answers the range's bytes from its own address, and its
+/// GPU reads and writes them from the start of its page, `into` bytes before it (measured on the
+/// M3 Max, macOS 26.7: one range from 0x40 and from 0x1000 into its page, a heap's and a
+/// replace's alike, `tests/detach_backing.rs`); a buffer of the runtime's has one address for
+/// the CPU and the GPU, the first byte of the memory it imports, so no alias of this platform's
+/// gives both.
+fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
+    unrepresentable(
+        sel,
+        &format!(
+            "address ranges whose first starts at {address:#x}, {into:#x} bytes into its page: \
+             Metal's contents answers its bytes from that address, and its GPU reads and writes \
+             them from the page's start, {into:#x} bytes before it; the runtime's buffer has one \
+             address for the CPU and the GPU"
+        ),
+    )
+}
+
+/// The guest's pages of `ranges`, gathered into a fresh alias of `size` bytes rounded up to the
+/// host's page ([`runs`]), zero-filled past the ranges' pages, read-only when `read_only` (module
+/// docs). `None`, with nothing left mapped, for ranges Metal refuses (an empty list, a NULL or an
+/// unmapped range, one with a page the host maps without read access, which the runtime refuses
+/// to import, past `size` too). Where the host refuses the alias what it needs past those checks
+/// (address space, a remap of the guest's pages, which on Linux takes pages with a file behind
+/// them, a protection), the process ends at `sel` ([`refused_by_host`]): Metal takes the ranges.
+///
+/// Where the runtime imports read-only memory through a writable twin of its files
+/// ([`crate::os::TWINS_READ_ONLY`], Linux), a read-only alias's zeros past the ranges' pages map
+/// the block of zeros ([`fill_zeros`]), as a twin can be made of a file alone: the twin's are
+/// zeros of its own then ([`crate::os::import_view`]). Elsewhere they are the fresh range's own.
+pub(crate) fn gather(
+    sel: &'static str,
+    ranges: &[ResourceAddressRange],
+    size: u64,
+    read_only: bool,
+) -> Option<Alias> {
+    let vm = OsVm::new();
+    let page = vm.page_size();
+    let length = size.checked_next_multiple_of(page)?;
+    // Every page of the ranges, those past `size` too, as Metal refuses one there (measured);
+    // checked before the alias takes address space, which a hole among the ranges could hold,
+    // and before a death of ranges Metal refuses.
+    for span in spans(ranges, page)? {
+        let source = HostPtr::from_addr(usize::try_from(span.start).ok()?);
+        if !vm.readable(source, span.end - span.start) {
+            return None;
+        }
+    }
+    let runs = runs(sel, ranges, length, page)?;
+    let at = vm
+        .allocate_anywhere(length)
+        .unwrap_or_else(|kr| refused_by_host(sel, "address space for an alias", length, kr));
+    let alias = Alias {
+        at: NonNull::new(at.as_ptr::<u8>())?,
+        length,
+        kept: AtomicBool::new(false),
+    };
+    let mut pages = 0;
+    for run in runs {
+        let source = HostPtr::from_addr(usize::try_from(run.source).ok()?);
+        if let Err(kr) = vm.remap_shared_overwrite(at.wrapping_add(run.offset), source, run.length)
+        {
+            refused_by_host(
+                sel,
+                "a remap of the guest's pages into an alias",
+                run.length,
+                kr,
+            );
+        }
+        pages = run.offset + run.length;
+    }
+    if read_only {
+        if crate::os::TWINS_READ_ONLY {
+            fill_zeros(sel, &vm, at, pages, length);
+        }
+        if let Err(kr) = vm.protect_max(at, length, VmProt::READ) {
+            refused_by_host(sel, "an alias's read-only protection", length, kr);
+        }
+    }
+    Some(alias)
+}
+
+/// The death at `sel` of `what`, of `length` bytes, that the host refused with `kr`, where
+/// Metal's call goes on: this platform's alias of the guest's pages, or its zeros, need what
+/// Metal's own call does not, and no answer of Metal's fits without them (a NO or nil where
+/// Metal answers YES, or a detach whose object stays over the guest's pages).
+fn refused_by_host(sel: &'static str, what: &str, length: u64, kr: KernReturn) -> ! {
+    fatal_with_detail(
+        DeathId::Platform {
+            kind: DeathKind::Abort,
+            call: sel,
+        },
+        &format!(
+            "the host refused {what} of {length:#x} bytes (kern_return {}), where Metal's call \
+             goes on",
+            kr.0
+        ),
+    )
+}
+
+/// The line of the death at `detachBacking` of an object the runtime refused to detach
+/// ([`Backing::detach`]), `refused` its answer: a texture over its bytes whose image no stand-in
+/// of zero bytes presents exactly (a multisample or multi-planar texture, or one with a depth or
+/// decoded twin), or one being made over them (`RuntimeGap::DetachTextures`); memory for a
+/// stand-in; a lost device. Metal detaches it, and such a texture reads zero bytes and drops its
+/// writes (measured on an M4), which the runtime has no form for there.
+fn refused_detach(refused: &rt::Error) -> String {
+    format!(
+        "{}: the detach of a buffer or heap, which the runtime refuses where a texture over its \
+         bytes has no stand-in of zero bytes (a multisample or multi-planar texture, or one with \
+         a depth or decoded twin) or is being made, or for memory or a lost device; Metal \
+         detaches it, and such a texture reads zeros and drops its writes",
+        crate::answer::refusal(refused)
+    )
+}
+
+/// The death at `detachBacking` of a buffer neither replaced nor made over memory of the
+/// caller's by `newBufferWithDescriptor:` ([`Backing::detach`]): one of the device's own memory,
+/// one made on a surface, or one `newBufferWithBytesNoCopy:length:options:deallocator:` made.
+/// What Metal's `contents` answers after such a detach, and when it runs such a buffer's
+/// deallocator, is not measured, and core detaches none of them.
+fn unmeasured_detach() -> ! {
+    fatal_with_detail(
+        DeathId::Platform {
+            kind: DeathKind::Abort,
+            call: DETACH,
+        },
+        "a detach of a buffer neither replaced nor made by newBufferWithDescriptor: over memory \
+         of the caller's (one of the device's own memory, one made on a surface, or one \
+         newBufferWithBytesNoCopy: made): what Metal's contents answers after it, and when \
+         Metal runs the buffer's deallocator, is not measured",
+    )
+}
+
+/// The bytes of [`zero_block`]'s block: 1 MiB, whole pages on every host.
+const ZERO_BLOCK: u64 = 0x10_0000;
+
+/// A block of [`ZERO_BLOCK`] bytes of zeros, read-only, made once and never freed, that a
+/// read-only alias's zeros past its ranges' pages map where the runtime twins read-only memory
+/// ([`fill_zeros`]); `Err` with the host's answer where it gave none. A view can be made of it
+/// ([`crate::os::allocate_aliasable`]).
+fn zero_block() -> Result<HostPtr, KernReturn> {
+    static BLOCK: OnceLock<Result<usize, KernReturn>> = OnceLock::new();
+    let at = BLOCK.get_or_init(|| {
+        let vm = OsVm::new();
+        let at = crate::os::allocate_zeros(ZERO_BLOCK)?;
+        match vm.protect_max(at, ZERO_BLOCK, VmProt::READ) {
+            Ok(()) => Ok(at.addr()),
+            Err(kr) => {
+                let _ = vm.deallocate(at, ZERO_BLOCK);
+                Err(kr)
+            }
+        }
+    });
+    at.map(HostPtr::from_addr)
+}
+
+/// Maps the block of [`zero_block`] over the bytes from `from` to `length` of the range at `at`,
+/// whole pages: one remap maps the block, and each further one doubles what is mapped. Where the
+/// host gave no block or refused a remap, the process ends at `sel` ([`refused_by_host`]).
+fn fill_zeros(sel: &'static str, vm: &OsVm, at: HostPtr, from: u64, length: u64) {
+    if from >= length {
+        return;
+    }
+    let block = zero_block()
+        .unwrap_or_else(|kr| refused_by_host(sel, "the block of zeros", ZERO_BLOCK, kr));
+    let (first, length) = (at.wrapping_add(from), length - from);
+    let mut mapped = length.min(ZERO_BLOCK);
+    if let Err(kr) = vm.remap_shared_overwrite(first, block, mapped) {
+        refused_by_host(sel, "a remap of the block of zeros", mapped, kr);
+    }
+    while mapped < length {
+        let more = mapped.min(length - mapped);
+        if let Err(kr) = vm.remap_shared_overwrite(first.wrapping_add(mapped), first, more) {
+            refused_by_host(sel, "a remap of zeros", more, kr);
+        }
+        mapped += more;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::os::PAGE;
+
+    fn range(address: u64, length: u64) -> ResourceAddressRange {
+        ResourceAddressRange { address, length }
+    }
+
+    fn run(offset: u64, source: u64, length: u64) -> Run {
+        Run {
+            offset,
+            source,
+            length,
+        }
+    }
+
+    /// Fresh pages of the host a view can be made of, each byte `byte`.
+    fn pages(count: u64, byte: u8) -> HostPtr {
+        let at = crate::os::allocate_aliasable(count * PAGE).unwrap();
+        // SAFETY: the pages were just allocated, readable and writable.
+        unsafe {
+            std::ptr::write_bytes(
+                at.as_ptr::<u8>(),
+                byte,
+                usize::try_from(count * PAGE).unwrap(),
+            );
+        };
+        at
+    }
+
+    fn read(at: NonNull<u8>, offset: u64) -> u8 {
+        // SAFETY: test memory this test mapped readable.
+        unsafe {
+            at.as_ptr()
+                .add(usize::try_from(offset).unwrap())
+                .read_volatile()
+        }
+    }
+
+    fn write(at: HostPtr, offset: u64, byte: u8) {
+        // SAFETY: test memory this test mapped writable.
+        unsafe { at.wrapping_add(offset).as_ptr::<u8>().write_volatile(byte) }
+    }
+
+    fn address(at: HostPtr) -> u64 {
+        u64::try_from(at.addr()).unwrap()
+    }
+
+    /// Host-contiguous ranges make one run, as core cuts its runs at two pages; the ranges'
+    /// bytes are cut at the size, and a short last range is remapped to its page's end
+    #[test]
+    fn runs_join_contiguous_ranges_up_to_the_size() {
+        let at = 0x10_0000;
+        let ranges = [
+            range(at, PAGE),
+            range(at + PAGE, PAGE),
+            range(at + 0x10_0000, PAGE),
+        ];
+        assert_eq!(
+            runs(REPLACE, &ranges, 3 * PAGE, PAGE),
+            Some(vec![
+                run(0, at, 2 * PAGE),
+                run(2 * PAGE, at + 0x10_0000, PAGE)
+            ])
+        );
+        assert_eq!(
+            runs(REPLACE, &ranges, PAGE, PAGE),
+            Some(vec![run(0, at, PAGE)])
+        );
+        assert_eq!(
+            runs(REPLACE, &[range(at, 0x10)], PAGE, PAGE),
+            Some(vec![run(0, at, PAGE)])
+        );
+        assert_eq!(runs(REPLACE, &[], PAGE, PAGE), None);
+        assert_eq!(
+            runs(REPLACE, &[range(at, PAGE), range(0, PAGE)], 2 * PAGE, PAGE),
+            None
+        );
+    }
+
+    /// Each run of ranges whose bytes follow on takes the pages it lies in, whole, as Metal maps
+    /// them: a range of part of a page all of it, before another too, and a later range starting
+    /// off its page from the page's start, through the page of its last byte; up to the size,
+    /// those that follow on in the host's memory one remap: the shapes `tests/detach_backing.rs`
+    /// compares with Metal's (its `unaligned_shape`'s 2 to 7), and more
+    #[test]
+    fn runs_take_the_pages_each_run_of_bytes_lies_in() {
+        let g = 0x10_0000;
+        let cases = [
+            // A range of a quarter page before one of two pages: its page, then the next one's.
+            (
+                vec![range(g, PAGE / 4), range(g + 2 * PAGE, 2 * PAGE)],
+                2 * PAGE,
+                vec![run(0, g, PAGE), run(PAGE, g + 2 * PAGE, PAGE)],
+            ),
+            // A range of a page and 0x40 bytes: two pages.
+            (
+                vec![range(g, PAGE + 0x40), range(g + 3 * PAGE, PAGE)],
+                2 * PAGE,
+                vec![run(0, g, 2 * PAGE)],
+            ),
+            // A later range from 0x40 into its page: from the page's start.
+            (
+                vec![range(g, PAGE), range(g + 2 * PAGE + 0x40, PAGE)],
+                2 * PAGE,
+                vec![run(0, g, PAGE), run(PAGE, g + 2 * PAGE, PAGE)],
+            ),
+            // The same before a third range: through the page of its last byte.
+            (
+                vec![
+                    range(g, PAGE),
+                    range(g + 2 * PAGE + 0x40, PAGE),
+                    range(g + 5 * PAGE, PAGE),
+                ],
+                3 * PAGE,
+                vec![run(0, g, PAGE), run(PAGE, g + 2 * PAGE, 2 * PAGE)],
+            ),
+            // Ranges whose bytes follow on across a page: one run of bytes.
+            (
+                vec![
+                    range(g, PAGE + 0x40),
+                    range(g + PAGE + 0x40, 2 * PAGE - 0x40),
+                ],
+                3 * PAGE,
+                vec![run(0, g, 3 * PAGE)],
+            ),
+            // A middle range of a quarter page from its page's start.
+            (
+                vec![
+                    range(g, PAGE),
+                    range(g + 2 * PAGE, PAGE / 4),
+                    range(g + 4 * PAGE, PAGE),
+                ],
+                3 * PAGE,
+                vec![
+                    run(0, g, PAGE),
+                    run(PAGE, g + 2 * PAGE, PAGE),
+                    run(2 * PAGE, g + 4 * PAGE, PAGE),
+                ],
+            ),
+            // Ranges that do not follow on but share a page: the page twice.
+            (
+                vec![range(g, PAGE / 4), range(g + PAGE / 2, PAGE)],
+                3 * PAGE,
+                vec![run(0, g, PAGE), run(PAGE, g, 2 * PAGE)],
+            ),
+            // A range of part of a page before the next page's range: one remap.
+            (
+                vec![range(g, PAGE / 4), range(g + PAGE, PAGE)],
+                2 * PAGE,
+                vec![run(0, g, 2 * PAGE)],
+            ),
+            // A range of no bytes takes nothing.
+            (
+                vec![
+                    range(g, PAGE),
+                    range(g + 0x40 + 4 * PAGE, 0),
+                    range(g + 2 * PAGE, PAGE),
+                ],
+                2 * PAGE,
+                vec![run(0, g, PAGE), run(PAGE, g + 2 * PAGE, PAGE)],
+            ),
+        ];
+        for (ranges, size, expected) in cases {
+            assert_eq!(
+                runs(REPLACE, &ranges, size, PAGE),
+                Some(expected),
+                "{ranges:x?}"
+            );
+        }
+    }
+
+    /// A first range starting off its page dies at the creator, naming where it starts and what
+    /// Metal's CPU and GPU see; ranges Metal refuses (a NULL one, an unmapped page) are refused
+    /// first, as Metal makes nothing of them
+    #[test]
+    fn a_first_range_off_its_page_dies() {
+        use reims_vgpu_core::raise::death::DeathKind;
+        use reims_vgpu_core::testkit::capture::catch_death;
+        let guest = pages(3, 0);
+        for (into, sel) in [(0x40, REPLACE), (PAGE / 4, "newHeapWithDescriptor:")] {
+            let ranges = [range(address(guest) + into, 2 * PAGE)];
+            *crate::answer::LAST_LINE.lock() = None;
+            let site = catch_death(|| gather(sel, &ranges, 2 * PAGE, false).is_some()).unwrap_err();
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
+            assert!(
+                line.contains(&format!("{into:#x} bytes into its page"))
+                    && line.contains("Metal's contents answers its bytes from that address"),
+                "{line}"
+            );
+        }
+        let null = range(0, PAGE);
+        let off = range(address(guest) + 0x40, PAGE);
+        assert_eq!(runs(REPLACE, &[off, null], 2 * PAGE, PAGE), None);
+        let vm = OsVm::new();
+        assert!(
+            vm.deallocate(guest.wrapping_add(2 * PAGE), PAGE)
+                .is_success()
+        );
+        let unmapped = [range(address(guest) + 0x40, 2 * PAGE)];
+        assert!(gather(REPLACE, &unmapped, 2 * PAGE, false).is_none());
+        assert!(vm.deallocate(guest, 2 * PAGE).is_success());
+    }
+
+    /// The alias shows the guest's pages, in order, and the guest's pages its writes; past the
+    /// ranges it is zero-filled pages of its own
+    #[test]
+    fn an_alias_is_the_guests_pages_both_ways() {
+        let guest = pages(4, 0xa1);
+        write(guest, 3 * PAGE, 0xb2);
+        let ranges = [
+            range(address(guest), PAGE),
+            range(address(guest) + PAGE, PAGE),
+            range(address(guest) + 3 * PAGE, PAGE),
+        ];
+        let alias = gather(REPLACE, &ranges, 4 * PAGE, false).unwrap();
+        let first = alias.first();
+        assert_eq!(
+            [0, PAGE, 2 * PAGE, 3 * PAGE].map(|at| read(first, at)),
+            [0xa1, 0xa1, 0xb2, 0]
+        );
+        write(guest, 5, 0x5c);
+        assert_eq!(read(first, 5), 0x5c, "the guest's write shows in the alias");
+        write(HostPtr::from_ptr(first.as_ptr()), 2 * PAGE + 7, 0x6d);
+        // SAFETY: the guest's pages are mapped.
+        let seen = unsafe {
+            guest
+                .wrapping_add(3 * PAGE + 7)
+                .as_ptr::<u8>()
+                .read_volatile()
+        };
+        assert_eq!(seen, 0x6d, "the alias's write shows in the guest's page");
+        drop(alias);
+        assert!(OsVm::new().deallocate(guest, 4 * PAGE).is_success());
+    }
+
+    /// A NULL or unmapped range, one with a page mapped without access, within the size or past
+    /// it, or none, gathers nothing; read-only pages gather
+    #[test]
+    fn refused_ranges_gather_nothing() {
+        use reims_vgpu_core::platform::os::vm::VmProt;
+        let vm = OsVm::new();
+        // A hole of one page between two mapped ones, where no alias of two pages fits.
+        let around = pages(3, 0);
+        let hole = around.wrapping_add(PAGE);
+        assert!(vm.deallocate(hole, PAGE).is_success());
+        let shut = pages(2, 0);
+        vm.protect_max(shut.wrapping_add(PAGE), PAGE, VmProt(0))
+            .unwrap();
+        // A page unmapped before free address space, where the alias would fit.
+        let last = pages(2, 0);
+        assert!(vm.deallocate(last.wrapping_add(PAGE), PAGE).is_success());
+        for ranges in [
+            vec![],
+            vec![range(0, PAGE)],
+            vec![range(address(around), PAGE), range(address(hole), PAGE)],
+            vec![range(address(shut), 2 * PAGE)],
+            vec![range(address(last), 2 * PAGE)],
+        ] {
+            assert!(
+                gather(REPLACE, &ranges, 2 * PAGE, false).is_none(),
+                "{ranges:?}"
+            );
+        }
+        // Past the size, as within it.
+        for ranges in [
+            vec![range(address(shut), 2 * PAGE)],
+            vec![
+                range(address(shut), PAGE),
+                range(address(shut) + PAGE, PAGE),
+            ],
+            vec![range(address(last), 2 * PAGE)],
+        ] {
+            assert!(
+                gather(REPLACE, &ranges, PAGE, false).is_none(),
+                "{ranges:?}"
+            );
+        }
+        // A later range that ends in its page before an unmapped one: only its page is read.
+        let ends = [
+            range(address(around), PAGE),
+            range(address(last) + 0x40, PAGE - 0x40),
+        ];
+        assert!(gather(REPLACE, &ends, 2 * PAGE, false).is_some());
+        let read_only = pages(1, 0);
+        vm.protect_max(read_only, PAGE, VmProt::READ).unwrap();
+        assert!(gather(REPLACE, &[range(address(read_only), PAGE)], PAGE, false).is_some());
+        for page in [around, around.wrapping_add(2 * PAGE), last, read_only] {
+            assert!(vm.deallocate(page, PAGE).is_success());
+        }
+        assert!(vm.deallocate(shut, 2 * PAGE).is_success());
+    }
+
+    /// Runtime identities of `N` objects, made and released here, which no other object takes.
+    fn ids<const N: usize>() -> [rt::ObjectId; N] {
+        let dev = crate::gpu::device::tests::dev();
+        std::array::from_fn(|_| {
+            dev.raw
+                .new_buffer(16, rt::ResourceOptions::default())
+                .unwrap()
+                .object_id()
+        })
+    }
+
+    /// A registry of its own, empty.
+    fn registry() -> Detached {
+        Detached {
+            next: 0,
+            detached: BTreeSet::new(),
+            released: BTreeMap::new(),
+            open: BTreeMap::new(),
+            submitted: BTreeMap::new(),
+        }
+    }
+
+    /// A command buffer made now in `d` by `task`, or by none: its number.
+    fn made(d: &mut Detached, task: Option<&Arc<TaskLife>>) -> u64 {
+        let made = d.number();
+        d.open.insert(made, task.map(Arc::downgrade));
+        made
+    }
+
+    /// Command buffer `made` committed now in `d`.
+    fn committed(d: &mut Detached, made: u64) -> u64 {
+        d.open.insert(made, None);
+        made
+    }
+
+    /// A replace answers NO for an attached object and for ranges of another total, and YES once
+    /// the runtime took the alias, which leaves the object attached. A detach is the runtime's,
+    /// once; `contents` then stays the memory the object was over: what a no-copy buffer was made
+    /// over, whose deallocator's run, which the runtime hands over as it lets go of it, is held
+    /// until the first replace, or a replace's alias. The runtime's NO leaves the object
+    /// attached, and its refusal ends the process at `detachBacking`, naming it and what Metal's
+    /// textures read; so does a detach of a buffer neither replaced nor made over memory of the
+    /// caller's
+    #[test]
+    fn replace_answers_as_metal() {
+        use reims_vgpu_core::testkit::capture::catch_death;
+        let guest = pages(2, 0xa1);
+        let ranges = [range(address(guest), 2 * PAGE)];
+        let [id, other] = ids();
+        let site = catch_death(|| Backing::new(false, other).detach(|| Ok(true)));
+        assert_eq!(
+            site.map_err(|site| (site.kind, site.file)),
+            Err((DeathKind::Abort, DETACH)),
+            "no memory of the caller's"
+        );
+        let backing = Backing::new(false, id);
+        let made_over = pages(2, 0x11);
+        let made_at = NonNull::new(made_over.as_ptr::<u8>()).unwrap();
+        let held = Arc::new(Held::default());
+        backing.made_over_own(Own::new(made_at, Arc::clone(&held)));
+        let ran = Arc::new(AtomicBool::new(false));
+        let deallocate = || {
+            let ran = Arc::clone(&ran);
+            Box::new(move || ran.store(true, Ordering::Release)) as Box<dyn FnOnce() + Send>
+        };
+        let rebinds = std::cell::Cell::new(0);
+        let rebind = |_: NonNull<u8>, _: rt::KeepAlive| {
+            rebinds.set(rebinds.get() + 1);
+            Ok(())
+        };
+        // The runtime's detaches, and its answer to each.
+        let detaches = std::cell::Cell::new(0);
+        let detach = |answer: Result<bool, rt::Error>| {
+            let detaches = &detaches;
+            move || {
+                detaches.set(detaches.get() + 1);
+                answer
+            }
+        };
+        let refusal = || rt::Error::NotImplemented(rt::RuntimeGap::DetachTextures);
+        assert_eq!(
+            backing.replace(&ranges, false, 2 * PAGE, 2 * PAGE, rebind),
+            Ok(false),
+            "attached"
+        );
+        backing.detach(detach(Ok(false)));
+        assert!(!backing.is_detached(), "the runtime's NO");
+        assert_eq!(backing.kept_contents(), None);
+        held.run(deallocate());
+        assert!(ran.load(Ordering::Acquire), "not held past a NO");
+        ran.store(false, Ordering::Release);
+        backing.detach(detach(Ok(true)));
+        backing.detach(detach(Ok(true)));
+        assert!(backing.is_detached());
+        assert_eq!(detaches.take(), 2, "never replaced: detached once");
+        assert_eq!(backing.kept_contents(), Some(made_at), "contents stays");
+        held.run(deallocate());
+        assert!(!ran.load(Ordering::Acquire), "held at the detach");
+        for length in [PAGE, 3 * PAGE] {
+            assert_eq!(
+                backing.replace(&ranges, false, length, length, rebind),
+                Ok(false),
+                "{length:#x}"
+            );
+        }
+        assert_eq!(rebinds.get(), 0);
+        assert!(!ran.load(Ordering::Acquire), "held past refused replaces");
+        assert_eq!(
+            backing.replace(&ranges, false, 2 * PAGE, 2 * PAGE, rebind),
+            Ok(true)
+        );
+        assert_eq!(rebinds.get(), 1);
+        assert!(ran.load(Ordering::Acquire), "run inside the first replace");
+        assert!(!backing.is_detached());
+        let alias = backing.alias.lock().last.as_ref().map(|alias| alias.at);
+        backing.detach(detach(Ok(true)));
+        assert_eq!(detaches.take(), 1);
+        assert_eq!(backing.kept_contents(), alias, "contents stays the alias");
+        assert_eq!(
+            backing.replace(&ranges, false, 2 * PAGE, 2 * PAGE, rebind),
+            Ok(true)
+        );
+        assert_eq!(backing.kept_contents(), None);
+        let site = catch_death(|| backing.detach(detach(Err(refusal())))).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, DETACH));
+        assert_eq!(detaches.take(), 1);
+        let line = refused_detach(&refusal());
+        assert!(
+            line.starts_with("the Vulkan runtime refused it: ")
+                && line.contains("Metal detaches it, and such a texture reads zeros"),
+            "{line}"
+        );
+        let fixed = Backing::fixed();
+        fixed.detach(detach(Ok(true)));
+        assert!(!fixed.is_detached(), "a fixed backing never detaches");
+        assert_eq!(detaches.take(), 0);
+        assert_eq!(
+            fixed.replace(&ranges, false, 2 * PAGE, 2 * PAGE, rebind),
+            Ok(false)
+        );
+        let vm = OsVm::new();
+        assert!(vm.deallocate(guest, 2 * PAGE).is_success());
+        assert!(vm.deallocate(made_over, 2 * PAGE).is_success());
+    }
+
+    /// A no-copy buffer never replaced runs its deallocator as it goes where a detach held the
+    /// run, as Metal's runs it as the buffer is destroyed
+    #[test]
+    fn a_held_run_is_made_as_the_buffer_goes() {
+        let [id] = ids();
+        let backing = Backing::new(false, id);
+        let made_over = pages(1, 0x11);
+        let held = Arc::new(Held::default());
+        let made_at = NonNull::new(made_over.as_ptr::<u8>()).unwrap();
+        backing.made_over_own(Own::new(made_at, Arc::clone(&held)));
+        backing.detach(|| Ok(true));
+        let ran = Arc::new(AtomicBool::new(false));
+        let run = Arc::clone(&ran);
+        held.run(Box::new(move || run.store(true, Ordering::Release)));
+        assert!(!ran.load(Ordering::Acquire), "held at the detach");
+        drop(backing);
+        assert!(ran.load(Ordering::Acquire), "run as it went");
+        assert!(OsVm::new().deallocate(made_over, PAGE).is_success());
+    }
+
+    /// A deallocator's run is made at once but while a detach holds it; then at the release,
+    /// once, and at once again after it
+    #[test]
+    fn a_held_run_is_made_at_its_release() {
+        let held = Held::default();
+        let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let run = || {
+            let runs = Arc::clone(&runs);
+            Box::new(move || {
+                runs.fetch_add(1, Ordering::AcqRel);
+            }) as Box<dyn FnOnce() + Send>
+        };
+        let count = || runs.load(Ordering::Acquire);
+        held.run(run());
+        assert_eq!(count(), 1);
+        held.hold();
+        held.run(run());
+        assert_eq!(count(), 1, "held");
+        held.release();
+        assert_eq!(count(), 2, "released");
+        held.release();
+        assert_eq!(count(), 2, "once");
+        held.run(run());
+        assert_eq!(count(), 3, "at once after it");
+    }
+
+    /// A read-only alias reads the guest's pages, and zeros past them, and its pages cannot be
+    /// made writable
+    #[test]
+    fn a_read_only_alias_reads_zeros_past_its_pages() {
+        let guest = pages(1, 0xa5);
+        let alias = gather(REPLACE, &[range(address(guest), PAGE)], 3 * PAGE, true).unwrap();
+        assert_eq!(alias.length, 3 * PAGE);
+        assert_eq!(read(alias.at, 0), 0xa5);
+        for offset in [PAGE, 2 * PAGE + 5, 3 * PAGE - 1] {
+            assert_eq!(read(alias.at, offset), 0, "{offset:#x}");
+        }
+        let at = HostPtr::from_ptr(alias.at.as_ptr());
+        assert!(!crate::os::writable(at, alias.length), "writable");
+        drop(alias);
+        assert!(OsVm::new().deallocate(guest, PAGE).is_success());
+    }
+
+    /// An object fails the command buffers that use it while it is detached; released detached,
+    /// those made before the release until they close; replaced, none here, committed before the
+    /// replace or not (the runtime fails one that names it, module docs). No release is kept
+    /// while no command buffer is open
+    #[test]
+    fn detached_objects_fail_their_command_buffers() {
+        let mut d = registry();
+        let [buffer, heap] = ids();
+        let first = made(&mut d, None);
+        assert!(!d.any(first));
+        d.detached(buffer);
+        assert!(d.any(first) && d.fails(buffer, first) && !d.fails(heap, first));
+        d.attached(buffer);
+        assert!(!d.any(first) && !d.fails(buffer, first), "replaced");
+        let first = committed(&mut d, first);
+        d.detached(buffer);
+        d.released(buffer);
+        let second = made(&mut d, None);
+        assert!(d.detached.is_empty());
+        assert!(d.fails(buffer, first), "made before the release");
+        assert!(!d.fails(buffer, second) && !d.any(second), "made after it");
+        d.detached(heap);
+        let second = committed(&mut d, second);
+        assert!(d.fails(heap, second) && d.fails(heap, first), "detached");
+        d.attached(heap);
+        assert!(!d.fails(heap, second), "committed before the replace");
+        d.closed(first);
+        assert!(
+            d.released.is_empty(),
+            "no open command buffer made before it"
+        );
+        d.closed(second);
+        assert!(d.open.is_empty());
+        d.detached(buffer);
+        d.released(buffer);
+        assert!(d.detached.is_empty() && d.released.is_empty());
+    }
+
+    /// A command buffer committed while a buffer it fills is detached fails with code 8 as it is
+    /// submitted, as Metal's (`tests/detach_backing.rs`'s `never_replaced`), on every host: the
+    /// detached buffer lies in no memory, so no host keeps what a command that reaches it unnamed
+    /// writes
+    #[test]
+    fn a_commit_while_detached_fails_on_every_host() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::device::GpuDevice;
+        use reims_vgpu_core::platform::resource::Buffer;
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
+        use reims_vgpu_core::raise::OnFault;
+        const TEST: &str = "gpu::backing::tests::a_commit_while_detached_fails_on_every_host";
+        if std::env::var("RVG_CHILD").as_deref() == Ok(TEST) {
+            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            let d = crate::gpu::device::tests::dev();
+            let memory = pages(1, 0xd0);
+            // SAFETY: the pages stay mapped for the process, which exits below.
+            let contents = unsafe { reims_vgpu_core::platform::HostRange::new(memory, PAGE) };
+            let buffer = d
+                .new_buffer(BufferDesc {
+                    length: PAGE,
+                    options: vec![OptionSet::StorageMode(0)],
+                    pinned_gpu_address: None,
+                    contents: Some(contents),
+                    no_copy: true,
+                    deallocator: None,
+                })
+                .unwrap()
+                .unwrap();
+            buffer.detach_backing().unwrap();
+            let queue = d.new_command_queue().unwrap();
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for command in [
+                BlitCmd::FillBuffer {
+                    buffer: &buffer,
+                    range: NsRange::new(0, 16),
+                    value: 0x5c,
+                },
+                BlitCmd::EndEncoding,
+            ] {
+                e.encode(OnFault::Return, command).unwrap();
+            }
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            let code = cb.error().map_or(0, |e| e.code);
+            println!("status {} code {code}", cb.status().0);
+            std::process::exit(0);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("RVG_CHILD", TEST)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let death = stderr
+            .lines()
+            .find(|l| l.starts_with("reims-vgpu: fatal: "));
+        assert!(out.status.success() && death.is_none(), "{out:?}");
+        assert!(stdout.contains("status 5 code 8"), "{stdout}");
+    }
+
+    /// A command buffer of an isolated task that ended holds no release: one that died mid-encode
+    /// is never released, and never commits. One that committed holds it until it completed
+    #[test]
+    fn an_ended_tasks_command_buffer_holds_no_release() {
+        let mut d = registry();
+        let task = TaskLife::new();
+        let leaked = made(&mut d, Some(&task));
+        let sent = made(&mut d, Some(&task));
+        let sent = committed(&mut d, sent);
+        let host = made(&mut d, None);
+        let [buffer] = ids();
+        d.detached(buffer);
+        d.released(buffer);
+        assert!(d.fails(buffer, leaked) && d.fails(buffer, sent));
+        d.closed(host);
+        assert!(d.fails(buffer, leaked), "the task is running");
+        let other = made(&mut d, None);
+        assert!(task.exit());
+        d.closed(other);
+        assert_eq!(d.open.keys().copied().collect::<Vec<_>>(), [sent]);
+        assert!(d.fails(buffer, sent), "committed");
+        d.closed(sent);
+        assert!(d.open.is_empty() && d.released.is_empty());
+    }
+}

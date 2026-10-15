@@ -1,0 +1,2 @@
+# reims-ctl's own: the repository root's bans (architecture 17.4) are the library's, whose
+# threads, locks and clocks come from its platform. reims-ctl links nothing of the library.

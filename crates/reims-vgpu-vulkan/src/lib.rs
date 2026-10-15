@@ -1,0 +1,28 @@
+//! A proof of concept: the `Platform` implementation over `metal2vulkan-runtime`, a Metal-shaped
+//! API on Vulkan (architecture D1). The Metal platform stays the product: this one is the API's
+//! platform only under the `vulkan` features of `reims-vgpu` and `reims-vgpu-c`, which
+//! `cargo xtask dist --platform vulkan` selects.
+//!
+//! - **GPU objects** are the runtime's ([`gpu`]): each handle is an [`Obj`] over the runtime's
+//!   object and what core's trait asks of it beside (the device it came from, the IOSurface it
+//!   retains).
+//! - **The runtime's typed errors** become core's outcomes in one place, [`answer`]: a raise the
+//!   send's policy decides, `None` where Metal answers nil, an `NsErrorText`, or a death naming
+//!   the selector where the runtime refuses what Metal does.
+//! - **A method not built yet** dies at its selector ([`answer::unbuilt`]), so a run's death line
+//!   names the first selector the platform lacks; none answers a made-up value.
+//! - **The OS services** ([`os`]): on macOS the metal crate's (threads, clocks, Mach VM, the
+//!   autorelease pool and IOSurface), over MoltenVK; on Linux this crate's own, over the host's
+//!   Vulkan driver.
+//! - **A display window's swapchain** (`swapchain`), on the runtime's own device: the window's
+//!   render thread presents the display's frames through it, with no copy, on either OS.
+
+pub mod answer;
+pub mod api;
+pub mod gpu;
+pub mod os;
+pub mod platform;
+pub mod remap;
+pub mod swapchain;
+
+pub use platform::{Obj, VulkanPlatform};

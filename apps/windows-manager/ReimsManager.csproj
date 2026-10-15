@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>ReimsManager</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="../../scripts/windows/*.ps1" Link="scripts/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../scripts/windows/ucrt64.cmake" Link="scripts/ucrt64.cmake" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../scripts/windows/guest-setup.command" Link="scripts/guest-setup.command" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../scripts/windows/guest-display.js" Link="scripts/guest-display.js" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

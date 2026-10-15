@@ -1,0 +1,25 @@
+[package]
+name = "reims-vgpu-core"
+description = "All of the library's behaviour, generic over the platform; links no Apple framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+# core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
+testkit = []
+
+# Architecture 2.2: no objc2, block2, dispatch2, mach2 or libc here.
+[dependencies]
+parking_lot.workspace = true
+zerocopy.workspace = true
+bitflags.workspace = true
+log.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
+[lints]
+workspace = true

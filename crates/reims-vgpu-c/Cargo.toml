@@ -1,0 +1,53 @@
+[package]
+name = "reims-vgpu-c"
+description = "The C API (rvg_*) over reims-vgpu; adds no behaviour"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the dist tree's lib/libreims_vgpu.dylib (@rpath/libreims_vgpu.dylib), which the suite's
+# runner links; staticlib: lib/libreims_vgpu.a, which QEMU and the smoke link; rlib so Rust tests
+# link it.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["macos-sdl"]
+# SDL3's window on macOS (`reims-vgpu`'s `macos-sdl`), on by default: `--no-default-features`
+# builds the macOS library without SDL, its windows AppKit's alone.
+macos-sdl = ["reims-vgpu/macos-sdl"]
+# The Vulkan platform's proof of concept (architecture 11.1): every handle is made on
+# `VulkanPlatform` in place of `MetalPlatform`. Off by default: the Metal platform is the product.
+# `cargo xtask dist --platform vulkan` builds the dist tree with it.
+vulkan = ["reims-vgpu/vulkan"]
+
+[dependencies]
+reims-vgpu.workspace = true
+# The platform trait's associated types (the unit tests' testkit platform stands where
+# MetalPlatform stands in the product), and the log hook.
+reims-vgpu-core.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+# `fstat` and the host's page size, for the files behind a memory map's ranges.
+libc.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows always uses Vulkan, including when the C crate's default features are disabled.
+reims-vgpu = { workspace = true, features = ["vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `exception::catch` around every call of a host function (`ffi::host_call`, `ffi/catch/macos.rs`).
+objc2.workspace = true
+
+[dev-dependencies]
+reims-vgpu = { workspace = true, features = ["testkit"] }
+reims-vgpu-core = { workspace = true, features = ["testkit"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# The exceptions `ffi`'s tests throw as a host would (`ffi/tests/macos.rs`).
+objc2-foundation.workspace = true
+
+[lints]
+workspace = true

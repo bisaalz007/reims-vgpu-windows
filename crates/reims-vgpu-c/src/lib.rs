@@ -1,0 +1,94 @@
+//! The C API (docs/api.md section 2): a thin FFI layer over `reims-vgpu`'s Rust API, from which
+//! cbindgen writes `include/reims_vgpu.h`. It converts and forwards; it decides nothing. Every
+//! callback it builds calls the host's function synchronously, on the thread core calls it on,
+//! so the order and the threads of every call to the host are core's.
+//!
+//! Conventions, which the header's preamble repeats:
+//! - every function is `extern "C"`, and runs its body inside [`ffi::export`]: nothing unwinds
+//!   out of it, and a panic under it ends the process before anything unwinds ([`ffi`]);
+//! - handles are opaque ([`handle`]); a create writes one only on `RVG_OK`, a release of NULL
+//!   does nothing, and any other NULL handle is `RVG_ERR_INVALID_ARGUMENT` where the function
+//!   answers an [`RvgStatus`] and ends the process where it does not;
+//! - every struct the host writes starts with `struct_size` ([`sized`]);
+//! - every callback table has one `ctx` and one `destroy` ([`table`]).
+//!
+//! The exports are made over [`Plat`]: the product's `MetalPlatform`, or with the `vulkan`
+//! feature the proof of concept's `VulkanPlatform`, and core's testkit platform in this crate's
+//! unit tests, which then run the product's code. Linux requires the `vulkan` feature;
+//! Windows always uses Vulkan, since Metal is macOS's.
+
+// With the `vulkan` feature, a debug build's proof that the runtime's types are `Send` and `Sync`
+// nests deeper than rustc's default limit of 128 (E0275).
+#![recursion_limit = "256"]
+
+// cbindgen writes the header's functions in the order it parses them: these modules' order,
+// each in a group of its own so that rustfmt keeps it.
+pub mod status;
+
+pub mod log;
+
+pub mod device;
+pub mod display;
+pub mod frame;
+pub mod iosurface;
+pub mod trace;
+pub mod window;
+
+mod ffi;
+mod handle;
+mod sized;
+mod table;
+
+pub use status::RvgStatus;
+
+#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
+compile_error!("on Linux, reims-vgpu-c builds only with the `vulkan` feature (VulkanPlatform)");
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("reims-vgpu-c supports only macOS, Linux and Windows");
+
+/// The platform every handle is made on.
+#[cfg(all(not(any(test, feature = "vulkan")), target_os = "macos"))]
+pub(crate) type Plat = reims_vgpu::MetalPlatform;
+/// The platform every handle is made on, with the `vulkan` feature: the proof of concept over
+/// metal2vulkan's runtime (architecture 2.2).
+#[cfg(all(not(test), any(feature = "vulkan", target_os = "windows")))]
+pub(crate) type Plat = reims_vgpu::VulkanPlatform;
+/// The platform every handle is made on: core's testkit platform in this crate's unit tests.
+#[cfg(test)]
+pub(crate) type Plat = reims_vgpu_core::testkit::FakePlatform;
+
+/// The most display ports a device has.
+pub const RVG_MAX_DISPLAY_PORTS: u32 = 8;
+
+/// The size of the device's MMIO region: the PCI BAR, or vmapple's first region.
+pub const RVG_DEVICE_MMIO_SIZE: u64 = 16384;
+
+/// The PCI vendor ID of the device.
+pub const RVG_PCI_VENDOR_ID: u16 = 4203;
+
+/// The PCI device ID of the device.
+pub const RVG_PCI_DEVICE_ID: u16 = 61166;
+
+/// The BAR that holds the device's MMIO region.
+pub const RVG_PCI_BAR_MMIO: u32 = 0;
+
+/// The MSI vectors the device uses.
+pub const RVG_PCI_MSI_VECTORS: u32 = 1;
+
+const _: () = assert!(RVG_MAX_DISPLAY_PORTS == reims_vgpu::MAX_DISPLAY_PORTS);
+const _: () = assert!(RVG_DEVICE_MMIO_SIZE == reims_vgpu::DEVICE_MMIO_SIZE);
+const _: () = assert!(RVG_PCI_VENDOR_ID == reims_vgpu::PCI_VENDOR_ID);
+const _: () = assert!(RVG_PCI_DEVICE_ID == reims_vgpu::PCI_DEVICE_ID);
+
+/// Ends the process: `call` was given a NULL handle it cannot answer without one.
+pub(crate) fn null_handle(call: &'static str) -> ! {
+    use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal};
+    fatal(DeathId::Platform {
+        kind: DeathKind::NullDeref,
+        call,
+    })
+}
+
+#[cfg(test)]
+mod testkit;

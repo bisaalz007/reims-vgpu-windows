@@ -1,0 +1,238 @@
+//! Platform trait: `GpuDevice`: MTLDevice selectors, SPI included, and the two Metal C SPI
+//! functions that take a device.
+//!
+//! Conventions (architecture 4.2): zero-argument getters return `T` (the metal crate's `send_get`
+//! dies on a raise); every method with arguments and every creator returns `RaiseResult<T>`;
+//! creators return `Option` because Metal can return nil whether or not core checks.
+//!
+//! Creators and encoders hand Metal much of what the guest sends as it is, so Metal's own
+//! validation, or the driver, ends the process at the op whose input breaks Metal's rules: a
+//! pipeline made from a nil or invalid function or with an unspecialized function constant, a
+//! malformed serialized descriptor, a texture descriptor Metal refuses, a second encoder over an
+//! open one, an encoder open at the commit, a nil indirect buffer. An isolated task's thread is no
+//! exception (`tasks::isolation::life`). A method whose input can do so says it on an `aborts:`
+//! line.
+
+use std::sync::Arc;
+
+use super::caps::DeviceCaps;
+use super::host_range::HostRange;
+use super::types::{
+    NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+};
+use super::values::{
+    BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
+};
+use super::{Handle, Platform};
+use crate::raise::{OnFault, RaiseResult};
+use crate::rt::Hold;
+
+/// A deallocator Metal calls once when a no-copy buffer is freed (the
+/// `newBufferWithBytesNoCopy:…deallocator:` block). `None` is a nil block.
+pub type NoCopyDeallocator = Box<dyn FnOnce() + Send>;
+
+/// The deserialization context's `functionWithFunctionRef:` (`MTLDeserializationContext`,
+/// PGResourceManagerDeserializationContext): runs synchronously on the calling thread, during the
+/// SPI call, once per function reference the blob names, under the hold the platform
+/// hands it (Metal's runs it under a handler of its own). `Err` is a throw inside the lookup (a
+/// task cursor or a creator raising), which the platform carries through Metal's send to the
+/// caller as the same raise.
+pub type FunctionResolver<'a, P> =
+    &'a mut dyn FnMut(Hold<'_>, u64) -> RaiseResult<Option<<P as Platform>::Function>>;
+
+/// `id<MTLDevice>` (`id<MTLDeviceSPI>`).
+pub trait GpuDevice<P: Platform>: Handle {
+    /// sel: allowLibrariesFromOtherPlatforms SPI
+    /// Side effect only; sent once per device, where no handler is live: a raise inside it dies
+    /// at the send.
+    fn allow_foreign_libraries(&self);
+    /// sel: heapTextureSizeAndAlignWithDescriptor:
+    /// The result reaches the guest (opcode 64, info 451/469).
+    fn heap_texture_size_and_align(&self, desc: &P::TextureDescriptor)
+    -> RaiseResult<SizeAndAlign>;
+    /// sel: newBufferWithBytesNoCopy:length:options:deallocator: — (nil
+    /// deallocator),. Wraps host memory with no copy: `bytes` is the pointer and the length, and
+    /// its constructor's contract keeps it mapped until Metal runs `deallocator`, or, with no
+    /// deallocator, for as long as the buffer lives.
+    /// Reached both under a handler and with none: `on` says which this call is.
+    fn new_buffer_over_host_memory(
+        &self,
+        on: OnFault,
+        bytes: HostRange<'_>,
+        options: u64,
+        deallocator: Option<NoCopyDeallocator>,
+    ) -> RaiseResult<Option<P::Buffer>>;
+    /// sel: newBufferWithIOSurface: SPI — The buffer retains
+    /// the surface (a guest-visible count).
+    fn new_buffer_on_surface(
+        &self,
+        iosurface: Option<&P::Surface>,
+    ) -> RaiseResult<Option<P::Buffer>>;
+    /// sel: newBufferWithLength:options:
+    /// nil means the resource is refused.
+    /// Reached both under a handler and with none: `on` says which this call is.
+    fn new_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<P::Buffer>>;
+    /// sel: newCommandQueue
+    /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
+    fn new_command_queue(&self) -> Option<P::CommandQueue>;
+    /// sel: newComputePipelineDescriptorWithSerializedData:deserializationContext: SPI
+    /// `data` becomes a `dispatch_data_t` with core's destructor; `context` runs synchronously
+    /// during the call. aborts: a malformed or truncated blob, inside Metal's deserializer.
+    fn deserialize_compute_pipeline_descriptor(
+        &self,
+        hold: Hold<'_>,
+        data: &[u8],
+        context: FunctionResolver<'_, P>,
+    ) -> RaiseResult<Option<P::ComputePipelineDescriptor>>;
+    /// sel: newComputePipelineStateWithDescriptor:options:reflection:error:
+    /// Core passes nil `reflection`; `Err` is the `NSError` (nil error with a nil state is
+    /// `Ok(None)`). The descriptor is nil when its serialized form deserializes to nil; core sends
+    /// it unchecked, and Metal answers nil with an error (testing.md 6.18).
+    fn new_compute_pipeline_state(
+        &self,
+        descriptor: Option<&P::ComputePipelineDescriptor>,
+        options: u64,
+    ) -> RaiseResult<Result<Option<P::ComputePipeline>, NsErrorText>>;
+    /// sel: newComputePipelineStateWithFunction:error:
+    /// The function may be nil (a library with no such function); core asserts on nil in the
+    /// service. No path reaches it under a handler: a raise inside it dies at the send.
+    fn new_compute_pipeline_state_for_function(
+        &self,
+        compute_function: Option<&P::Function>,
+    ) -> Result<Option<P::ComputePipeline>, NsErrorText>;
+    /// sel: newLibraryWithSource:options:error:
+    /// The library of our own shaders: the display's present functions and the XR10 blit
+    /// kernels, from the Metal Shading Language the platform embeds. It is compiled once per
+    /// Metal device, and each call answers a new reference to it; `Err` is the compiler's
+    /// `NSError`. No path reaches it under a handler: a raise inside it dies at the send.
+    fn new_shader_library(&self) -> Result<Option<P::Library>, NsErrorText>;
+    /// sel: newEvent
+    /// Reached both under a handler and with none: `on` says which this call is.
+    fn new_event(&self, on: OnFault) -> RaiseResult<Option<P::Event>>;
+    /// sel: newFence
+    fn new_fence(&self) -> RaiseResult<Option<P::Fence>>;
+    /// sel: newLibraryWithData:error: — `data` becomes a
+    /// `dispatch_data_t`; `Err` is the `NSError`, whose description core logs.
+    fn new_library(&self, data: &[u8]) -> RaiseResult<Result<Option<P::Library>, NsErrorText>>;
+    /// sel: newRasterizationRateMapWithDescriptor:
+    /// aborts: the third layer on the suite's host (render_ratemap_three_layers).
+    fn new_rate_map(&self, descriptor: &P::RateMapDescriptor) -> RaiseResult<Option<P::RateMap>>;
+    /// sel: newRenderPipelineDescriptorWithSerializedData:deserializationContext: SPI
+    /// As the compute form. aborts: malformed blobs.
+    fn deserialize_render_pipeline_descriptor(
+        &self,
+        hold: Hold<'_>,
+        data: &[u8],
+        context: FunctionResolver<'_, P>,
+    ) -> RaiseResult<Option<P::RenderPipelineDescriptor>>;
+    /// sel: newRenderPipelineStateWithDescriptor:options:reflection:error:
+    /// Core passes nil `reflection`, and a nil descriptor unchecked, as the compute form.
+    fn new_render_pipeline_state_from_descriptor(
+        &self,
+        descriptor: Option<&P::RenderPipelineDescriptor>,
+        options: u64,
+    ) -> RaiseResult<Result<Option<P::RenderPipeline>, NsErrorText>>;
+    /// sel: newRenderPipelineStateWithTileDescriptor:options:reflection:error:
+    /// Core passes nil `reflection`, and a nil descriptor unchecked, as the compute form.
+    fn new_tile_render_pipeline_state(
+        &self,
+        descriptor: Option<&P::TileRenderPipelineDescriptor>,
+        options: u64,
+    ) -> RaiseResult<Result<Option<P::RenderPipeline>, NsErrorText>>;
+    /// sel: newSharedEvent — One per FIFO. No path reaches it under a handler: a raise inside
+    /// it dies at the send.
+    fn new_shared_event(&self) -> Option<P::SharedEvent>;
+    /// sel: newSharedEventWithHandle: — Opens the FIFO
+    /// event the host sent; the handle may be nil (decoded from the wire). No path reaches it
+    /// under a handler: a raise inside it dies at the send.
+    fn open_shared_event(
+        &self,
+        shared_event_handle: Option<&P::SharedEventHandle>,
+    ) -> Option<P::SharedEvent>;
+    /// sel: newSharedTextureWithDescriptor:
+    fn new_shared_texture(
+        &self,
+        descriptor: &P::TextureDescriptor,
+    ) -> RaiseResult<Option<P::Texture>>;
+    /// sel: newSharedTextureWithHandle:withResourceIndex: SPI
+    /// The index is the guest's placement word, unverified.
+    fn open_shared_texture(
+        &self,
+        handle: Option<&P::SharedTextureHandle>,
+        resource_index: u64,
+    ) -> RaiseResult<Option<P::Texture>>;
+    /// sel: newTextureWithDescriptor:
+    /// Reached both under a handler and with none: `on` says which this call is.
+    fn new_texture(
+        &self,
+        on: OnFault,
+        descriptor: &P::TextureDescriptor,
+    ) -> RaiseResult<Option<P::Texture>>;
+    /// sel: newTextureWithDescriptor:iosurface:plane:
+    /// The texture retains the surface (guest-visible count). aborts: display opcode 8 with some
+    /// descriptors (testing.md 7.4).
+    fn new_texture_on_surface(
+        &self,
+        descriptor: &P::TextureDescriptor,
+        iosurface: Option<&P::Surface>,
+        plane: u64,
+    ) -> RaiseResult<Option<P::Texture>>;
+    /// sel: newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: SPI
+    /// As the compute form, over core's buffer: `malloc(buffer_length)` (the cursor's remaining
+    /// bytes) holding `data` (the `descriptorLength` bytes read into it, which the data spans),
+    /// never freed. aborts: malformed blobs.
+    fn deserialize_tile_render_pipeline_descriptor(
+        &self,
+        hold: Hold<'_>,
+        data: &[u8],
+        buffer_length: u64,
+        context: FunctionResolver<'_, P>,
+    ) -> RaiseResult<Option<P::TileRenderPipelineDescriptor>>;
+    /// sel: reserveResourceIndicesForResourceType:indices:indexCount: SPI
+    /// (types 0, 1 and 5). `indexCount` is `indices.len()`.
+    fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()>;
+    /// C SPI `MTLPixelFormatGetInfoForDevice(device, format)`
+    /// 0x38 bytes, copied out whole.
+    fn pixel_format_info(&self, format: u64) -> PixelFormatInfo;
+    /// C SPI `MTLGetTextureLevelInfoForDeviceWithOptions(device, …)`
+    /// 0x68 bytes.
+    fn texture_level_info(&self, q: &TextureLevelQuery) -> TextureLevelInfo;
+
+    // Capabilities and creators from values.
+    /// The device's capabilities: read in full on the first call for this device, then shared.
+    fn caps(&self) -> Arc<DeviceCaps>;
+    /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
+    /// `desc`.
+    fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>>;
+    /// sel: newHeapWithDescriptor: — from a heap descriptor made from `desc`, and that
+    /// descriptor's `resourceOptions` read after the creation.
+    fn new_heap(&self, desc: &HeapDesc<'_, P>) -> RaiseResult<HeapMade<P>>;
+    /// sel: newSamplerStateWithDescriptor: — from a sampler descriptor made from `desc`.
+    fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<P::SamplerState>>;
+    /// sel: newDepthStencilStateWithDescriptor: — from a depth-stencil descriptor made from
+    /// `desc`.
+    fn new_depth_stencil_state(
+        &self,
+        desc: &DepthStencilDesc,
+    ) -> RaiseResult<Option<P::DepthStencilState>>;
+    /// sel: newIndirectCommandBufferWithDescriptor:maxCommandCount:options: — from an ICB
+    /// descriptor made from `desc`.
+    fn new_indirect_command_buffer(
+        &self,
+        desc: &IcbDesc,
+        max_count: u64,
+        options: u64,
+    ) -> RaiseResult<Option<P::Icb>>;
+    /// sel: newRenderPipelineStateWithDescriptor:error: — from a render pipeline descriptor
+    /// made from `desc` (a raise from its colour attachment lookup comes first). No path reaches
+    /// it under a handler: either raise dies at its send.
+    fn new_render_pipeline_state(
+        &self,
+        desc: &RenderPipelineDesc<'_, P>,
+    ) -> Result<Option<P::RenderPipeline>, NsErrorText>;
+}

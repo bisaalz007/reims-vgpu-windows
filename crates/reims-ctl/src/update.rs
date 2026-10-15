@@ -1,0 +1,240 @@
+//! Self-update: the checkout reims-ctl was installed from pulls, and scripts/install-ctl.sh
+//! builds and installs the new reims-ctl and QEMU. The new QEMU goes beside the old one, so
+//! running VMs keep theirs; the new reims-ctl replaces this binary, so restart it afterwards.
+//!
+//! The checkout's branch is the channel an update follows: master is stable, and development
+//! gets changes first. Choosing a channel checks its branch out before the script runs, so the
+//! script that builds is that branch's own, and later updates stay on it.
+
+use crate::install::Install;
+use crate::paths;
+use anyhow::{Context, Result, bail};
+use std::path::Path;
+use std::process::Command;
+
+/// The branches an update can follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Channel {
+    /// The master branch
+    Stable,
+    /// The development branch, which gets changes before stable
+    Development,
+}
+
+impl Channel {
+    pub const ALL: [Channel; 2] = [Channel::Stable, Channel::Development];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Development => "development",
+        }
+    }
+
+    pub fn branch(self) -> &'static str {
+        match self {
+            Channel::Stable => "master",
+            Channel::Development => "development",
+        }
+    }
+
+    /// The channel that follows `branch`, if one does.
+    pub fn of(branch: &str) -> Option<Channel> {
+        Channel::ALL.into_iter().find(|c| c.branch() == branch)
+    }
+}
+
+/// The branch checked out in `repo`; None on a detached HEAD.
+pub fn current_branch(repo: &Path) -> Option<String> {
+    git_output(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
+}
+
+/// What an update of `repo` follows, for people: "the stable channel (master)", "the branch
+/// NAME", or "a detached HEAD".
+pub fn following(repo: &Path) -> String {
+    match current_branch(repo) {
+        Some(b) => match Channel::of(&b) {
+            Some(c) => format!("the {} channel ({b})", c.name()),
+            None => format!("the branch {b}"),
+        },
+        None => "a detached HEAD".into(),
+    }
+}
+
+/// Updates from the checkout, first switching it to `channel`'s branch where one is given.
+pub fn update(channel: Option<Channel>) -> Result<()> {
+    let i = Install::load().context(
+        "no install record: run scripts/install-ctl.sh in your reims-vgpu checkout once, and \
+         reims-ctl update can use it from then on",
+    )?;
+    if let Some(c) = channel {
+        switch(&i.repo, c)?;
+    }
+    let script = i.repo.join("scripts/install-ctl.sh");
+    if !script.is_file() {
+        bail!("{} is missing: was the checkout moved?", script.display());
+    }
+    let status = Command::new("bash")
+        .arg(&script)
+        .arg("--update")
+        .current_dir(&i.repo)
+        .status()
+        .context("run bash")?;
+    if !status.success() {
+        bail!("the update failed (exit {})", status.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+/// Checks out `c`'s branch in `repo`, fetched from the remote the current branch tracks (origin
+/// where it tracks none). A branch the checkout lacks is made tracking the remote's, and one
+/// that tracks nothing is set to track it, so the script's pull moves it on. git tracks only a
+/// branch the remote's fetch refspecs cover, which a single-branch clone's do not: the branch is
+/// added to them there.
+fn switch(repo: &Path, c: Channel) -> Result<()> {
+    let branch = c.branch();
+    if !repo.join(".git").exists() {
+        bail!("{} is not a git checkout: was it moved?", repo.display());
+    }
+    let current = current_branch(repo);
+    if current.as_deref() == Some(branch) {
+        return Ok(());
+    }
+    let remote = current
+        .and_then(|b| git_output(repo, &["config", &format!("branch.{b}.remote")]))
+        .filter(|r| r != ".")
+        .unwrap_or_else(|| "origin".into());
+    let upstream = format!("{remote}/{branch}");
+    println!(
+        "Switching {} to the {} channel ({branch})",
+        paths::tilde(repo),
+        c.name()
+    );
+    let src = format!("refs/heads/{branch}");
+    let covered = git_output(
+        repo,
+        &["config", "--get-all", &format!("remote.{remote}.fetch")],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|r| r.trim_start_matches('+').split_once(':'))
+    .any(|(from, _)| from == "refs/heads/*" || from == src);
+    if !covered {
+        git(repo, &["remote", "set-branches", "--add", &remote, branch])?;
+    }
+    git(
+        repo,
+        &["fetch", &remote, &format!("+{src}:refs/remotes/{upstream}")],
+    )
+    .with_context(|| format!("fetch {branch} from {remote}"))?;
+    let have = git_output(repo, &["rev-parse", "--verify", "-q", &src]);
+    if have.is_none() {
+        git(repo, &["switch", "--track", "-c", branch, &upstream])
+    } else {
+        git(repo, &["switch", branch])
+    }
+    .with_context(|| {
+        format!(
+            "switch {} to {branch}: commit or set aside its local changes, then update again",
+            paths::tilde(repo)
+        )
+    })?;
+    if git_output(repo, &["config", &format!("branch.{branch}.remote")]).is_none() {
+        git(repo, &["branch", "--set-upstream-to", &upstream, branch])?;
+    }
+    Ok(())
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .context("run git")?;
+    if !status.success() {
+        bail!("git {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+/// `git args`' output, trimmed; None where it fails or prints nothing.
+fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (o.status.success() && !out.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {}", args.join(" "));
+    }
+
+    #[test]
+    fn channels_follow_their_branches() {
+        assert_eq!(Channel::of("master"), Some(Channel::Stable));
+        assert_eq!(Channel::of("development"), Some(Channel::Development));
+        assert_eq!(Channel::of("steelbrain/feature"), None);
+    }
+
+    #[test]
+    fn switching_fetches_and_tracks_the_channels_branch() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-channel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (origin, clone) = (d.join("origin"), d.join("clone"));
+        std::fs::create_dir_all(&origin).unwrap();
+        run(&origin, &["init", "-q", "-b", "master"]);
+        run(&origin, &["config", "user.name", "t"]);
+        run(&origin, &["config", "user.email", "t@t"]);
+        run(&origin, &["commit", "-q", "--allow-empty", "-m", "stable"]);
+        run(&origin, &["switch", "-q", "-c", "development"]);
+        run(
+            &origin,
+            &["commit", "-q", "--allow-empty", "-m", "development"],
+        );
+        run(&origin, &["switch", "-q", "master"]);
+        // A single-branch clone, whose fetches keep only master.
+        run(
+            &d,
+            &[
+                "clone",
+                "-q",
+                "--single-branch",
+                "-b",
+                "master",
+                origin.to_str().unwrap(),
+                "clone",
+            ],
+        );
+
+        switch(&clone, Channel::Development).unwrap();
+        assert_eq!(current_branch(&clone).as_deref(), Some("development"));
+        assert_eq!(
+            git_output(&clone, &["rev-parse", "--abbrev-ref", "@{u}"]).as_deref(),
+            Some("origin/development")
+        );
+        assert_eq!(following(&clone), "the development channel (development)");
+
+        switch(&clone, Channel::Stable).unwrap();
+        assert_eq!(following(&clone), "the stable channel (master)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
